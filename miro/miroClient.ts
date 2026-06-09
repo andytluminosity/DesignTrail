@@ -24,6 +24,8 @@ type CreateMiroItemBase = {
   accessToken: string;
   boardId: string;
   position?: MiroPosition;
+  anchorItemId?: string;
+  anchorOffset?: Partial<MiroPosition>;
 };
 
 type CreateMiroImageInput = CreateMiroItemBase & {
@@ -36,6 +38,7 @@ type CreateMiroStickyNoteInput = CreateMiroItemBase & {
 
 type MiroItemResponse = {
   id: string;
+  position?: MiroPosition;
   [key: string]: unknown;
 };
 
@@ -106,6 +109,28 @@ async function postMiroItem(
   return responseBody as MiroItemResponse;
 }
 
+async function getMiroItem(
+  accessToken: string,
+  boardId: string,
+  itemId: string
+): Promise<MiroItemResponse> {
+  const response = await fetch(
+    `https://api.miro.com/v2/boards/${boardId}/items/${encodeURIComponent(itemId)}`,
+    {
+      method: "GET",
+      headers: getMiroHeaders(accessToken),
+    }
+  );
+  const responseText = await response.text();
+  const responseBody = parseResponseBody(responseText);
+
+  if (!response.ok) {
+    throw new Error(`Miro API error ${response.status}: ${JSON.stringify(responseBody)}`);
+  }
+
+  return responseBody as MiroItemResponse;
+}
+
 function parseResponseBody(responseText: string): unknown {
   if (!responseText) {
     return null;
@@ -153,18 +178,60 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isMiroPosition(value: unknown): value is MiroPosition {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as MiroPosition).x === "number" &&
+    typeof (value as MiroPosition).y === "number"
+  );
+}
+
+async function resolveMiroPosition({
+  accessToken,
+  boardId,
+  position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset = {},
+}: CreateMiroItemBase): Promise<MiroPosition> {
+  if (!anchorItemId) {
+    return position;
+  }
+
+  const anchorItem = await getMiroItem(accessToken, boardId, anchorItemId);
+
+  if (!isMiroPosition(anchorItem.position)) {
+    throw new Error(`Miro item ${anchorItemId} does not expose a usable position.`);
+  }
+
+  return {
+    x: anchorItem.position.x + (anchorOffset.x ?? 0),
+    y: anchorItem.position.y + (anchorOffset.y ?? 0),
+  };
+}
+
 export async function createMiroImage({
   accessToken,
   boardId,
   url,
   position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset,
 }: CreateMiroImageInput): Promise<MiroItemResponse> {
+  const resolvedPosition = await resolveMiroPosition({
+    accessToken,
+    boardId,
+    position,
+    anchorItemId,
+    anchorOffset,
+  });
+
   return postMiroItem(
     `https://api.miro.com/v2/boards/${boardId}/images`,
     accessToken,
     {
       data: { url },
-      position,
+      position: resolvedPosition,
     }
   );
 }
@@ -174,13 +241,23 @@ export async function createMiroStickyNote({
   boardId,
   content,
   position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset,
 }: CreateMiroStickyNoteInput): Promise<MiroItemResponse> {
+  const resolvedPosition = await resolveMiroPosition({
+    accessToken,
+    boardId,
+    position,
+    anchorItemId,
+    anchorOffset,
+  });
+
   return postMiroItem(
     `https://api.miro.com/v2/boards/${boardId}/sticky_notes`,
     accessToken,
     {
       data: { content },
-      position,
+      position: resolvedPosition,
     }
   );
 }
@@ -209,14 +286,12 @@ export async function createCommitNode(commit: CommitData): Promise<MiroTimeline
   const previousNode = timelineState.nodes.at(-1) ?? null;
 
   try {
-    /*
     const image = await createMiroImage({
       accessToken,
       boardId,
       url: screenshotUrl,
       position,
     });
-    */
     const metadata = await createMiroStickyNote({
       accessToken,
       boardId,
