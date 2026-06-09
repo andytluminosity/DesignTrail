@@ -1,5 +1,10 @@
 import OpenAI from "openai";
-import type { CommitAnalysis, CommitType, ScreenshotTarget } from "./types.js";
+import type {
+  CommitAnalysis,
+  CommitType,
+  ScreenshotTarget,
+  UiElement,
+} from "./types.js";
 
 const MODEL = "gpt-4o-mini";
 
@@ -13,7 +18,7 @@ const VALID_TYPES: CommitType[] = ["UI_CHANGE", "FEATURE", "REFACTOR", "UNKNOWN"
 const VALID_MODES: ScreenshotTarget["mode"][] = ["full", "selector", "text", "role"];
 
 const SYSTEM_PROMPT = `You are a design-change analyzer for a git-based UI iteration tracker.
-Given a commit message and its diff, decide:
+Given a commit message, its diff, and a snapshot of the LIVE rendered page DOM, decide:
 1. A short human summary of what changed.
 2. The change type: one of UI_CHANGE, FEATURE, REFACTOR, UNKNOWN.
 3. What part of the rendered UI is most worth screenshotting.
@@ -28,11 +33,33 @@ Respond with ONLY a JSON object in exactly this shape:
   }
 }
 
-Guidance:
-- Use "selector" with a CSS selector (e.g. ".sidebar", "#header") when the diff clearly targets a specific element/class.
-- Use "text" with visible text when a labeled element is the focus.
-- Use "role" with an ARIA role (e.g. "navigation", "button") when a semantic region is the focus.
-- Use "full" when the change is broad, non-visual, or unclear.`;
+CRITICAL targeting rules:
+- The "UI CONTEXT" section lists the elements that ACTUALLY exist on the page.
+  You MUST only target elements that appear there. NEVER invent a class, id, text,
+  or role that is not present in the UI CONTEXT.
+- Prefer "text" (exact visible text from the context) or "role" because they are the
+  most robust. Use "selector" only when a class/id from the context clearly isolates
+  the changed element; selector value must be a real CSS selector built from the
+  listed classes/ids (e.g. ".stats-grid", "#header").
+- If no listed element clearly corresponds to the change, or the change is broad,
+  non-visual, or unclear, or the UI CONTEXT is empty, use mode "full".`;
+
+function formatUiContext(ui: UiElement[] | null | undefined): string {
+  if (!ui || ui.length === 0) return "(no UI context available — the page could not be read)";
+  return ui
+    .map((e) => {
+      const selector =
+        `${e.tag}` +
+        `${e.id ? `#${e.id}` : ""}` +
+        `${e.classes.length ? "." + e.classes.join(".") : ""}`;
+      const meta: string[] = [];
+      if (e.role) meta.push(`role="${e.role}"`);
+      if (e.testid) meta.push(`data-testid="${e.testid}"`);
+      if (e.text) meta.push(`text=${JSON.stringify(e.text)}`);
+      return `- ${selector}${meta.length ? " " + meta.join(" ") : ""}`;
+    })
+    .join("\n");
+}
 
 function validate(raw: unknown): CommitAnalysis {
   if (typeof raw !== "object" || raw === null) return FALLBACK;
@@ -66,9 +93,11 @@ function validate(raw: unknown): CommitAnalysis {
 export async function analyzeCommit({
   diff,
   commitMessage,
+  uiContext,
 }: {
   diff: string;
   commitMessage: string;
+  uiContext?: UiElement[] | null;
 }): Promise<CommitAnalysis> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -85,7 +114,11 @@ export async function analyzeCommit({
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
-          content: `Commit message:\n${commitMessage}\n\nGit diff:\n${diff}`,
+          content:
+            `Commit message:\n${commitMessage}\n\n` +
+            `Git diff:\n${diff}\n\n` +
+            `UI CONTEXT (elements that exist on the live page — target ONLY these):\n` +
+            `${formatUiContext(uiContext)}`,
         },
       ],
     });

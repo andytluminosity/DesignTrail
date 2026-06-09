@@ -12,7 +12,9 @@ flowchart TD
   commit[git commit in a watched repo] --> hook[post-commit hook]
   hook --> capture[tracker/capture.ts]
   capture --> git["git.ts: hash, message, diff, repo name"]
+  capture --> dom["screenshot.ts: getPageContext (live DOM map)"]
   git --> llm["llm.ts: analyzeCommit (OpenAI)"]
+  dom --> llm
   llm --> decide{"screenshotTarget.mode"}
   decide -->|full| full[full page]
   decide -->|selector| sel["page.locator(value)"]
@@ -27,9 +29,12 @@ flowchart TD
   role --> save
 ```
 
-The LLM runs **before** the screenshot. It returns structured JSON deciding what to
-capture; the screenshot logic honors that decision and falls back to a full-page capture
-on any failure.
+The LLM runs **before** the screenshot. To keep its targeting grounded, DesignTrail first
+reads a compact map of the **live rendered DOM** (`getPageContext`) and passes it to the
+LLM alongside the diff. The LLM may only target elements that actually exist on the page,
+which prevents it from hallucinating selectors. It returns structured JSON deciding what to
+capture; the screenshot logic honors that decision and falls back to a full-page capture on
+any failure (missing element, unreachable page, etc.).
 
 ## Requirements
 
@@ -141,6 +146,14 @@ SCREENSHOT TARGET:
   - `text` -> `page.getByText(value)`.
   - `role` -> `page.getByRole(value)` with an ARIA role.
 
+To keep targeting accurate, `analyzeCommit` also receives a `uiContext` argument: a compact
+map of the live page's real elements (tag, id, classes, role, `data-testid`, and visible
+text) produced by `getPageContext` in [tracker/screenshot.ts](tracker/screenshot.ts). The
+prompt instructs the model to target **only** elements present in that context and to prefer
+`text`/`role` over guessed selectors. This is what prevents the model from inventing a class
+like `.stat-total-commits` that isn't in the DOM. If the page can't be read (dev server
+down), `uiContext` is empty and the model is told to use `full`.
+
 The call uses OpenAI's JSON mode (`response_format: { type: "json_object" }`) to force
 valid JSON, then validates the shape. On **any** failure (missing API key, network error,
 parse error, invalid enum, or a non-`full` mode without a value) it returns a safe
@@ -168,8 +181,8 @@ Read from `.env` in the DesignTrail root, regardless of which repo triggered the
 tracker/
   capture.ts      Orchestrates the pipeline; resolves paths, loads .env, logs, saves capture
   git.ts          getLatestCommit, getDiff, getRepoName via simple-git
-  llm.ts          analyzeCommit (OpenAI JSON mode) + safe fallback
-  screenshot.ts   takeScreenshot(outputPath, target, url) with full-page fallback
+  llm.ts          analyzeCommit (OpenAI JSON mode, DOM-grounded) + safe fallback
+  screenshot.ts   getPageContext(url) for live DOM map + takeScreenshot(outputPath, target, url) with full-page fallback
   install.ts      Installs the post-commit hook into target repos
   types.ts        CommitData, ScreenshotTarget, CommitAnalysis
 captures/         Saved screenshots, namespaced as captures/<repo>/<hash>.png (git-ignored)

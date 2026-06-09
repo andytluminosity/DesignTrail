@@ -17,3 +17,12 @@ export type CommitAnalysis = {
   type: CommitType;
   screenshotTarget: ScreenshotTarget;
 };
+
+export type UiElement = {
+  tag: string;
+  id?: string;
+  classes: string[];
+  role?: string;
+  testid?: string;
+  text?: string;
+};

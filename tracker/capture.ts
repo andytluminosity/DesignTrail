@@ -1,7 +1,7 @@
 import path from "path";
 import { fileURLToPath } from "url";
 import { getLatestCommit, getDiff, getRepoName } from "./git.js";
-import { takeScreenshot } from "./screenshot.js";
+import { takeScreenshot, getPageContext } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
 import type { CommitData } from "./types.js";
 
@@ -31,10 +31,15 @@ async function main(): Promise<void> {
     timestamp: Date.now(),
   };
 
+  // Read the live DOM first so the LLM targets elements that actually exist
+  // (prevents it from hallucinating selectors that aren't on the page).
+  const uiContext = await getPageContext(CAPTURE_URL);
+
   // Step: analyze the commit with the LLM BEFORE capturing anything.
   const analysis = await analyzeCommit({
     diff: commit.diff,
     commitMessage: commit.message,
+    uiContext,
   });
 
   const { mode, value } = analysis.screenshotTarget;
