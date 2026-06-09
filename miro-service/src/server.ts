@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { writeFileSync } from "fs";
 import path from "path";
 
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const { MIRO_CLIENT_ID, MIRO_CLIENT_SECRET, MIRO_REDIRECT_URI } = process.env;
 
