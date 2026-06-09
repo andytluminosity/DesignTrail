@@ -55,6 +55,38 @@ app.get("/oauth/callback", async (req, res) => {
   }
 });
 
+app.post("/test-node", async (req, res) => {
+  const { accessToken, boardId } = req.body as {
+    accessToken?: string;
+    boardId?: string;
+  };
+
+  if (!accessToken || !boardId) {
+    return res.status(400).send("Missing accessToken or boardId");
+  }
+
+  try {
+    const response = await axios.post(
+      `https://api.miro.com/v2/boards/${boardId}/sticky_notes`,
+      {
+        data: { content: "Hello from DesignTrail 🚀" },
+        position: { x: 0, y: 0 },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    return res.json(response.data);
+  } catch (error: any) {
+    console.error("Miro create node failed:", error.response?.data ?? error.message);
+    return res.status(500).send("Failed to create node");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Miro OAuth service listening on http://localhost:${PORT}`);
   console.log(`Start the flow at http://localhost:${PORT}/login`);
