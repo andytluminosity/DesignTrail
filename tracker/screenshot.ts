@@ -9,8 +9,9 @@ export async function takeScreenshot(hash: string): Promise<void> {
   await fse.ensureDir(CAPTURES_DIR);
   const outputPath = path.join(CAPTURES_DIR, `${hash}.png`);
 
-  const browser = await chromium.launch();
+  let browser;
   try {
+    browser = await chromium.launch();
     const page = await browser.newPage();
     await page.goto(TARGET_URL, { waitUntil: "load" });
     await page.waitForTimeout(2000);
@@ -22,6 +23,6 @@ export async function takeScreenshot(hash: string): Promise<void> {
     );
     console.warn(err instanceof Error ? err.message : err);
   } finally {
-    await browser.close();
+    await browser?.close();
   }
 }
