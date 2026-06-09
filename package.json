@@ -9,12 +9,14 @@
     "untrack": "tsx tracker/uninstall.ts"
   },
   "dependencies": {
+    "better-sqlite3": "^12.10.0",
     "fs-extra": "^11.2.0",
     "openai": "^6.42.0",
     "playwright": "^1.48.0",
     "simple-git": "^3.27.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/fs-extra": "^11.0.4",
     "@types/node": "^22.7.0",
     "tsx": "^4.19.0",

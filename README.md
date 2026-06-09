@@ -1,9 +1,10 @@
 # DesignTrail
 
 AI Design Iteration Tracker. Every time you commit code in a watched repo, DesignTrail
-analyzes the change with an LLM, decides what part of the UI matters, and captures a
-targeted Playwright screenshot. The goal is to build a visual + semantic history of how a
-design evolves, commit by commit.
+analyzes the change with an LLM, decides which UI components changed, captures a targeted
+Playwright screenshot per component, and records each change as a node in a per-repo
+**design-evolution graph** stored in SQLite. The goal is to build a visual + semantic
+history of how a design evolves, organized as a tree of components.
 
 ## How it works
 
@@ -12,29 +13,71 @@ flowchart TD
   commit[git commit in a watched repo] --> hook[post-commit hook]
   hook --> capture[tracker/capture.ts]
   capture --> git["git.ts: hash, message, diff, repo name"]
-  capture --> dom["screenshot.ts: getPageContext (live DOM map)"]
-  git --> llm["llm.ts: analyzeCommit (OpenAI)"]
+  capture --> graph["graph.ts: load /data/repo/graph.db"]
+  capture --> dom["screenshot.ts: getSiteContext (live DOM map)"]
+  graph --> llm["llm.ts: analyzeCommit (OpenAI) -> components[]"]
   dom --> llm
-  llm --> decide{"screenshotTarget.mode"}
-  decide -->|full| full[full page]
-  decide -->|selector| sel["page.locator(value)"]
-  decide -->|text| txt["page.getByText(value)"]
-  decide -->|role| role["page.getByRole(value)"]
-  sel -->|invalid| full
-  txt -->|invalid| full
-  role -->|invalid| full
-  full --> save["save PNG to captures/repo/hash.png"]
-  sel --> save
-  txt --> save
-  role --> save
+  llm --> loop["for each changed component"]
+  loop --> branch["branch.ts: resolveBranch / resolveParentBranch"]
+  branch --> node["build IterationNode (parent = branch tip)"]
+  node --> store["graph.ts: addNode + ensureBranch (SQLite)"]
+  loop --> shot["screenshot.ts: takeScreenshots (one browser, N captures)"]
+  shot --> save["save PNG to captures/repo/hash/component.png"]
+  store --> db["/data/repo/graph.db"]
 ```
 
-The LLM runs **before** the screenshot. To keep its targeting grounded, DesignTrail first
-reads a compact map of the **live rendered DOM** (`getPageContext`) and passes it to the
-LLM alongside the diff. The LLM may only target elements that actually exist on the page,
-which prevents it from hallucinating selectors. It returns structured JSON deciding what to
-capture; the screenshot logic honors that decision and falls back to a full-page capture on
-any failure (missing element, unreachable page, etc.).
+The LLM runs **before** the screenshots. To keep its targeting grounded, DesignTrail first
+reads a compact map of the **live rendered DOM** (`getSiteContext`) and passes it to the
+LLM alongside the diff and the existing component tree. The LLM identifies **every** UI
+component the commit changed and, for each, may only target elements that actually exist on
+the page (which prevents hallucinated selectors). The screenshot logic honors each decision
+and falls back to a full-page capture on any failure (missing element, unreachable page,
+etc.).
+
+## The design-evolution graph
+
+A **node is a component change, not a commit**: one commit can change several components and
+therefore produce several nodes and several screenshots. Nodes are organized into a
+**component tree** where each branch is a component.
+
+- **Branches are components.** All changes to the same component chain together on one
+  branch via each node's `parentId` (the previous node on that branch).
+- **Nesting is LLM-driven.** When a commit introduces a brand-new component, the LLM picks
+  which existing branch it nests under (any branch in the tree), recorded as
+  `parent_branch_id`. `fork_node_id` pins the node it split from.
+- **Stable identity.** The existing branch tree is rendered into the prompt with explicit
+  parsing instructions, so the LLM reuses an exact existing branch name when a change
+  targets that same component (instead of inventing a near-duplicate like `side-nav` vs
+  `sidebar`). A validation backstop drops any `parentBranch` that isn't a real branch.
+- **Broad / non-visual changes** land on `main` with a full-page capture.
+
+Everything is persisted per repo in SQLite at `data/<repo>/graph.db` (no server, fully
+deterministic, rebuilt from disk on every commit). `DesignGraph.exportGraph()` returns
+`{ branches, nodes }` for downstream consumers (a visual graph, timeline UI, replay, etc.).
+
+### Database schema
+
+```sql
+commits  (hash PK, message, diff, timestamp)                 -- per-commit data, stored once
+branches (id PK, parent_branch_id, fork_node_id, created_at) -- the component tree
+nodes    (id PK = "<hash>:<branch>", commit_hash, branch_id, -- one per component change
+          parent_id, summary, type, screenshot_path, timestamp)
+```
+
+Console output is a per-component block under each commit:
+
+```text
+========================
+COMMIT: <hash>   REPO: <repo>
+
+COMPONENT: sidebar
+  PARENT BRANCH: main
+  PARENT NODE:   none
+  TYPE:          UI_CHANGE
+  SUMMARY:       Added collapse toggle to sidebar
+  SCREENSHOT:    captures/TempRepo/<hash>/sidebar.png
+========================
+```
 
 ## Requirements
 
@@ -129,42 +172,37 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
 1. The watched repo's `post-commit` hook runs the tracker. git sets the working directory
    to that repo, so the tracker reads **that repo's** latest commit and diff, while loading
    its own dependencies and `.env` from the DesignTrail install.
-2. `analyzeCommit` sends the commit message + diff to OpenAI and gets back structured JSON.
-3. A targeted screenshot is captured based on the LLM's decision.
-4. The PNG is saved to `captures/<repo-name>/<commit-hash>.png` inside DesignTrail (captures
-   from all watched repos are centralized here and namespaced per repo).
-
-Example console output:
-
-```text
-COMMIT: 2a26bfd45a3318bbecdfe6a17103bbad62c07b46
-REPO: TempRepo
-
-LLM SUMMARY:
-Added sidebar navigation to dashboard
-
-SCREENSHOT MODE:
-selector
-
-SCREENSHOT TARGET:
-.sidebar
-```
+2. The per-repo graph is opened (`data/<repo>/graph.db`) and the commit row is recorded.
+3. `analyzeCommit` sends the commit message + diff + live DOM map + existing component tree
+   to OpenAI and gets back a list of changed components.
+4. For each component, a branch is resolved (reused or newly nested), an `IterationNode` is
+   written, and a targeted screenshot is captured (all captures share one browser).
+5. PNGs are saved to `captures/<repo-name>/<commit-hash>/<component>.png` inside DesignTrail
+   (captures from all watched repos are centralized here and namespaced per repo).
 
 ## LLM output contract
 
-`analyzeCommit({ diff, commitMessage })` ([tracker/llm.ts](tracker/llm.ts)) returns:
+`analyzeCommit({ diff, commitMessage, siteContext, existingBranches })`
+([tracker/llm.ts](tracker/llm.ts)) returns a list of changed components:
 
 ```json
 {
-  "summary": "Added sidebar navigation to dashboard",
-  "type": "UI_CHANGE",
-  "screenshotTarget": {
-    "mode": "selector",
-    "value": ".sidebar"
-  }
+  "components": [
+    {
+      "component": "sidebar",
+      "parentBranch": "main",
+      "summary": "Added collapse toggle to sidebar",
+      "type": "UI_CHANGE",
+      "path": "/dashboard",
+      "screenshotTarget": { "mode": "selector", "value": ".sidebar" }
+    }
+  ]
 }
 ```
 
+- `component` is a stable branch id; `""` means a broad/global/non-visual change (-> `main`).
+- `parentBranch` is only used for a **new** component: which existing branch it nests under
+  (`""` -> `main`). It is dropped unless it names a real branch.
 - `type` is one of `UI_CHANGE`, `FEATURE`, `REFACTOR`, `UNKNOWN`.
 - `screenshotTarget.mode` is one of `full`, `selector`, `text`, `role`.
   - `full` -> full-page screenshot (no `value`).
@@ -172,25 +210,24 @@ SCREENSHOT TARGET:
   - `text` -> `page.getByText(value)`.
   - `role` -> `page.getByRole(value)` with an ARIA role.
 
-To keep targeting accurate, `analyzeCommit` also receives a `uiContext` argument: a compact
-map of the live page's real elements (tag, id, classes, role, `data-testid`, and visible
-text) produced by `getPageContext` in [tracker/screenshot.ts](tracker/screenshot.ts). The
-prompt instructs the model to target **only** elements present in that context and to prefer
-`text`/`role` over guessed selectors. This is what prevents the model from inventing a class
-like `.stat-total-commits` that isn't in the DOM. If the page can't be read (dev server
-down), `uiContext` is empty and the model is told to use `full`.
+To keep targeting accurate, `analyzeCommit` receives `siteContext`: a per-page compact map
+of the live page's real elements (tag, id, classes, role, `data-testid`, and visible text)
+produced by `getSiteContext` in [tracker/screenshot.ts](tracker/screenshot.ts). The prompt
+instructs the model to target **only** elements present in that context. It also receives
+`existingBranches`, rendered as an indented component tree with explicit parsing
+instructions, so it reuses exact existing branch names.
 
 The call uses OpenAI's JSON mode (`response_format: { type: "json_object" }`) to force
-valid JSON, then validates the shape. On **any** failure (missing API key, network error,
-parse error, invalid enum, or a non-`full` mode without a value) it returns a safe
-fallback:
+valid JSON, then validates each component independently. On **any** failure (missing API
+key, network error, parse error, invalid shape) or when no entry survives validation, it
+returns a safe fallback:
 
 ```json
-{ "summary": "General layout change", "type": "UNKNOWN", "screenshotTarget": { "mode": "full" } }
+{ "components": [{ "component": "", "summary": "General layout change", "type": "UNKNOWN", "path": "/", "screenshotTarget": { "mode": "full" } }] }
 ```
 
-If the chosen element can't be found on the page, the screenshot also falls back to
-full-page. The system never crashes a commit.
+If a chosen element can't be found on the page, that screenshot falls back to full-page. The
+system never crashes a commit.
 
 ## Configuration
 
@@ -205,14 +242,17 @@ Read from `.env` in the DesignTrail root, regardless of which repo triggered the
 
 ```text
 tracker/
-  capture.ts      Orchestrates the pipeline; resolves paths, loads .env, logs, saves capture
+  capture.ts      Orchestrates the pipeline; resolves paths, loads .env, writes graph, logs
   git.ts          getLatestCommit, getDiff, getRepoName via simple-git
-  llm.ts          analyzeCommit (OpenAI JSON mode, DOM-grounded) + safe fallback
-  screenshot.ts   getPageContext(url) for live DOM map + takeScreenshot(outputPath, target, url) with full-page fallback
+  llm.ts          analyzeCommit (OpenAI JSON mode, DOM-grounded, tree-aware) + safe fallback
+  branch.ts       slug/resolveBranch/resolveParentBranch (component -> branch id)
+  graph.ts        DesignGraph over SQLite (commits/branches/nodes); tips, ensureBranch, addNode, exportGraph
+  screenshot.ts   getSiteContext(url) for live DOM map + takeScreenshots(jobs, url) (one browser, full-page fallback)
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
-  types.ts        CommitData, ScreenshotTarget, CommitAnalysis
-captures/         Saved screenshots, namespaced as captures/<repo>/<hash>.png (git-ignored)
+  types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord
+captures/         Saved screenshots, namespaced as captures/<repo>/<hash>/<component>.png (git-ignored)
+data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 ```
 
 ## Scripts
@@ -229,14 +269,16 @@ npm run untrack -- <repo> # Remove the tracking hook from one or more repos
 # Start the dev server for the app you track (must serve CAPTURE_URL)
 # then, from the watched repo:
 git commit -m "tweak layout"
-# ...the tracker runs automatically and writes captures/<repo>/<hash>.png
+# ...the tracker runs automatically, writes captures/<repo>/<hash>/<component>.png
+# and updates data/<repo>/graph.db
 ```
 
 ## Notes and constraints
 
-- Local and deterministic: no database and no third-party design tool integration.
+- Local and deterministic: a per-repo SQLite graph, no server, no third-party design tool
+  integration. State is rebuilt from disk on every commit.
 - Screenshots require the dev server to be running; otherwise the capture step is skipped
-  with a warning and the commit still succeeds.
+  with a warning and the commit still succeeds (graph nodes are still written).
 - This is a hackathon project; the design intent is to grow toward component-level capture,
   semantic UI diffs, and intelligent design-exploration graphs.
 ```

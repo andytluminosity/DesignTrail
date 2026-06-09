@@ -191,44 +191,84 @@ async function captureLocator(
   return locateLoc.first();
 }
 
+export type ScreenshotJob = {
+  outputPath: string;
+  target: ScreenshotTarget;
+  navPath?: string;
+};
+
+/**
+ * Captures a single job on an already-open page: navigates to its route, then
+ * screenshots the located/capture element, falling back to full page on any
+ * failure. Throws only if navigation itself fails (so the caller can decide).
+ */
+async function captureOnePage(
+  page: Page,
+  job: ScreenshotJob,
+  url: string
+): Promise<void> {
+  const { outputPath, target, navPath = "/" } = job;
+  await fse.ensureDir(path.dirname(outputPath));
+
+  await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
+  await page.waitForTimeout(2000);
+
+  if (target.mode !== "full" || target.capture) {
+    try {
+      const locator = await captureLocator(page, target);
+      if (locator) {
+        await locator.screenshot({ path: outputPath });
+        console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
+        return;
+      }
+    } catch {
+      console.warn(
+        `Target not found for mode "${target.mode}" value "${target.value ?? ""}". Falling back to full page.`
+      );
+    }
+  }
+
+  await page.screenshot({ path: outputPath, fullPage: true });
+  console.log(`Screenshot saved (full): ${outputPath}`);
+}
+
+/**
+ * Captures many targeted screenshots reusing a SINGLE browser/page (one launch
+ * for N component captures). A failure on one job does not abort the rest.
+ */
+export async function takeScreenshots(jobs: ScreenshotJob[], url: string): Promise<void> {
+  if (jobs.length === 0) return;
+
+  let browser;
+  try {
+    browser = await chromium.launch();
+    const page = await browser.newPage();
+
+    for (const job of jobs) {
+      try {
+        await captureOnePage(page, job, url);
+      } catch (err) {
+        console.warn(
+          `Could not capture ${job.navPath ?? "/"} for ${job.outputPath}. Skipping this one.`
+        );
+        console.warn(err instanceof Error ? err.message : err);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `Could not capture ${url} (is your dev server running?). Skipping screenshots.`
+    );
+    console.warn(err instanceof Error ? err.message : err);
+  } finally {
+    await browser?.close();
+  }
+}
+
 export async function takeScreenshot(
   outputPath: string,
   target: ScreenshotTarget,
   url: string,
   navPath: string = "/"
 ): Promise<void> {
-  await fse.ensureDir(path.dirname(outputPath));
-
-  let browser;
-  try {
-    browser = await chromium.launch();
-    const page = await browser.newPage();
-    await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
-    await page.waitForTimeout(2000);
-
-    if (target.mode !== "full" || target.capture) {
-      try {
-        const locator = await captureLocator(page, target);
-        if (locator) {
-          await locator.screenshot({ path: outputPath });
-          console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
-          return;
-        }
-      } catch {
-        console.warn(
-          `Target not found for mode "${target.mode}" value "${target.value ?? ""}". Falling back to full page.`
-        );
-      }
-    }
-
-    await page.screenshot({ path: outputPath, fullPage: true });
-    console.log(`Screenshot saved (full): ${outputPath}`);
-  } catch (err) {
-    console.warn(
-      `Could not capture ${url} (is your dev server running?). Skipping screenshot.`
-    );
-    console.warn(err instanceof Error ? err.message : err);
-  } finally {
-    await browser?.close();
-  }
+  await takeScreenshots([{ outputPath, target, navPath }], url);
 }
