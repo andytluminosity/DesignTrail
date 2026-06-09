@@ -63,6 +63,58 @@ function nodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]> {
   return map;
 }
 
+/**
+ * Representative geometry per branch = the latest node on that branch that
+ * actually has geometry. Branches with no measured node are omitted.
+ */
+function geometryByBranch(
+  branches: BranchRecord[],
+  nodes: IterationNode[]
+): Map<string, NodeGeometry> {
+  const grouped = nodesByBranch(nodes);
+  const out = new Map<string, NodeGeometry>();
+  for (const branch of branches) {
+    let geometry: NodeGeometry | undefined;
+    for (const n of grouped.get(branch.id) ?? []) {
+      if (n.geometry) geometry = n.geometry;
+    }
+    if (geometry) out.set(branch.id, geometry);
+  }
+  return out;
+}
+
+/**
+ * For every branch that has measured container geometry, returns its smallest
+ * OTHER branch whose container rect fully encloses it (true on-screen
+ * containment), or null when nothing contains it (it is a spatial root). Shared
+ * by the spatial viz and by persistence so the stored branch tree matches the
+ * board. Branches without geometry are omitted entirely.
+ */
+export function deriveContainmentParents(
+  branches: BranchRecord[],
+  nodes: IterationNode[]
+): Map<string, string | null> {
+  const geoms = geometryByBranch(branches, nodes);
+  const entries = [...geoms.entries()];
+  const parents = new Map<string, string | null>();
+
+  for (const [id, g] of entries) {
+    let bestId: string | null = null;
+    let bestGeom: NodeGeometry | null = null;
+    for (const [otherId, og] of entries) {
+      if (otherId === id) continue;
+      if (!contains(og, g)) continue;
+      if (!bestGeom || area(og) < area(bestGeom)) {
+        bestId = otherId;
+        bestGeom = og;
+      }
+    }
+    parents.set(id, bestId);
+  }
+
+  return parents;
+}
+
 export function buildLayout(branches: BranchRecord[], nodes: IterationNode[]): Layout {
   const grouped = nodesByBranch(nodes);
 
@@ -89,18 +141,9 @@ export function buildLayout(branches: BranchRecord[], nodes: IterationNode[]): L
 
   // Resolve each frame's parent: spatial containment for positioned frames, the
   // LLM parent_branch_id as a fallback for the rest.
-  const parentOf = new Map<string, string | null>();
-
-  for (const frame of positioned) {
-    const g = frame.geometry!;
-    let best: FrameNode | null = null;
-    for (const other of positioned) {
-      if (other === frame || !other.geometry) continue;
-      if (!contains(other.geometry, g)) continue;
-      if (!best || area(other.geometry!) < area(best.geometry!)) best = other;
-    }
-    parentOf.set(frame.branch.id, best ? best.branch.id : null);
-  }
+  const parentOf = new Map<string, string | null>(
+    deriveContainmentParents(branches, nodes)
+  );
 
   const unpositioned: FrameNode[] = [];
   for (const frame of frames.values()) {

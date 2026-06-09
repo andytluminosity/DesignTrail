@@ -23,11 +23,12 @@ export type NodeGeometry = {
 };
 
 export type ScreenshotTarget = {
-  // how to LOCATE the changed element (or full page)
+  // How to locate the changed element (or full page).
   mode: "full" | "selector" | "text" | "role";
   value?: string;
-  // explicit element to SCREENSHOT (the part of the page to capture).
-  // omit to screenshot the located element itself.
+  // Container to climb to and screenshot/measure: the smallest meaningful frame
+  // around the located element. It defines this component's branch and drives
+  // both the screenshot and the recorded geometry. Absent for "full" captures.
   capture?: LocatorSpec;
 };
 
@@ -58,8 +59,10 @@ export type IterationNode = {
   type: CommitType;
   screenshotPath: string; // relative, e.g. captures/<repo>/<hash>/<branchId>.png
   timestamp: number;
-  // On-screen rect of the located element at capture time. Undefined for nodes
-  // captured before geometry tracking existed (until backfilled).
+  // On-screen rect of the captured container at capture time (the climbed
+  // `capture` element, or the located element when no container was chosen).
+  // Undefined for nodes captured before geometry tracking existed, or whose
+  // capture fell back to full page.
   geometry?: NodeGeometry;
 };
 
@@ -71,7 +74,7 @@ export type BranchRecord = {
   createdAt: number;
   // How to re-screenshot this branch's component on demand (e.g. for cascading
   // ancestor updates). navPath is the route to navigate to; target is the
-  // locator/capture spec. Undefined for legacy branches created before this existed.
+  // component locator. Undefined for legacy branches created before this existed.
   navPath?: string;
   target?: ScreenshotTarget;
 };
@@ -95,7 +98,7 @@ export type UiElement = {
   role?: string;
   testid?: string;
   text?: string;
-  // Best-effort selector for the nearest identifiable ancestor (id/class), so
-  // the LLM can choose a containing component to capture (frame the change).
+  // Best-effort selector for the nearest identifiable ancestor (id/class), useful
+  // as context when assigning component nesting.
   parent?: string;
 };

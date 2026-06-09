@@ -24,7 +24,7 @@ try {
 
 const CAPTURE_URL = process.env.CAPTURE_URL ?? "http://localhost:3000";
 
-/** Mirrors capture.ts: how to re-screenshot a branch with no stored capture spec. */
+/** Mirrors capture.ts: how to re-screenshot a branch with no stored target. */
 function fallbackTarget(branchId: string): ScreenshotTarget {
   if (branchId === MAIN_BRANCH) return { mode: "full" };
   return { mode: "selector", value: `[class~="${branchId}"]` };

@@ -42,11 +42,12 @@ Respond with ONLY a JSON object in exactly this shape:
       "type": "UI_CHANGE" | "FEATURE" | "REFACTOR" | "UNKNOWN",
       "path": string (the route to navigate to, e.g. "/dashboard"),
       "screenshotTarget": {
-        "mode": "full" | "selector" | "text" | "role",
-        "value": string (omit when mode is "full"),
+        "mode": "full" | "selector" | "text" | "role" (use "full" ONLY when component is "";
+                a NAMED component MUST locate its change with selector/text/role),
+        "value": string (omit ONLY when mode is "full"),
         "capture": {
           "mode": "selector" | "text" | "role",
-          "value": string
+          "value": string (REQUIRED for a named component: the container that IS this component)
         }
       }
     }
@@ -78,12 +79,22 @@ COMPONENT GRANULARITY — BE AGGRESSIVE ABOUT SPLITTING SUB-COMPONENTS:
   WHOLE: adding/removing/reordering its children, layout, or adding a new control that
   restructures it (e.g. adding a collapse toggle to the sidebar => component "sidebar").
 - Concrete worked examples:
-  - Logo text changes from "IT" to "ITQQ":
+  - Logo text changes from "IT" to "ITQQ" (locate the text, climb to the logo area):
     { "component": "logo", "parentBranch": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "selector", "value": ".sidebar__logo" } }
-  - A collapse toggle button is added to the sidebar:
+      "screenshotTarget": { "mode": "text", "value": "ITQQ",
+        "capture": { "mode": "selector", "value": ".sidebar__logo" } } }
+  - Footer version text changes from "v0.1.0" to "v0.1.1" (locate the text, climb to the
+    footer area — do NOT attribute this to the whole sidebar, and do NOT use mode "full"):
+    { "component": "footer", "parentBranch": "sidebar", "type": "UI_CHANGE",
+      "screenshotTarget": { "mode": "text", "value": "v0.1.1",
+        "capture": { "mode": "selector", "value": ".sidebar__footer" } } }
+  - A nav link label changes (locate the link, climb to the nav area):
+    { "component": "nav", "parentBranch": "sidebar", "type": "UI_CHANGE",
+      "screenshotTarget": { "mode": "text", "value": "Projects",
+        "capture": { "mode": "selector", "value": ".sidebar__nav" } } }
+  - A collapse toggle button is added to the sidebar (a container-wide change):
     { "component": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "selector", "value": ".sidebar__collapse",
+      "screenshotTarget": { "mode": "selector", "value": ".sidebar",
         "capture": { "mode": "selector", "value": ".sidebar" } } }
 
 CRITICAL targeting rules:
@@ -91,26 +102,36 @@ CRITICAL targeting rules:
   that ACTUALLY exist on that page. You MUST only target elements that appear there. NEVER
   invent a class, id, text, or role that is not present.
 - For each component, "path" MUST be one of the listed PAGE routes — the page where that
-  change is visible. Both the locate target and the capture target MUST exist on THAT page.
+  change is visible. The screenshot target MUST exist on THAT page.
 - "mode"/"value" describe how to LOCATE the changed element. Prefer "text" (exact visible
   text from the context) or "role" because they are the most robust. Use "selector" only when
   a class/id from the context clearly isolates the element.
 
-CRITICAL capture-framing rules:
-- "capture" describes the element to actually SCREENSHOT. NEVER screenshot a bare atomic
-  control or a tiny text node in isolation (a lone button, a 1-6 character logo, a single
-  icon) — the result is an unreadable crop with no context.
-- Always frame the change in the smallest MEANINGFUL, self-contained containing component.
-  When the located element is a tiny control, set "capture" to its containing component (use
-  the element's "parent=" hint or an enclosing container present in the UI CONTEXT).
-- For a change that RESTRUCTURES a container (e.g. a toggle added to the sidebar), set
-  "capture" to the WHOLE container (e.g. { "mode": "selector", "value": ".sidebar" }).
-- The "capture" selector/text/role MUST be an element present in the UI CONTEXT on that page.
-- Omit "capture" only when the located element is itself already a meaningful, well-framed
-  component.
-- Emit one entry per distinct changed component. If the change is broad, non-visual, or
-  unclear, or the UI CONTEXT is empty, return a SINGLE entry with "component": "", "path": "/"
-  and mode "full" (no "capture").`;
+CONTAINER MODEL — "mode"/"value" LOCATE the change, "capture" FRAMES the branch:
+- "mode"/"value" pinpoint the changed element (the text node, icon, button, etc.).
+- "capture" names the SMALLEST MEANINGFUL SELF-CONTAINED CONTAINER that frames that
+  element — this container is what gets screenshotted AND measured, and it DEFINES this
+  component's branch. It MUST be an element that exists in the UI CONTEXT.
+- Each sub-component climbs to its OWN container, NOT to the shared parent. The logo climbs
+  to its own logo area (e.g. ".sidebar__logo"), the nav climbs to its own nav area — so the
+  branches' rects stay strictly enclosed and nest cleanly. NEVER point two different
+  components' "capture" at the same shared container; that produces equal rects that cannot
+  nest.
+- A change that affects a container AS A WHOLE belongs to that container's own branch: set
+  "component" to the container and point both the located element and "capture" at it.
+- The "capture" container IS the named component — it is exactly what we screenshot and
+  measure for that branch. A NAMED component is ALWAYS a concrete on-screen container, so it
+  MUST use mode selector/text/role to locate the change AND provide a "capture" container.
+- NEVER use mode "full" for a named component. "full" screenshots the ENTIRE page and is
+  reserved EXCLUSIVELY for "component": "" (a genuinely global, page-wide, or non-visual
+  change). A small text/style tweak to one area (a footer version string, a single label,
+  one stat color) is NOT global — locate it and climb to its own container instead.
+- Omit "capture" only when "mode" is "full" (i.e. only for "component": ""). For any located
+  element, provide a "capture" container (it may equal the located element itself if the
+  element is already its own smallest meaningful frame).
+- Emit one entry per distinct changed component. Only when the change is genuinely page-wide,
+  non-visual, or the UI CONTEXT is empty, return a SINGLE entry with "component": "",
+  "path": "/" and mode "full".`;
 
 function formatSiteContext(site: PageContext[] | null | undefined): string {
   if (!site || site.length === 0) {
@@ -181,6 +202,11 @@ export function formatBranchTree(branches: BranchRecord[]): string {
   );
 }
 
+/**
+ * Validates the optional container `capture` spec the LLM picks to climb to and
+ * screenshot. Only selector/text/role are valid (full has no container), and a
+ * non-empty value is required; otherwise the climb is dropped.
+ */
 function validateCapture(raw: unknown): LocatorSpec | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const obj = raw as Record<string, unknown>;
@@ -229,7 +255,7 @@ function validateComponent(
       const value = typeof target.value === "string" ? target.value.trim() : "";
       if (value) {
         const capture = validateCapture(target.capture);
-        screenshotTarget = capture ? { mode, value, capture } : { mode, value };
+        screenshotTarget = { mode, value, ...(capture ? { capture } : {}) };
       }
     }
   }

@@ -5,17 +5,33 @@ import { takeScreenshots, getSiteContext } from "./screenshot.js";
 import type { ScreenshotJob } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
 import { DesignGraph } from "./graph.js";
+import { deriveContainmentParents } from "./layout.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "./branch.js";
 import type { CommitData, IterationNode, ScreenshotTarget } from "./types.js";
 
 /**
- * How to re-screenshot an ancestor branch whose stored capture is missing
- * (legacy branches created before per-branch capture persistence). main -> full
- * page; any other branch -> its class as a best-effort container selector.
+ * How to re-screenshot an ancestor branch whose stored target is missing
+ * (legacy branches created before per-branch target persistence). main -> full
+ * page; any other branch -> its class as a best-effort component selector.
  */
 function fallbackTarget(branchId: string): ScreenshotTarget {
   if (branchId === MAIN_BRANCH) return { mode: "full" };
   return { mode: "selector", value: `[class~="${branchId}"]` };
+}
+
+/**
+ * A named component IS a container, so it must be screenshotted as that
+ * container — never the whole page. If a target for a named component is
+ * full-page (the LLM bailed to "full", or a legacy branch stored one), coerce
+ * it to the component's own container selector so we frame the component and
+ * never stamp the branch with a page-sized rect that corrupts spatial nesting.
+ * main keeps its legitimate full-page capture.
+ */
+function containerTarget(branchId: string, target: ScreenshotTarget): ScreenshotTarget {
+  if (branchId !== MAIN_BRANCH && target.mode === "full") {
+    return fallbackTarget(branchId);
+  }
+  return target;
 }
 
 // Resolve the tracker's own root (DesignTrail) so the pipeline works no matter
@@ -140,7 +156,7 @@ async function main(): Promise<void> {
     for (const change of components) {
       const branchId = resolveBranch(change.component);
       const navPath = change.path ?? "/";
-      const target = change.screenshotTarget;
+      const target = containerTarget(branchId, change.screenshotTarget);
 
       if (!graph.branchExists(branchId)) {
         const parentBranchId =
@@ -193,7 +209,7 @@ async function main(): Promise<void> {
       if (nodedBranches.has(ancestor)) continue;
 
       const branch = graph.getBranch(ancestor);
-      const target = branch?.target ?? fallbackTarget(ancestor);
+      const target = containerTarget(ancestor, branch?.target ?? fallbackTarget(ancestor));
       const navPath = branch?.navPath ?? "/";
       const summary = `Updated to reflect new nested component(s): ${[...children]
         .sort()
@@ -229,6 +245,20 @@ async function main(): Promise<void> {
       if (!geometry) continue;
       const nodeId = nodeByOutput.get(outputPath);
       if (nodeId) graph.setNodeGeometry(nodeId, geometry);
+    }
+  });
+
+  // Now that each branch's container geometry is known, derive branch nesting
+  // from spatial containment and persist it so the stored tree matches the
+  // board: every branch with container geometry nests under the smallest OTHER
+  // branch whose container encloses it (main/page ends up the root). The LLM
+  // parentBranch remains the fallback for branches that never got geometry, so
+  // those are left untouched here.
+  const { branches, nodes } = graph.exportGraph();
+  const derived = deriveContainmentParents(branches, nodes);
+  graph.transaction(() => {
+    for (const [branchId, parentBranchId] of derived) {
+      graph.setBranchParent(branchId, parentBranchId);
     }
   });
 

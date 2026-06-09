@@ -13,14 +13,6 @@ import type {
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
 
-// Used only as a fallback: when a text/role match lands on a leaf node, climb to
-// the nearest meaningful container so we capture the whole component. Uses
-// word-match ([class~=...]) so BEM sub-element classes (e.g. "card__title") do
-// not match the leaf itself and defeat the climb.
-const CONTAINER_SELECTOR =
-  '[data-testid], section, article, li, ' +
-  '[class~="card"], [class~="panel"], [class~="tile"], [class~="item"], [class~="widget"], [class~="box"]';
-
 /**
  * Extracts a compact map of real, visible elements on the currently loaded page
  * so the LLM can choose selectors/text/roles that actually exist (instead of
@@ -183,44 +175,54 @@ function resolveLocator(
 }
 
 /**
- * Resolves the element to screenshot, in priority order:
- *  1. the LLM's explicit capture target (trusted region), if present and found;
- *  2. the located element — for text/role, climbing to the nearest container;
+ * Resolves the element to screenshot. The LLM locates the changed element, then
+ * (when `target.capture` is set) we climb to the smallest meaningful container
+ * that frames it — that container defines the branch and drives both the
+ * screenshot and the measured geometry. Priority order:
+ *  1. the climbed container (when `capture` is set and resolves);
+ *  2. the located changed element;
  *  3. null (caller falls back to full page).
  */
 async function captureLocator(
   page: Page,
   target: ScreenshotTarget
 ): Promise<Locator | ElementHandle | null> {
-  if (target.capture) {
-    const captureLoc = resolveLocator(page, target.capture);
-    if (captureLoc && (await captureLoc.count()) > 0) {
-      try {
-        await captureLoc.first().waitFor({ state: "visible", timeout: 5000 });
-        return captureLoc.first();
-      } catch {
-        // Explicit capture target not visible; fall through to located element.
-      }
-    }
-  }
-
   const locateLoc = resolveLocator(page, target);
   if (!locateLoc) return null;
 
-  await locateLoc.first().waitFor({ state: "visible", timeout: 5000 });
+  const located = locateLoc.first();
+  await located.waitFor({ state: "visible", timeout: 5000 });
 
-  if (target.mode === "text" || target.mode === "role") {
-    const handle = await locateLoc.first().elementHandle();
-    if (handle) {
-      const container = await handle.evaluateHandle(
-        (el, sel) => (el as Element).closest(sel) ?? el,
-        CONTAINER_SELECTOR
-      );
-      return container.asElement() ?? handle;
+  const capture = target.capture;
+  if (!capture) return located;
+
+  try {
+    if (capture.mode === "selector") {
+      // Climb from the located element to the nearest matching ancestor
+      // container (falling back to the element itself if none matches).
+      const elementHandle = await located.elementHandle();
+      if (elementHandle) {
+        const containerHandle = await page.evaluateHandle(
+          ({ el, sel }) => (el as Element).closest(sel) ?? el,
+          { el: elementHandle, sel: capture.value }
+        );
+        const containerElement = containerHandle.asElement();
+        if (containerElement) return containerElement;
+      }
+    } else {
+      // text/role container: resolve directly and use it if visible.
+      const containerLoc = resolveLocator(page, capture);
+      if (containerLoc) {
+        const container = containerLoc.first();
+        await container.waitFor({ state: "visible", timeout: 5000 });
+        return container;
+      }
     }
+  } catch {
+    // Any climb failure falls back to the located element below.
   }
 
-  return locateLoc.first();
+  return located;
 }
 
 /** Full scrollable document dimensions of the currently loaded page. */
@@ -232,7 +234,10 @@ async function pageDimensions(page: Page): Promise<{ pageW: number; pageH: numbe
 }
 
 /** Geometry of a located element in document (page) pixels, or undefined if unmeasurable. */
-async function readGeometry(loc: Locator, page: Page): Promise<NodeGeometry | undefined> {
+async function readGeometry(
+  loc: Locator | ElementHandle,
+  page: Page
+): Promise<NodeGeometry | undefined> {
   try {
     const box = await loc.boundingBox();
     if (!box) return undefined;
@@ -257,21 +262,6 @@ async function fullPageGeometry(page: Page): Promise<NodeGeometry> {
   return { x: 0, y: 0, w: pageW, h: pageH, pageW, pageH };
 }
 
-/**
- * Geometry of the LOCATED element (the actual change target), independent of any
- * framed/container capture region. For `full` mode there is no element, so the
- * whole page is the rect.
- */
-async function locatedGeometry(
-  page: Page,
-  target: ScreenshotTarget
-): Promise<NodeGeometry | undefined> {
-  if (target.mode === "full") return fullPageGeometry(page);
-  const loc = resolveLocator(page, { mode: target.mode, value: target.value });
-  if (!loc) return fullPageGeometry(page);
-  return (await readGeometry(loc.first(), page)) ?? fullPageGeometry(page);
-}
-
 export type ScreenshotJob = {
   outputPath: string;
   target: ScreenshotTarget;
@@ -280,7 +270,7 @@ export type ScreenshotJob = {
 
 /**
  * Captures a single job on an already-open page: navigates to its route, then
- * screenshots the located/capture element, falling back to full page on any
+ * screenshots the located element, falling back to full page on any
  * failure. Returns the file written plus the located element's geometry. Throws
  * only if navigation itself fails (so the caller can decide).
  */
@@ -295,12 +285,14 @@ async function captureOnePage(
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
   await page.waitForTimeout(2000);
 
-  if (target.mode !== "full" || target.capture) {
+  if (target.mode !== "full") {
     try {
-      const locator = await captureLocator(page, target);
-      if (locator) {
-        await locator.screenshot({ path: outputPath });
-        const geometry = await locatedGeometry(page, target);
+      const element = await captureLocator(page, target);
+      if (element) {
+        await element.screenshot({ path: outputPath });
+        // Measure the SAME element we screenshot (the climbed container when one
+        // was chosen), so geometry == the captured container's rect.
+        const geometry = await readGeometry(element, page);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
         return { outputPath, geometry };
       }
@@ -316,10 +308,7 @@ async function captureOnePage(
   // (e.g. main). A targeted capture that fell back to full page never actually
   // measured its component, so record no geometry rather than polluting the
   // spatial tree with a page-sized rect (which would mis-nest the branch).
-  const geometry =
-    target.mode === "full" && !target.capture
-      ? await fullPageGeometry(page)
-      : undefined;
+  const geometry = target.mode === "full" ? await fullPageGeometry(page) : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
   return { outputPath, geometry };
 }

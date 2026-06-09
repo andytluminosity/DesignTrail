@@ -252,8 +252,8 @@ export class DesignGraph {
 
   /**
    * Records (or refreshes) how to re-screenshot a branch's component: the route
-   * to navigate to and the locator/capture spec. Used by cascading ancestor
-   * updates so any branch can be re-captured on demand.
+   * to navigate to and the component locator. Used by cascading ancestor updates
+   * so any branch can be re-captured on demand.
    */
   setBranchCapture(id: string, navPath: string, target: ScreenshotTarget): void {
     this.db
@@ -261,6 +261,18 @@ export class DesignGraph {
         `UPDATE branches SET nav_path = @navPath, target_json = @targetJson WHERE id = @id`
       )
       .run({ id, navPath, targetJson: JSON.stringify(target) });
+  }
+
+  /**
+   * Reparents a branch to a new container branch (derived from spatial
+   * containment after geometry is known). `main` is the root and is never
+   * reparented.
+   */
+  setBranchParent(id: string, parentBranchId: string | null): void {
+    if (id === MAIN_BRANCH) return;
+    this.db
+      .prepare(`UPDATE branches SET parent_branch_id = @parentBranchId WHERE id = @id`)
+      .run({ id, parentBranchId });
   }
 
   addNode(node: IterationNode): void {
