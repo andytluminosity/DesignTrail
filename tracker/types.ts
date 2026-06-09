@@ -3,6 +3,7 @@ export type CommitData = {
   message: string;
   diff: string;
   timestamp: number;
+  repoName?: string;
 };
 
 export type LocatorSpec = {

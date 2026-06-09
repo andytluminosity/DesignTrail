@@ -192,7 +192,8 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
 
 1. The watched repo's `post-commit` hook runs the tracker. git sets the working directory
    to that repo, so the tracker reads **that repo's** latest commit and diff, while loading
-   its own dependencies and `.env` from the DesignTrail install.
+   its own dependencies and `.env` from the DesignTrail install. For manual runs, pass a
+   repo path with `npm run capture -- /path/to/repo`.
 2. The per-repo graph is opened (`data/<repo>/graph.db`) and the commit row is recorded.
 3. `analyzeCommit` sends the commit message + diff + live DOM map + existing component tree
    to OpenAI and gets back a list of changed components.
@@ -283,6 +284,7 @@ data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 
 ```bash
 npm run capture            # Manually run the pipeline against the current repo/commit
+npm run capture -- <repo>  # Manually run the pipeline against a specific repo/commit
 npm run track -- <repo>    # Install the tracking hook into one or more repos
 npm run untrack -- <repo>  # Remove the tracking hook from one or more repos
 npm run visualize -- <repo> # Render the graph to data/<repo>/graph.html (all repos if omitted)
@@ -307,10 +309,13 @@ open data/TempRepo/graph.html
 
 ```bash
 # Start the dev server for the app you track (must serve CAPTURE_URL)
-# then, from the watched repo:
+# then either commit from the watched repo:
 git commit -m "tweak layout"
 # ...the tracker runs automatically, writes captures/<repo>/<hash>/<component>.png
 # and updates data/<repo>/graph.db
+
+# or manually capture a specific repo:
+npm run capture -- /path/to/watched-repo
 ```
 
 ## Notes and constraints

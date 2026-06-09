@@ -1,9 +1,13 @@
 import path from "path";
 import simpleGit from "simple-git";
 
-const git = simpleGit();
+function getGit(repoPath = process.cwd()) {
+  return simpleGit(repoPath);
+}
 
-export async function getRepoName(): Promise<string> {
+export async function getRepoName(repoPath?: string): Promise<string> {
+  const git = getGit(repoPath);
+
   try {
     const root = (await git.revparse(["--show-toplevel"])).trim();
     return path.basename(root) || "unknown-repo";
@@ -12,7 +16,8 @@ export async function getRepoName(): Promise<string> {
   }
 }
 
-export async function getLatestCommit(): Promise<{ hash: string; message: string }> {
+export async function getLatestCommit(repoPath?: string): Promise<{ hash: string; message: string }> {
+  const git = getGit(repoPath);
   const log = await git.log(["-1"]);
   const latest = log.latest;
 
@@ -23,7 +28,9 @@ export async function getLatestCommit(): Promise<{ hash: string; message: string
   return { hash: latest.hash, message: latest.message };
 }
 
-export async function getDiff(commitHash: string): Promise<string> {
+export async function getDiff(commitHash: string, repoPath?: string): Promise<string> {
+  const git = getGit(repoPath);
+
   try {
     return await git.diff([`${commitHash}~1`, commitHash]);
   } catch {

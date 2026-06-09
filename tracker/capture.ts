@@ -7,6 +7,7 @@ import { analyzeCommit } from "./llm.js";
 import { DesignGraph } from "./graph.js";
 import { deriveContainmentParents } from "./layout.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "./branch.js";
+import { createCommitNode } from "../miro/miroClient.js";
 import type { CommitData, IterationNode, ScreenshotTarget } from "./types.js";
 
 /**
@@ -73,15 +74,17 @@ function logCommit(hash: string, repo: string, entries: DebugEntry[]): void {
 }
 
 async function main(): Promise<void> {
-  const { hash, message } = await getLatestCommit();
-  const diff = await getDiff(hash);
-  const repoName = await getRepoName();
+  const repoPath = path.resolve(process.argv[2] ?? process.cwd());
+  const { hash, message } = await getLatestCommit(repoPath);
+  const diff = await getDiff(hash, repoPath);
+  const repoName = await getRepoName(repoPath);
 
   const commit: CommitData = {
     hash,
     message,
     diff,
     timestamp: Date.now(),
+    repoName,
   };
 
   const graph = await DesignGraph.load(repoName);
@@ -263,6 +266,9 @@ async function main(): Promise<void> {
   });
 
   graph.close();
+
+  // Mirror this commit's capture onto the Miro timeline board.
+  await createCommitNode(commit);
 }
 
 main().catch((err) => {
