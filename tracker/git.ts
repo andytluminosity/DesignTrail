@@ -1,6 +1,16 @@
+import path from "path";
 import simpleGit from "simple-git";
 
 const git = simpleGit();
+
+export async function getRepoName(): Promise<string> {
+  try {
+    const root = (await git.revparse(["--show-toplevel"])).trim();
+    return path.basename(root) || "unknown-repo";
+  } catch {
+    return "unknown-repo";
+  }
+}
 
 export async function getLatestCommit(): Promise<{ hash: string; message: string }> {
   const log = await git.log(["-1"]);
