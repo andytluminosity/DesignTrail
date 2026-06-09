@@ -36,6 +36,26 @@ type CreateMiroStickyNoteInput = CreateMiroItemBase & {
   content: string;
 };
 
+type MiroConnectorShape = "straight" | "elbowed" | "curved";
+
+type MiroConnectorStyle = {
+  strokeColor?: string;
+  strokeWidth?: string;
+  strokeStyle?: string;
+  startStrokeCap?: string;
+  endStrokeCap?: string;
+  [key: string]: string | undefined;
+};
+
+type CreateMiroConnectorInput = {
+  accessToken: string;
+  boardId: string;
+  startItemId: string;
+  endItemId: string;
+  shape?: MiroConnectorShape;
+  style?: MiroConnectorStyle;
+};
+
 type MiroItemResponse = {
   id: string;
   position?: MiroPosition;
@@ -258,6 +278,32 @@ export async function createMiroStickyNote({
     {
       data: { content },
       position: resolvedPosition,
+    }
+  );
+}
+
+export async function createConnector({
+  accessToken,
+  boardId,
+  startItemId,
+  endItemId,
+  shape = "straight",
+  style,
+}: CreateMiroConnectorInput): Promise<MiroItemResponse> {
+  return postMiroItem(
+    `https://api.miro.com/v2/boards/${boardId}/connectors`,
+    accessToken,
+    {
+      startItem: {
+        id: startItemId,
+        snapTo: "auto",
+      },
+      endItem: {
+        id: endItemId,
+        snapTo: "auto",
+      },
+      shape,
+      ...(style ? { style } : {}),
     }
   );
 }
