@@ -98,6 +98,32 @@ DESIGNTRAIL="/abs/path/to/DesignTrail"
 # <<< DesignTrail tracker <<<
 ```
 
+## Unwatching a repo
+
+Use the uninstaller to remove the tracking hook from a repo. Same argument style as
+`track` (one repo, several repos, or the current directory with no argument).
+
+```bash
+# Stop watching one repo
+npm run untrack -- /path/to/some-repo
+
+# Stop watching several at once
+npm run untrack -- /path/to/repoA /path/to/repoB
+
+# Stop watching the current directory (no argument)
+npm run untrack
+```
+
+The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
+
+- Resolves the hooks directory the same way as the installer (`git rev-parse --git-path
+  hooks`).
+- Removes the DesignTrail block whether it was installed with the marker fences or as a
+  stand-alone hook.
+- If the hook contained other commands, preserves them and removes only the DesignTrail
+  part; if the hook existed only for DesignTrail, deletes the `post-commit` file entirely.
+- Is safe to re-run and on repos that were never tracked (it leaves their hooks untouched).
+
 ## What happens on each commit
 
 1. The watched repo's `post-commit` hook runs the tracker. git sets the working directory
@@ -184,6 +210,7 @@ tracker/
   llm.ts          analyzeCommit (OpenAI JSON mode, DOM-grounded) + safe fallback
   screenshot.ts   getPageContext(url) for live DOM map + takeScreenshot(outputPath, target, url) with full-page fallback
   install.ts      Installs the post-commit hook into target repos
+  uninstall.ts    Removes the post-commit hook from target repos
   types.ts        CommitData, ScreenshotTarget, CommitAnalysis
 captures/         Saved screenshots, namespaced as captures/<repo>/<hash>.png (git-ignored)
 ```
@@ -193,6 +220,7 @@ captures/         Saved screenshots, namespaced as captures/<repo>/<hash>.png (g
 ```bash
 npm run capture           # Manually run the pipeline against the current repo/commit
 npm run track -- <repo>   # Install the tracking hook into one or more repos
+npm run untrack -- <repo> # Remove the tracking hook from one or more repos
 ```
 
 ## Manual testing

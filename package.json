@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "capture": "tsx tracker/capture.ts",
-    "track": "tsx tracker/install.ts"
+    "track": "tsx tracker/install.ts",
+    "untrack": "tsx tracker/uninstall.ts"
   },
   "dependencies": {
     "fs-extra": "^11.2.0",
