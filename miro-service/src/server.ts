@@ -1,12 +1,15 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import { writeFileSync } from "fs";
+import path from "path";
 
 dotenv.config();
 
 const { MIRO_CLIENT_ID, MIRO_CLIENT_SECRET, MIRO_REDIRECT_URI } = process.env;
 
 const PORT = 3000;
+const TOKEN_FILE = path.resolve(__dirname, "../../.miro-token.json");
 let miroAccessToken: string | null = null;
 
 const app = express();
@@ -48,6 +51,7 @@ app.get("/oauth/callback", async (req, res) => {
 
     const accessToken = response.data.access_token;
     miroAccessToken = accessToken;
+    writeFileSync(TOKEN_FILE, JSON.stringify({ accessToken }, null, 2));
     console.log("Miro token stored successfully");
 
     return res.send("OAuth complete. You can return to the app.");
