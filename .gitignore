@@ -13,6 +13,7 @@ build/
 
 # App data
 captures/
+.designtrail/
 
 # Logs
 logs/

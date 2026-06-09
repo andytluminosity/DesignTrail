@@ -3,6 +3,7 @@ import { fileURLToPath } from "url";
 import { getLatestCommit, getDiff, getRepoName } from "./git.js";
 import { takeScreenshot, getSiteContext } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
+import { createCommitNode } from "../miro/miroClient.js";
 import type { CommitData } from "./types.js";
 
 // Resolve the tracker's own root (DesignTrail) so the pipeline works no matter
@@ -29,6 +30,7 @@ async function main(): Promise<void> {
     message,
     diff,
     timestamp: Date.now(),
+    repoName,
   };
 
   // Read the live DOM (across pages) first so the LLM targets elements that
@@ -67,6 +69,7 @@ async function main(): Promise<void> {
   // Captures are centralized in DesignTrail and namespaced by repo.
   const outputPath = path.join(TRACKER_ROOT, "captures", repoName, `${commit.hash}.png`);
   await takeScreenshot(outputPath, analysis.screenshotTarget, CAPTURE_URL, navPath);
+  await createCommitNode(commit);
 }
 
 main().catch((err) => {
