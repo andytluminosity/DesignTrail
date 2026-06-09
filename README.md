@@ -292,33 +292,16 @@ npm run backfill-geometry -- <repo> # Backfill on-screen geometry for pre-geomet
 ## Visualizing the graph
 
 `npm run visualize` ([tracker/visualize.ts](tracker/visualize.ts)) reads a repo's SQLite graph
-and writes a self-contained `data/<repo>/graph.html` — no graph libraries, just positioned
-`<div>`s and a little vanilla JS. It renders a **Figma/Miro-style spatial board**: every branch
-is a **frame** placed at its located element's real on-screen rect, so the hierarchy reflects
-what actually contains what on the page.
-
-- **Geometry-driven nesting.** [tracker/layout.ts](tracker/layout.ts) (`buildLayout`) assigns
-  each frame's parent as the smallest *other* frame whose rect fully encloses it (true spatial
-  containment), and orders siblings in reading order (top-to-bottom, then left-to-right). This
-  is why a `logo` frame nests inside the `sidebar` frame: its bounding box sits inside the
-  sidebar's. `main` (a full-page capture) is the outer page rect that contains everything.
-- **Fallback.** A branch with no geometry yet (e.g. a capture failed) falls back to its
-  LLM-assigned `parent_branch_id`; anything still unplaceable appears in a clickable tray at
-  the bottom of the board.
-- **Pan & zoom.** Scroll to zoom toward the cursor, drag to pan, or hit **Fit to screen**.
-- **Iteration timeline.** Click any frame (or tray chip) to open a drawer with that branch's
-  ordered iteration nodes — screenshot, type badge, commit hash, and summary.
+and writes a self-contained `data/<repo>/graph.html` — no graph libraries, just nested cards.
+It renders the **component tree** (each branch nested under its `parent_branch_id`, annotated
+with its fork point) and, within each branch, the ordered **iteration nodes** as screenshot
+thumbnails with their type and summary. Open the file in a browser:
 
 ```bash
-npm run backfill-geometry -- TempRepo   # first time only: measure existing branches
-npm run visualize -- TempRepo           # one repo
-npm run visualize                       # every repo found under data/
+npm run visualize -- TempRepo   # one repo
+npm run visualize               # every repo found under data/
 open data/TempRepo/graph.html
 ```
-
-Geometry is captured automatically on every new commit, so the backfill is only needed once for
-history recorded before geometry tracking existed. Both the backfill and the live capture need
-the dev server running on `CAPTURE_URL`.
 
 ## Manual testing
 
