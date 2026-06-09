@@ -312,7 +312,14 @@ async function captureOnePage(
   }
 
   await page.screenshot({ path: outputPath, fullPage: true });
-  const geometry = await fullPageGeometry(page);
+  // Only treat a full-page capture as real geometry when the target WAS full
+  // (e.g. main). A targeted capture that fell back to full page never actually
+  // measured its component, so record no geometry rather than polluting the
+  // spatial tree with a page-sized rect (which would mis-nest the branch).
+  const geometry =
+    target.mode === "full" && !target.capture
+      ? await fullPageGeometry(page)
+      : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
   return { outputPath, geometry };
 }
