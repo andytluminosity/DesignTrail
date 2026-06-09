@@ -6,7 +6,8 @@
   "scripts": {
     "capture": "tsx tracker/capture.ts",
     "track": "tsx tracker/install.ts",
-    "untrack": "tsx tracker/uninstall.ts"
+    "untrack": "tsx tracker/uninstall.ts",
+    "visualize": "tsx tracker/visualize.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

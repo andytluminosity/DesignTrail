@@ -258,9 +258,24 @@ data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 ## Scripts
 
 ```bash
-npm run capture           # Manually run the pipeline against the current repo/commit
-npm run track -- <repo>   # Install the tracking hook into one or more repos
-npm run untrack -- <repo> # Remove the tracking hook from one or more repos
+npm run capture            # Manually run the pipeline against the current repo/commit
+npm run track -- <repo>    # Install the tracking hook into one or more repos
+npm run untrack -- <repo>  # Remove the tracking hook from one or more repos
+npm run visualize -- <repo> # Render the graph to data/<repo>/graph.html (all repos if omitted)
+```
+
+## Visualizing the graph
+
+`npm run visualize` ([tracker/visualize.ts](tracker/visualize.ts)) reads a repo's SQLite graph
+and writes a self-contained `data/<repo>/graph.html` — no graph libraries, just nested cards.
+It renders the **component tree** (each branch nested under its `parent_branch_id`, annotated
+with its fork point) and, within each branch, the ordered **iteration nodes** as screenshot
+thumbnails with their type and summary. Open the file in a browser:
+
+```bash
+npm run visualize -- TempRepo   # one repo
+npm run visualize               # every repo found under data/
+open data/TempRepo/graph.html
 ```
 
 ## Manual testing
