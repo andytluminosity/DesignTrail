@@ -1,0 +1,20 @@
+{
+  "name": "designtrail",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture": "tsx tracker/capture.ts"
+  },
+  "dependencies": {
+    "fs-extra": "^11.2.0",
+    "playwright": "^1.48.0",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
