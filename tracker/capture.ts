@@ -1,7 +1,7 @@
 import path from "path";
 import { fileURLToPath } from "url";
 import { getLatestCommit, getDiff, getRepoName } from "./git.js";
-import { takeScreenshot, getPageContext } from "./screenshot.js";
+import { takeScreenshot, getSiteContext } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
 import type { CommitData } from "./types.js";
 
@@ -31,18 +31,19 @@ async function main(): Promise<void> {
     timestamp: Date.now(),
   };
 
-  // Read the live DOM first so the LLM targets elements that actually exist
-  // (prevents it from hallucinating selectors that aren't on the page).
-  const uiContext = await getPageContext(CAPTURE_URL);
+  // Read the live DOM (across pages) first so the LLM targets elements that
+  // actually exist (prevents it from hallucinating selectors that aren't there).
+  const siteContext = await getSiteContext(CAPTURE_URL);
 
   // Step: analyze the commit with the LLM BEFORE capturing anything.
   const analysis = await analyzeCommit({
     diff: commit.diff,
     commitMessage: commit.message,
-    uiContext,
+    siteContext,
   });
 
-  const { mode, value } = analysis.screenshotTarget;
+  const navPath = analysis.path ?? "/";
+  const { mode, value, capture } = analysis.screenshotTarget;
 
   console.log(`COMMIT: ${commit.hash}`);
   console.log(`REPO: ${repoName}`);
@@ -50,16 +51,22 @@ async function main(): Promise<void> {
   console.log("LLM SUMMARY:");
   console.log(analysis.summary);
   console.log("");
+  console.log("NAVIGATE TO:");
+  console.log(navPath);
+  console.log("");
   console.log("SCREENSHOT MODE:");
   console.log(mode);
   console.log("");
   console.log("SCREENSHOT TARGET:");
   console.log(mode === "full" ? "(full page)" : value ?? "(full page)");
   console.log("");
+  console.log("CAPTURE:");
+  console.log(capture ? `${capture.mode}: ${capture.value}` : "(located element)");
+  console.log("");
 
   // Captures are centralized in DesignTrail and namespaced by repo.
   const outputPath = path.join(TRACKER_ROOT, "captures", repoName, `${commit.hash}.png`);
-  await takeScreenshot(outputPath, analysis.screenshotTarget, CAPTURE_URL);
+  await takeScreenshot(outputPath, analysis.screenshotTarget, CAPTURE_URL, navPath);
 }
 
 main().catch((err) => {
