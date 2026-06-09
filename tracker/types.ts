@@ -10,6 +10,18 @@ export type LocatorSpec = {
   value: string;
 };
 
+// On-screen geometry of a located element, in page (document) pixels. pageW/pageH
+// are the full scrollable document dimensions, so the spatial board can lay every
+// component out in one shared coordinate system.
+export type NodeGeometry = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  pageW: number;
+  pageH: number;
+};
+
 export type ScreenshotTarget = {
   // how to LOCATE the changed element (or full page)
   mode: "full" | "selector" | "text" | "role";
@@ -46,6 +58,9 @@ export type IterationNode = {
   type: CommitType;
   screenshotPath: string; // relative, e.g. captures/<repo>/<hash>/<branchId>.png
   timestamp: number;
+  // On-screen rect of the located element at capture time. Undefined for nodes
+  // captured before geometry tracking existed (until backfilled).
+  geometry?: NodeGeometry;
 };
 
 // A component branch — the node of the component tree.
@@ -59,6 +74,13 @@ export type BranchRecord = {
   // locator/capture spec. Undefined for legacy branches created before this existed.
   navPath?: string;
   target?: ScreenshotTarget;
+};
+
+// Result of capturing one screenshot job: the file it wrote and, when a concrete
+// element was located, that element's on-screen geometry.
+export type ScreenshotResult = {
+  outputPath: string;
+  geometry?: NodeGeometry;
 };
 
 export type PageContext = {

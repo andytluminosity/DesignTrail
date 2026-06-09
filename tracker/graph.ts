@@ -6,6 +6,7 @@ import type {
   BranchRecord,
   CommitData,
   IterationNode,
+  NodeGeometry,
   ScreenshotTarget,
 } from "./types.js";
 import { MAIN_BRANCH } from "./branch.js";
@@ -39,7 +40,13 @@ CREATE TABLE IF NOT EXISTS nodes (
   summary         TEXT,
   type            TEXT,
   screenshot_path TEXT,
-  timestamp       INTEGER NOT NULL
+  timestamp       INTEGER NOT NULL,
+  geom_x          REAL,
+  geom_y          REAL,
+  geom_w          REAL,
+  geom_h          REAL,
+  page_w          REAL,
+  page_h          REAL
 );
 `;
 
@@ -61,6 +68,12 @@ type NodeRow = {
   type: string;
   screenshot_path: string;
   timestamp: number;
+  geom_x: number | null;
+  geom_y: number | null;
+  geom_w: number | null;
+  geom_h: number | null;
+  page_w: number | null;
+  page_h: number | null;
 };
 
 function parseTarget(raw: string | null): ScreenshotTarget | undefined {
@@ -86,6 +99,27 @@ function toBranchRecord(row: BranchRow): BranchRecord {
   };
 }
 
+function toGeometry(row: NodeRow): NodeGeometry | undefined {
+  if (
+    row.geom_x == null ||
+    row.geom_y == null ||
+    row.geom_w == null ||
+    row.geom_h == null ||
+    row.page_w == null ||
+    row.page_h == null
+  ) {
+    return undefined;
+  }
+  return {
+    x: row.geom_x,
+    y: row.geom_y,
+    w: row.geom_w,
+    h: row.geom_h,
+    pageW: row.page_w,
+    pageH: row.page_h,
+  };
+}
+
 function toIterationNode(row: NodeRow): IterationNode {
   return {
     id: row.id,
@@ -96,6 +130,7 @@ function toIterationNode(row: NodeRow): IterationNode {
     type: row.type as IterationNode["type"],
     screenshotPath: row.screenshot_path,
     timestamp: row.timestamp,
+    geometry: toGeometry(row),
   };
 }
 
@@ -126,14 +161,23 @@ export class DesignGraph {
    * SQLite has no "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info first.
    */
   private static migrate(db: Database.Database): void {
-    const cols = (db.prepare(`PRAGMA table_info(branches)`).all() as {
+    const branchCols = (db.prepare(`PRAGMA table_info(branches)`).all() as {
       name: string;
     }[]).map((c) => c.name);
-    if (!cols.includes("nav_path")) {
+    if (!branchCols.includes("nav_path")) {
       db.exec(`ALTER TABLE branches ADD COLUMN nav_path TEXT`);
     }
-    if (!cols.includes("target_json")) {
+    if (!branchCols.includes("target_json")) {
       db.exec(`ALTER TABLE branches ADD COLUMN target_json TEXT`);
+    }
+
+    const nodeCols = (db.prepare(`PRAGMA table_info(nodes)`).all() as {
+      name: string;
+    }[]).map((c) => c.name);
+    for (const col of ["geom_x", "geom_y", "geom_w", "geom_h", "page_w", "page_h"]) {
+      if (!nodeCols.includes(col)) {
+        db.exec(`ALTER TABLE nodes ADD COLUMN ${col} REAL`);
+      }
     }
   }
 
@@ -236,6 +280,26 @@ export class DesignGraph {
         type: node.type,
         screenshotPath: node.screenshotPath,
         timestamp: node.timestamp,
+      });
+  }
+
+  /** Records the on-screen geometry of a node's located element. */
+  setNodeGeometry(nodeId: string, geom: NodeGeometry): void {
+    this.db
+      .prepare(
+        `UPDATE nodes
+            SET geom_x = @x, geom_y = @y, geom_w = @w, geom_h = @h,
+                page_w = @pageW, page_h = @pageH
+          WHERE id = @id`
+      )
+      .run({
+        id: nodeId,
+        x: geom.x,
+        y: geom.y,
+        w: geom.w,
+        h: geom.h,
+        pageW: geom.pageW,
+        pageH: geom.pageH,
       });
   }
 

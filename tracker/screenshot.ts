@@ -2,7 +2,13 @@ import path from "path";
 import fse from "fs-extra";
 import { chromium } from "playwright";
 import type { ElementHandle, Locator, Page } from "playwright";
-import type { PageContext, ScreenshotTarget, UiElement } from "./types.js";
+import type {
+  NodeGeometry,
+  PageContext,
+  ScreenshotResult,
+  ScreenshotTarget,
+  UiElement,
+} from "./types.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
@@ -217,6 +223,55 @@ async function captureLocator(
   return locateLoc.first();
 }
 
+/** Full scrollable document dimensions of the currently loaded page. */
+async function pageDimensions(page: Page): Promise<{ pageW: number; pageH: number }> {
+  return await page.evaluate(() => ({
+    pageW: document.documentElement.scrollWidth,
+    pageH: document.documentElement.scrollHeight,
+  }));
+}
+
+/** Geometry of a located element in document (page) pixels, or undefined if unmeasurable. */
+async function readGeometry(loc: Locator, page: Page): Promise<NodeGeometry | undefined> {
+  try {
+    const box = await loc.boundingBox();
+    if (!box) return undefined;
+    const { pageW, pageH } = await pageDimensions(page);
+    const scroll = await page.evaluate(() => ({ sx: window.scrollX, sy: window.scrollY }));
+    return {
+      x: box.x + scroll.sx,
+      y: box.y + scroll.sy,
+      w: box.width,
+      h: box.height,
+      pageW,
+      pageH,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Full-page rect spanning the whole document, used for `full` captures (e.g. main). */
+async function fullPageGeometry(page: Page): Promise<NodeGeometry> {
+  const { pageW, pageH } = await pageDimensions(page);
+  return { x: 0, y: 0, w: pageW, h: pageH, pageW, pageH };
+}
+
+/**
+ * Geometry of the LOCATED element (the actual change target), independent of any
+ * framed/container capture region. For `full` mode there is no element, so the
+ * whole page is the rect.
+ */
+async function locatedGeometry(
+  page: Page,
+  target: ScreenshotTarget
+): Promise<NodeGeometry | undefined> {
+  if (target.mode === "full") return fullPageGeometry(page);
+  const loc = resolveLocator(page, { mode: target.mode, value: target.value });
+  if (!loc) return fullPageGeometry(page);
+  return (await readGeometry(loc.first(), page)) ?? fullPageGeometry(page);
+}
+
 export type ScreenshotJob = {
   outputPath: string;
   target: ScreenshotTarget;
@@ -226,13 +281,14 @@ export type ScreenshotJob = {
 /**
  * Captures a single job on an already-open page: navigates to its route, then
  * screenshots the located/capture element, falling back to full page on any
- * failure. Throws only if navigation itself fails (so the caller can decide).
+ * failure. Returns the file written plus the located element's geometry. Throws
+ * only if navigation itself fails (so the caller can decide).
  */
 async function captureOnePage(
   page: Page,
   job: ScreenshotJob,
   url: string
-): Promise<void> {
+): Promise<ScreenshotResult> {
   const { outputPath, target, navPath = "/" } = job;
   await fse.ensureDir(path.dirname(outputPath));
 
@@ -244,8 +300,9 @@ async function captureOnePage(
       const locator = await captureLocator(page, target);
       if (locator) {
         await locator.screenshot({ path: outputPath });
+        const geometry = await locatedGeometry(page, target);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
-        return;
+        return { outputPath, geometry };
       }
     } catch {
       console.warn(
@@ -255,16 +312,23 @@ async function captureOnePage(
   }
 
   await page.screenshot({ path: outputPath, fullPage: true });
+  const geometry = await fullPageGeometry(page);
   console.log(`Screenshot saved (full): ${outputPath}`);
+  return { outputPath, geometry };
 }
 
 /**
  * Captures many targeted screenshots reusing a SINGLE browser/page (one launch
  * for N component captures). A failure on one job does not abort the rest.
+ * Returns one result per successfully captured job (with geometry when known).
  */
-export async function takeScreenshots(jobs: ScreenshotJob[], url: string): Promise<void> {
-  if (jobs.length === 0) return;
+export async function takeScreenshots(
+  jobs: ScreenshotJob[],
+  url: string
+): Promise<ScreenshotResult[]> {
+  if (jobs.length === 0) return [];
 
+  const results: ScreenshotResult[] = [];
   let browser;
   try {
     browser = await chromium.launch();
@@ -272,7 +336,7 @@ export async function takeScreenshots(jobs: ScreenshotJob[], url: string): Promi
 
     for (const job of jobs) {
       try {
-        await captureOnePage(page, job, url);
+        results.push(await captureOnePage(page, job, url));
       } catch (err) {
         console.warn(
           `Could not capture ${job.navPath ?? "/"} for ${job.outputPath}. Skipping this one.`
@@ -288,6 +352,7 @@ export async function takeScreenshots(jobs: ScreenshotJob[], url: string): Promi
   } finally {
     await browser?.close();
   }
+  return results;
 }
 
 export async function takeScreenshot(
@@ -295,6 +360,7 @@ export async function takeScreenshot(
   target: ScreenshotTarget,
   url: string,
   navPath: string = "/"
-): Promise<void> {
-  await takeScreenshots([{ outputPath, target, navPath }], url);
+): Promise<ScreenshotResult | undefined> {
+  const [result] = await takeScreenshots([{ outputPath, target, navPath }], url);
+  return result;
 }

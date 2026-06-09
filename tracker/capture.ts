@@ -84,6 +84,9 @@ async function main(): Promise<void> {
 
   const jobs: ScreenshotJob[] = [];
   const entries: DebugEntry[] = [];
+  // outputPath -> node id, so geometry returned by the screenshotter can be
+  // written back onto the right node after captures finish.
+  const nodeByOutput = new Map<string, string>();
 
   // Persist the commit, branches, and component nodes atomically. Screenshots
   // (async IO) happen afterwards, outside the transaction.
@@ -127,11 +130,9 @@ async function main(): Promise<void> {
       });
       nodedBranches.add(branchId);
 
-      jobs.push({
-        outputPath: path.join(TRACKER_ROOT, screenshotPath),
-        target,
-        navPath,
-      });
+      const outputPath = path.join(TRACKER_ROOT, screenshotPath);
+      nodeByOutput.set(outputPath, `${commit.hash}:${branchId}`);
+      jobs.push({ outputPath, target, navPath });
 
       return { parentId, screenshotPath };
     };
@@ -219,7 +220,17 @@ async function main(): Promise<void> {
 
   logCommit(commit.hash, repoName, entries);
 
-  await takeScreenshots(jobs, CAPTURE_URL);
+  const results = await takeScreenshots(jobs, CAPTURE_URL);
+
+  // Persist each captured element's geometry onto its node so the spatial board
+  // can nest/position branches by real on-screen containment.
+  graph.transaction(() => {
+    for (const { outputPath, geometry } of results) {
+      if (!geometry) continue;
+      const nodeId = nodeByOutput.get(outputPath);
+      if (nodeId) graph.setNodeGeometry(nodeId, geometry);
+    }
+  });
 
   graph.close();
 }

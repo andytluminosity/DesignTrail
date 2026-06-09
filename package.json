@@ -7,7 +7,8 @@
     "capture": "tsx tracker/capture.ts",
     "track": "tsx tracker/install.ts",
     "untrack": "tsx tracker/uninstall.ts",
-    "visualize": "tsx tracker/visualize.ts"
+    "visualize": "tsx tracker/visualize.ts",
+    "backfill-geometry": "tsx tracker/backfill-geometry.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

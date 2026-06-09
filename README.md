@@ -74,8 +74,16 @@ commits  (hash PK, message, diff, timestamp)                 -- per-commit data,
 branches (id PK, parent_branch_id, fork_node_id, created_at, -- the component tree
           nav_path, target_json)                             -- how to re-screenshot the branch
 nodes    (id PK = "<hash>:<branch>", commit_hash, branch_id, -- one per component change
-          parent_id, summary, type, screenshot_path, timestamp)
+          parent_id, summary, type, screenshot_path, timestamp,
+          geom_x, geom_y, geom_w, geom_h, page_w, page_h)    -- located element's on-screen rect
 ```
+
+Each node also records the **on-screen geometry** of its located element (the
+component's bounding box in document pixels, plus the full page dimensions). This
+is what lets the visualizer reconstruct a real spatial frame tree (see
+[Visualizing the graph](#visualizing-the-graph)) instead of relying on the LLM's
+semantic nesting. Geometry is captured automatically for new commits; older nodes
+have it backfilled by `npm run backfill-geometry`.
 
 Console output is a per-component block under each commit:
 
@@ -261,9 +269,12 @@ tracker/
   branch.ts       slug/resolveBranch/resolveParentBranch (component -> branch id)
   graph.ts        DesignGraph over SQLite (commits/branches/nodes); tips, ensureBranch, addNode, exportGraph
   screenshot.ts   getSiteContext(url) for live DOM map + takeScreenshots(jobs, url) (one browser, full-page fallback)
+  layout.ts       buildLayout: derives a spatial frame tree from node geometry (containment + reading order)
+  visualize.ts    Renders the per-repo graph.html as a pan/zoom Figma/Miro-style spatial board
+  backfill-geometry.ts  One-off: populates geometry for branches captured before geometry tracking
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
-  types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord
+  types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
 captures/         Saved screenshots, namespaced as captures/<repo>/<hash>/<component>.png (git-ignored)
 data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 ```
@@ -275,21 +286,39 @@ npm run capture            # Manually run the pipeline against the current repo/
 npm run track -- <repo>    # Install the tracking hook into one or more repos
 npm run untrack -- <repo>  # Remove the tracking hook from one or more repos
 npm run visualize -- <repo> # Render the graph to data/<repo>/graph.html (all repos if omitted)
+npm run backfill-geometry -- <repo> # Backfill on-screen geometry for pre-geometry nodes (all repos if omitted)
 ```
 
 ## Visualizing the graph
 
 `npm run visualize` ([tracker/visualize.ts](tracker/visualize.ts)) reads a repo's SQLite graph
-and writes a self-contained `data/<repo>/graph.html` — no graph libraries, just nested cards.
-It renders the **component tree** (each branch nested under its `parent_branch_id`, annotated
-with its fork point) and, within each branch, the ordered **iteration nodes** as screenshot
-thumbnails with their type and summary. Open the file in a browser:
+and writes a self-contained `data/<repo>/graph.html` — no graph libraries, just positioned
+`<div>`s and a little vanilla JS. It renders a **Figma/Miro-style spatial board**: every branch
+is a **frame** placed at its located element's real on-screen rect, so the hierarchy reflects
+what actually contains what on the page.
+
+- **Geometry-driven nesting.** [tracker/layout.ts](tracker/layout.ts) (`buildLayout`) assigns
+  each frame's parent as the smallest *other* frame whose rect fully encloses it (true spatial
+  containment), and orders siblings in reading order (top-to-bottom, then left-to-right). This
+  is why a `logo` frame nests inside the `sidebar` frame: its bounding box sits inside the
+  sidebar's. `main` (a full-page capture) is the outer page rect that contains everything.
+- **Fallback.** A branch with no geometry yet (e.g. a capture failed) falls back to its
+  LLM-assigned `parent_branch_id`; anything still unplaceable appears in a clickable tray at
+  the bottom of the board.
+- **Pan & zoom.** Scroll to zoom toward the cursor, drag to pan, or hit **Fit to screen**.
+- **Iteration timeline.** Click any frame (or tray chip) to open a drawer with that branch's
+  ordered iteration nodes — screenshot, type badge, commit hash, and summary.
 
 ```bash
-npm run visualize -- TempRepo   # one repo
-npm run visualize               # every repo found under data/
+npm run backfill-geometry -- TempRepo   # first time only: measure existing branches
+npm run visualize -- TempRepo           # one repo
+npm run visualize                       # every repo found under data/
 open data/TempRepo/graph.html
 ```
+
+Geometry is captured automatically on every new commit, so the backfill is only needed once for
+history recorded before geometry tracking existed. Both the backfill and the live capture need
+the dev server running on `CAPTURE_URL`.
 
 ## Manual testing
 
