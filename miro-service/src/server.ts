@@ -1,12 +1,16 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import { writeFileSync } from "fs";
+import path from "path";
 
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const { MIRO_CLIENT_ID, MIRO_CLIENT_SECRET, MIRO_REDIRECT_URI } = process.env;
 
 const PORT = 3000;
+const TOKEN_FILE = path.resolve(__dirname, "../../.miro-token.json");
+let miroAccessToken: string | null = null;
 
 const app = express();
 app.use(express.json());
@@ -46,7 +50,9 @@ app.get("/oauth/callback", async (req, res) => {
     );
 
     const accessToken = response.data.access_token;
-    console.log(`ACCESS TOKEN: ${accessToken}`);
+    miroAccessToken = accessToken;
+    writeFileSync(TOKEN_FILE, JSON.stringify({ accessToken }, null, 2));
+    console.log("Miro token stored successfully");
 
     return res.send("OAuth complete. You can return to the app.");
   } catch (error: any) {
@@ -56,13 +62,16 @@ app.get("/oauth/callback", async (req, res) => {
 });
 
 app.post("/test-node", async (req, res) => {
-  const { accessToken, boardId } = req.body as {
-    accessToken?: string;
+  const { boardId } = req.body as {
     boardId?: string;
   };
 
-  if (!accessToken || !boardId) {
-    return res.status(400).send("Missing accessToken or boardId");
+  if (!miroAccessToken) {
+    return res.status(401).send("Not authenticated with Miro");
+  }
+
+  if (!boardId) {
+    return res.status(400).send("Missing boardId");
   }
 
   try {
@@ -74,7 +83,7 @@ app.post("/test-node", async (req, res) => {
       },
       {
         headers: {
-          Authorization: `Bearer ${accessToken}`,
+          Authorization: `Bearer ${miroAccessToken}`,
           "Content-Type": "application/json",
         },
       }
