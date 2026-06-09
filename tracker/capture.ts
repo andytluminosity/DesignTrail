@@ -21,9 +21,10 @@ try {
 const CAPTURE_URL = process.env.CAPTURE_URL ?? "http://localhost:3000";
 
 async function main(): Promise<void> {
-  const { hash, message } = await getLatestCommit();
-  const diff = await getDiff(hash);
-  const repoName = await getRepoName();
+  const repoPath = path.resolve(process.argv[2] ?? process.cwd());
+  const { hash, message } = await getLatestCommit(repoPath);
+  const diff = await getDiff(hash, repoPath);
+  const repoName = await getRepoName(repoPath);
 
   const commit: CommitData = {
     hash,

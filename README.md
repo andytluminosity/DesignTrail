@@ -128,7 +128,8 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
 
 1. The watched repo's `post-commit` hook runs the tracker. git sets the working directory
    to that repo, so the tracker reads **that repo's** latest commit and diff, while loading
-   its own dependencies and `.env` from the DesignTrail install.
+   its own dependencies and `.env` from the DesignTrail install. For manual runs, pass a
+   repo path with `npm run capture -- /path/to/repo`.
 2. `analyzeCommit` sends the commit message + diff to OpenAI and gets back structured JSON.
 3. A targeted screenshot is captured based on the LLM's decision.
 4. The PNG is saved to `captures/<repo-name>/<commit-hash>.png` inside DesignTrail (captures
@@ -218,18 +219,22 @@ captures/         Saved screenshots, namespaced as captures/<repo>/<hash>.png (g
 ## Scripts
 
 ```bash
-npm run capture           # Manually run the pipeline against the current repo/commit
-npm run track -- <repo>   # Install the tracking hook into one or more repos
-npm run untrack -- <repo> # Remove the tracking hook from one or more repos
+npm run capture             # Manually run the pipeline against the current repo/commit
+npm run capture -- <repo>   # Manually run the pipeline against a specific repo/commit
+npm run track -- <repo>     # Install the tracking hook into one or more repos
+npm run untrack -- <repo>   # Remove the tracking hook from one or more repos
 ```
 
 ## Manual testing
 
 ```bash
 # Start the dev server for the app you track (must serve CAPTURE_URL)
-# then, from the watched repo:
+# then either commit from the watched repo:
 git commit -m "tweak layout"
 # ...the tracker runs automatically and writes captures/<repo>/<hash>.png
+
+# or manually capture a specific repo:
+npm run capture -- /path/to/watched-repo
 ```
 
 ## Notes and constraints
