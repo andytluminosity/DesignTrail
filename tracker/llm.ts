@@ -66,6 +66,26 @@ HOW TO READ THE EXISTING COMPONENT TREE:
 - Never set "parentBranch" to a name that is not in the tree; never set it to the new
   component's own name.
 
+COMPONENT GRANULARITY — BE AGGRESSIVE ABOUT SPLITTING SUB-COMPONENTS:
+- Decompose changes to the finest NAMED, REUSABLE sub-component. A container like a sidebar
+  has distinct sub-components (its logo/brand mark, its nav, its footer). When a change
+  targets one specific named sub-element, give that sub-element its OWN dedicated branch
+  nested under the container, instead of attributing the change to the broad container branch.
+  Example: a change to the sidebar's logo => component "logo", parentBranch "sidebar" (NOT
+  component "sidebar"). A change to a nav inside a sidebar => component "nav", parentBranch
+  "sidebar".
+- RESERVE the container branch (e.g. "sidebar") for changes that affect the component AS A
+  WHOLE: adding/removing/reordering its children, layout, or adding a new control that
+  restructures it (e.g. adding a collapse toggle to the sidebar => component "sidebar").
+- Concrete worked examples:
+  - Logo text changes from "IT" to "ITQQ":
+    { "component": "logo", "parentBranch": "sidebar", "type": "UI_CHANGE",
+      "screenshotTarget": { "mode": "selector", "value": ".sidebar__logo" } }
+  - A collapse toggle button is added to the sidebar:
+    { "component": "sidebar", "type": "UI_CHANGE",
+      "screenshotTarget": { "mode": "selector", "value": ".sidebar__collapse",
+        "capture": { "mode": "selector", "value": ".sidebar" } } }
+
 CRITICAL targeting rules:
 - The "UI CONTEXT" section lists pages (as "PAGE <route>:") and, under each, the elements
   that ACTUALLY exist on that page. You MUST only target elements that appear there. NEVER
@@ -75,9 +95,19 @@ CRITICAL targeting rules:
 - "mode"/"value" describe how to LOCATE the changed element. Prefer "text" (exact visible
   text from the context) or "role" because they are the most robust. Use "selector" only when
   a class/id from the context clearly isolates the element.
-- "capture" is OPTIONAL and describes the element to actually SCREENSHOT — normally the
-  nearest containing component that fully frames the change. Omit "capture" to screenshot the
-  located element itself.
+
+CRITICAL capture-framing rules:
+- "capture" describes the element to actually SCREENSHOT. NEVER screenshot a bare atomic
+  control or a tiny text node in isolation (a lone button, a 1-6 character logo, a single
+  icon) — the result is an unreadable crop with no context.
+- Always frame the change in the smallest MEANINGFUL, self-contained containing component.
+  When the located element is a tiny control, set "capture" to its containing component (use
+  the element's "parent=" hint or an enclosing container present in the UI CONTEXT).
+- For a change that RESTRUCTURES a container (e.g. a toggle added to the sidebar), set
+  "capture" to the WHOLE container (e.g. { "mode": "selector", "value": ".sidebar" }).
+- The "capture" selector/text/role MUST be an element present in the UI CONTEXT on that page.
+- Omit "capture" only when the located element is itself already a meaningful, well-framed
+  component.
 - Emit one entry per distinct changed component. If the change is broad, non-visual, or
   unclear, or the UI CONTEXT is empty, return a SINGLE entry with "component": "", "path": "/"
   and mode "full" (no "capture").`;
@@ -98,6 +128,7 @@ function formatSiteContext(site: PageContext[] | null | undefined): string {
           if (e.role) meta.push(`role="${e.role}"`);
           if (e.testid) meta.push(`data-testid="${e.testid}"`);
           if (e.text) meta.push(`text=${JSON.stringify(e.text)}`);
+          if (e.parent) meta.push(`parent=${e.parent}`);
           return `  - ${selector}${meta.length ? " " + meta.join(" ") : ""}`;
         })
         .join("\n");

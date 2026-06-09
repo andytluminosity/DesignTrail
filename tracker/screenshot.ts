@@ -29,8 +29,32 @@ async function extractElements(page: Page, limit: number): Promise<UiElement[]> 
       role?: string;
       testid?: string;
       text?: string;
+      parent?: string;
     }> = [];
     const seen = new Set<string>();
+
+    // Best-effort selector for an element from its id or first class.
+    const selectorFor = (el: Element): string | undefined => {
+      const htmlEl = el as HTMLElement;
+      if (htmlEl.id) return `#${htmlEl.id}`;
+      const cls =
+        typeof htmlEl.className === "string" && htmlEl.className.trim()
+          ? htmlEl.className.trim().split(/\s+/)
+          : [];
+      if (cls.length) return `.${cls[0]}`;
+      return undefined;
+    };
+
+    // Nearest ancestor that has a stable id/class we can target.
+    const nearestIdentifiableAncestor = (el: Element): string | undefined => {
+      let parent = el.parentElement;
+      while (parent && parent !== document.body) {
+        const sel = selectorFor(parent);
+        if (sel) return sel;
+        parent = parent.parentElement;
+      }
+      return undefined;
+    };
 
     const all = Array.from(document.body.querySelectorAll("*"));
     for (const el of all) {
@@ -56,13 +80,15 @@ async function extractElements(page: Page, limit: number): Promise<UiElement[]> 
       // Skip elements with no useful identifier at all.
       if (!id && classes.length === 0 && !role && !testid && !text) continue;
 
+      const parent = nearestIdentifiableAncestor(htmlEl);
+
       // Include text in the key so structurally identical but distinct
       // components (e.g. repeated cards) are not collapsed into one entry.
       const key = `${tag}#${id ?? ""}.${classes.join(".")}[${role ?? ""}]{${text}}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
-      out.push({ tag, id, classes, role, testid, text: text || undefined });
+      out.push({ tag, id, classes, role, testid, text: text || undefined, parent });
       if (out.length >= max) break;
     }
     return out;

@@ -2,7 +2,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import fse from "fs-extra";
 import Database from "better-sqlite3";
-import type { BranchRecord, CommitData, IterationNode } from "./types.js";
+import type {
+  BranchRecord,
+  CommitData,
+  IterationNode,
+  ScreenshotTarget,
+} from "./types.js";
 import { MAIN_BRANCH } from "./branch.js";
 
 // Resolve DesignTrail root so the DB lives in /data regardless of which repo's
@@ -21,7 +26,9 @@ CREATE TABLE IF NOT EXISTS branches (
   id               TEXT PRIMARY KEY,
   parent_branch_id TEXT,
   fork_node_id     TEXT,
-  created_at       INTEGER NOT NULL
+  created_at       INTEGER NOT NULL,
+  nav_path         TEXT,
+  target_json      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
@@ -41,6 +48,8 @@ type BranchRow = {
   parent_branch_id: string | null;
   fork_node_id: string | null;
   created_at: number;
+  nav_path: string | null;
+  target_json: string | null;
 };
 
 type NodeRow = {
@@ -54,12 +63,26 @@ type NodeRow = {
   timestamp: number;
 };
 
+function parseTarget(raw: string | null): ScreenshotTarget | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as ScreenshotTarget)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function toBranchRecord(row: BranchRow): BranchRecord {
   return {
     id: row.id,
     parentBranchId: row.parent_branch_id,
     forkNodeId: row.fork_node_id,
     createdAt: row.created_at,
+    navPath: row.nav_path ?? undefined,
+    target: parseTarget(row.target_json),
   };
 }
 
@@ -94,7 +117,24 @@ export class DesignGraph {
     const db = new Database(path.join(dir, "graph.db"));
     db.pragma("journal_mode = WAL");
     db.exec(SCHEMA);
+    DesignGraph.migrate(db);
     return new DesignGraph(db);
+  }
+
+  /**
+   * Adds columns introduced after the original schema to pre-existing databases.
+   * SQLite has no "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info first.
+   */
+  private static migrate(db: Database.Database): void {
+    const cols = (db.prepare(`PRAGMA table_info(branches)`).all() as {
+      name: string;
+    }[]).map((c) => c.name);
+    if (!cols.includes("nav_path")) {
+      db.exec(`ALTER TABLE branches ADD COLUMN nav_path TEXT`);
+    }
+    if (!cols.includes("target_json")) {
+      db.exec(`ALTER TABLE branches ADD COLUMN target_json TEXT`);
+    }
   }
 
   upsertCommit(commit: CommitData): void {
@@ -146,19 +186,37 @@ export class DesignGraph {
   ensureBranch(
     id: string,
     parentBranchId: string | null,
-    forkNodeId: string | null
+    forkNodeId: string | null,
+    navPath?: string,
+    target?: ScreenshotTarget
   ): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO branches (id, parent_branch_id, fork_node_id, created_at)
-         VALUES (@id, @parentBranchId, @forkNodeId, @createdAt)`
+        `INSERT OR IGNORE INTO branches
+           (id, parent_branch_id, fork_node_id, created_at, nav_path, target_json)
+         VALUES (@id, @parentBranchId, @forkNodeId, @createdAt, @navPath, @targetJson)`
       )
       .run({
         id,
         parentBranchId: id === MAIN_BRANCH ? null : parentBranchId,
         forkNodeId,
         createdAt: Date.now(),
+        navPath: navPath ?? null,
+        targetJson: target ? JSON.stringify(target) : null,
       });
+  }
+
+  /**
+   * Records (or refreshes) how to re-screenshot a branch's component: the route
+   * to navigate to and the locator/capture spec. Used by cascading ancestor
+   * updates so any branch can be re-captured on demand.
+   */
+  setBranchCapture(id: string, navPath: string, target: ScreenshotTarget): void {
+    this.db
+      .prepare(
+        `UPDATE branches SET nav_path = @navPath, target_json = @targetJson WHERE id = @id`
+      )
+      .run({ id, navPath, targetJson: JSON.stringify(target) });
   }
 
   addNode(node: IterationNode): void {

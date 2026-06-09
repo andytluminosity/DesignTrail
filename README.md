@@ -45,6 +45,18 @@ therefore produce several nodes and several screenshots. Nodes are organized int
 - **Nesting is LLM-driven.** When a commit introduces a brand-new component, the LLM picks
   which existing branch it nests under (any branch in the tree), recorded as
   `parent_branch_id`. `fork_node_id` pins the node it split from.
+- **Aggressive sub-component splitting.** Distinct named sub-components (e.g. a sidebar's
+  logo) get their OWN branch nested under their container instead of being lumped into the
+  container branch. The container branch is reserved for whole-component changes (layout, a
+  new control like a collapse toggle). Small atomic controls are screenshotted framed in
+  their containing component, never as a bare crop.
+- **Cascading ancestor updates.** Whenever a commit adds a new component (branch), every
+  ancestor up to `main` gets a fresh appended node that re-captures the ancestor's own
+  component, reflecting the new descendant (e.g. adding a `logo` appends an update node to
+  `sidebar` showing the whole sidebar, and to `main` as a full-page shot). This is
+  append-only: ancestors gain a new node and screenshot; existing history is never
+  overwritten. To make re-capture possible, each branch persists how to screenshot itself
+  (`nav_path` + `target_json`).
 - **Stable identity.** The existing branch tree is rendered into the prompt with explicit
   parsing instructions, so the LLM reuses an exact existing branch name when a change
   targets that same component (instead of inventing a near-duplicate like `side-nav` vs
@@ -59,7 +71,8 @@ deterministic, rebuilt from disk on every commit). `DesignGraph.exportGraph()` r
 
 ```sql
 commits  (hash PK, message, diff, timestamp)                 -- per-commit data, stored once
-branches (id PK, parent_branch_id, fork_node_id, created_at) -- the component tree
+branches (id PK, parent_branch_id, fork_node_id, created_at, -- the component tree
+          nav_path, target_json)                             -- how to re-screenshot the branch
 nodes    (id PK = "<hash>:<branch>", commit_hash, branch_id, -- one per component change
           parent_id, summary, type, screenshot_path, timestamp)
 ```

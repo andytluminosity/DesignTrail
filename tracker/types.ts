@@ -54,6 +54,11 @@ export type BranchRecord = {
   parentBranchId: string | null; // null for main; component nesting (LLM-driven)
   forkNodeId: string | null; // parent-branch tip node this split from (fork point)
   createdAt: number;
+  // How to re-screenshot this branch's component on demand (e.g. for cascading
+  // ancestor updates). navPath is the route to navigate to; target is the
+  // locator/capture spec. Undefined for legacy branches created before this existed.
+  navPath?: string;
+  target?: ScreenshotTarget;
 };
 
 export type PageContext = {
@@ -68,4 +73,7 @@ export type UiElement = {
   role?: string;
   testid?: string;
   text?: string;
+  // Best-effort selector for the nearest identifiable ancestor (id/class), so
+  // the LLM can choose a containing component to capture (frame the change).
+  parent?: string;
 };

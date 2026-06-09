@@ -6,7 +6,17 @@ import type { ScreenshotJob } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
 import { DesignGraph } from "./graph.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "./branch.js";
-import type { CommitData, IterationNode } from "./types.js";
+import type { CommitData, IterationNode, ScreenshotTarget } from "./types.js";
+
+/**
+ * How to re-screenshot an ancestor branch whose stored capture is missing
+ * (legacy branches created before per-branch capture persistence). main -> full
+ * page; any other branch -> its class as a best-effort container selector.
+ */
+function fallbackTarget(branchId: string): ScreenshotTarget {
+  if (branchId === MAIN_BRANCH) return { mode: "full" };
+  return { mode: "selector", value: `[class~="${branchId}"]` };
+}
 
 // Resolve the tracker's own root (DesignTrail) so the pipeline works no matter
 // which repo's git hook triggered it (e.g. DesignTrail itself or TempRepo).
@@ -80,8 +90,56 @@ async function main(): Promise<void> {
   graph.transaction(() => {
     graph.upsertCommit(commit);
 
+    // Ensure the root exists so cascading updates can always reach it; it is
+    // captured full-page.
+    graph.ensureBranch(MAIN_BRANCH, null, null, "/", { mode: "full" });
+
+    // Branches created in THIS commit (trigger cascading ancestor updates) and
+    // branches that already received a node this commit (skipped by the cascade).
+    const newBranches: string[] = [];
+    const nodedBranches = new Set<string>();
+
+    const addNodeAndJob = (
+      branchId: string,
+      summary: string,
+      type: IterationNode["type"],
+      target: ScreenshotTarget,
+      navPath: string
+    ): { parentId: string | null; screenshotPath: string } => {
+      // Parent node is the current tip of this branch (null if just created).
+      const parentId = graph.getBranchTip(branchId);
+      const screenshotPath = path.join(
+        "captures",
+        repoName,
+        commit.hash,
+        `${branchId}.png`
+      );
+
+      graph.addNode({
+        id: `${commit.hash}:${branchId}`,
+        commitHash: commit.hash,
+        branchId,
+        parentId,
+        summary,
+        type,
+        screenshotPath,
+        timestamp: commit.timestamp,
+      });
+      nodedBranches.add(branchId);
+
+      jobs.push({
+        outputPath: path.join(TRACKER_ROOT, screenshotPath),
+        target,
+        navPath,
+      });
+
+      return { parentId, screenshotPath };
+    };
+
     for (const change of components) {
       const branchId = resolveBranch(change.component);
+      const navPath = change.path ?? "/";
+      const target = change.screenshotTarget;
 
       if (!graph.branchExists(branchId)) {
         const parentBranchId =
@@ -89,32 +147,20 @@ async function main(): Promise<void> {
             ? null
             : resolveParentBranch(change.parentBranch, graph.getBranchNames());
         const forkNodeId = parentBranchId ? graph.getBranchTip(parentBranchId) : null;
-        graph.ensureBranch(branchId, parentBranchId, forkNodeId);
+        graph.ensureBranch(branchId, parentBranchId, forkNodeId, navPath, target);
+        if (branchId !== MAIN_BRANCH) newBranches.push(branchId);
+      } else {
+        // Refresh how to re-screenshot this component for future cascades.
+        graph.setBranchCapture(branchId, navPath, target);
       }
 
-      // Parent node is the current tip of this component branch (null if the
-      // branch was just created in this commit).
-      const parentId = graph.getBranchTip(branchId);
-
-      const screenshotPath = path.join("captures", repoName, commit.hash, `${branchId}.png`);
-
-      const node: IterationNode = {
-        id: `${commit.hash}:${branchId}`,
-        commitHash: commit.hash,
+      const { parentId, screenshotPath } = addNodeAndJob(
         branchId,
-        parentId,
-        summary: change.summary,
-        type: change.type,
-        screenshotPath,
-        timestamp: commit.timestamp,
-      };
-      graph.addNode(node);
-
-      jobs.push({
-        outputPath: path.join(TRACKER_ROOT, screenshotPath),
-        target: change.screenshotTarget,
-        navPath: change.path ?? "/",
-      });
+        change.summary,
+        change.type,
+        target,
+        navPath
+      );
 
       const branchRecord = graph.getBranch(branchId);
       entries.push({
@@ -123,6 +169,49 @@ async function main(): Promise<void> {
         parentId,
         type: change.type,
         summary: change.summary,
+        screenshotPath,
+      });
+    }
+
+    // Cascading ancestor updates: whenever a new component (branch) is added,
+    // every ancestor up to the root gets a fresh node re-capturing its own
+    // component, reflecting the new descendant. Append-only: each ancestor gains
+    // one new node (deduped per commit), never overwriting prior history.
+    const triggeredBy = new Map<string, Set<string>>();
+    for (const created of newBranches) {
+      let current = graph.getBranch(created)?.parentBranchId ?? null;
+      while (current) {
+        if (!triggeredBy.has(current)) triggeredBy.set(current, new Set());
+        triggeredBy.get(current)!.add(created);
+        current = graph.getBranch(current)?.parentBranchId ?? null;
+      }
+    }
+
+    for (const [ancestor, children] of triggeredBy) {
+      // A branch directly changed this commit already has an up-to-date node.
+      if (nodedBranches.has(ancestor)) continue;
+
+      const branch = graph.getBranch(ancestor);
+      const target = branch?.target ?? fallbackTarget(ancestor);
+      const navPath = branch?.navPath ?? "/";
+      const summary = `Updated to reflect new nested component(s): ${[...children]
+        .sort()
+        .join(", ")}`;
+
+      const { parentId, screenshotPath } = addNodeAndJob(
+        ancestor,
+        summary,
+        "UI_CHANGE",
+        target,
+        navPath
+      );
+
+      entries.push({
+        branchId: ancestor,
+        parentBranchId: branch?.parentBranchId ?? null,
+        parentId,
+        type: "UI_CHANGE",
+        summary,
         screenshotPath,
       });
     }
