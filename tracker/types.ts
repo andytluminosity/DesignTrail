@@ -6,11 +6,6 @@ export type CommitData = {
   repoName?: string;
 };
 
-export type LocatorSpec = {
-  mode: "selector" | "text" | "role";
-  value: string;
-};
-
 // On-screen geometry of a located element, in page (document) pixels. pageW/pageH
 // are the full scrollable document dimensions, so the spatial board can lay every
 // component out in one shared coordinate system.
@@ -24,13 +19,11 @@ export type NodeGeometry = {
 };
 
 export type ScreenshotTarget = {
-  // How to locate the changed element (or full page).
+  // How to locate the changed element (or full page). For a non-full target we
+  // screenshot/measure the located element's immediate parent container, which
+  // defines this component's branch and drives the recorded geometry.
   mode: "full" | "selector" | "text" | "role";
   value?: string;
-  // Container to climb to and screenshot/measure: the smallest meaningful frame
-  // around the located element. It defines this component's branch and drives
-  // both the screenshot and the recorded geometry. Absent for "full" captures.
-  capture?: LocatorSpec;
 };
 
 export type CommitType = "UI_CHANGE" | "FEATURE" | "REFACTOR" | "UNKNOWN";

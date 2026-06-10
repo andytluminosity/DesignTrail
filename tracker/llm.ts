@@ -4,7 +4,6 @@ import type {
   CommitAnalysis,
   CommitType,
   ComponentChange,
-  LocatorSpec,
   PageContext,
   ScreenshotTarget,
 } from "./types.js";
@@ -25,7 +24,6 @@ const FALLBACK: CommitAnalysis = {
 
 const VALID_TYPES: CommitType[] = ["UI_CHANGE", "FEATURE", "REFACTOR", "UNKNOWN"];
 const VALID_MODES: ScreenshotTarget["mode"][] = ["full", "selector", "text", "role"];
-const VALID_CAPTURE_MODES: LocatorSpec["mode"][] = ["selector", "text", "role"];
 
 const SYSTEM_PROMPT = `You are a design-change analyzer for a git-based UI iteration tracker.
 Given a commit message, its diff, a snapshot of the LIVE rendered DOM for each page,
@@ -44,11 +42,7 @@ Respond with ONLY a JSON object in exactly this shape:
       "screenshotTarget": {
         "mode": "full" | "selector" | "text" | "role" (use "full" ONLY when component is "";
                 a NAMED component MUST locate its change with selector/text/role),
-        "value": string (omit ONLY when mode is "full"),
-        "capture": {
-          "mode": "selector" | "text" | "role",
-          "value": string (REQUIRED for a named component: the container that IS this component)
-        }
+        "value": string (omit ONLY when mode is "full")
       }
     }
   ]
@@ -78,24 +72,21 @@ COMPONENT GRANULARITY — BE AGGRESSIVE ABOUT SPLITTING SUB-COMPONENTS:
 - RESERVE the container branch (e.g. "sidebar") for changes that affect the component AS A
   WHOLE: adding/removing/reordering its children, layout, or adding a new control that
   restructures it (e.g. adding a collapse toggle to the sidebar => component "sidebar").
-- Concrete worked examples:
-  - Logo text changes from "IT" to "ITQQ" (locate the text, climb to the logo area):
+- Concrete worked examples (locate the changed element precisely; the tracker screenshots
+  its immediate parent container automatically):
+  - Logo text changes from "IT" to "ITQQ" (locate the text node itself):
     { "component": "logo", "parentBranch": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "text", "value": "ITQQ",
-        "capture": { "mode": "selector", "value": ".sidebar__logo" } } }
-  - Footer version text changes from "v0.1.0" to "v0.1.1" (locate the text, climb to the
-    footer area — do NOT attribute this to the whole sidebar, and do NOT use mode "full"):
+      "screenshotTarget": { "mode": "text", "value": "ITQQ" } }
+  - Footer version text changes from "v0.1.0" to "v0.1.1" (locate the text — do NOT attribute
+    this to the whole sidebar, and do NOT use mode "full"):
     { "component": "footer", "parentBranch": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "text", "value": "v0.1.1",
-        "capture": { "mode": "selector", "value": ".sidebar__footer" } } }
-  - A nav link label changes (locate the link, climb to the nav area):
+      "screenshotTarget": { "mode": "text", "value": "v0.1.1" } }
+  - A nav link label changes (locate the link):
     { "component": "nav", "parentBranch": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "text", "value": "Projects",
-        "capture": { "mode": "selector", "value": ".sidebar__nav" } } }
+      "screenshotTarget": { "mode": "text", "value": "Projects" } }
   - A collapse toggle button is added to the sidebar (a container-wide change):
     { "component": "sidebar", "type": "UI_CHANGE",
-      "screenshotTarget": { "mode": "selector", "value": ".sidebar",
-        "capture": { "mode": "selector", "value": ".sidebar" } } }
+      "screenshotTarget": { "mode": "selector", "value": ".sidebar__collapse" } }
 
 CRITICAL targeting rules:
 - The "UI CONTEXT" section lists pages (as "PAGE <route>:") and, under each, the elements
@@ -107,28 +98,21 @@ CRITICAL targeting rules:
   text from the context) or "role" because they are the most robust. Use "selector" only when
   a class/id from the context clearly isolates the element.
 
-CONTAINER MODEL — "mode"/"value" LOCATE the change, "capture" FRAMES the branch:
-- "mode"/"value" pinpoint the changed element (the text node, icon, button, etc.).
-- "capture" names the SMALLEST MEANINGFUL SELF-CONTAINED CONTAINER that frames that
-  element — this container is what gets screenshotted AND measured, and it DEFINES this
-  component's branch. It MUST be an element that exists in the UI CONTEXT.
-- Each sub-component climbs to its OWN container, NOT to the shared parent. The logo climbs
-  to its own logo area (e.g. ".sidebar__logo"), the nav climbs to its own nav area — so the
-  branches' rects stay strictly enclosed and nest cleanly. NEVER point two different
-  components' "capture" at the same shared container; that produces equal rects that cannot
-  nest.
-- A change that affects a container AS A WHOLE belongs to that container's own branch: set
-  "component" to the container and point both the located element and "capture" at it.
-- The "capture" container IS the named component — it is exactly what we screenshot and
-  measure for that branch. A NAMED component is ALWAYS a concrete on-screen container, so it
-  MUST use mode selector/text/role to locate the change AND provide a "capture" container.
+CONTAINER MODEL — "mode"/"value" LOCATE the change; the tracker FRAMES the branch:
+- "mode"/"value" pinpoint the changed element (the text node, icon, button, etc.). Pick the
+  MOST SPECIFIC element that actually changed, and make sure it exists in the UI CONTEXT.
+- The tracker automatically climbs EXACTLY ONE DOM level up from the located element and
+  screenshots/measures that immediate parent container — that parent is what DEFINES this
+  component's branch. So choose "mode"/"value" such that the located element's direct parent
+  is the meaningful frame for this component.
+- A change that affects a container AS A WHOLE belongs to that container's own branch: locate
+  a direct child of that container so the one-level climb lands on the container itself.
+- A NAMED component is ALWAYS a concrete on-screen area, so it MUST use mode selector/text/role
+  to locate the change (never "full").
 - NEVER use mode "full" for a named component. "full" screenshots the ENTIRE page and is
   reserved EXCLUSIVELY for "component": "" (a genuinely global, page-wide, or non-visual
   change). A small text/style tweak to one area (a footer version string, a single label,
-  one stat color) is NOT global — locate it and climb to its own container instead.
-- Omit "capture" only when "mode" is "full" (i.e. only for "component": ""). For any located
-  element, provide a "capture" container (it may equal the located element itself if the
-  element is already its own smallest meaningful frame).
+  one stat color) is NOT global — locate the changed element instead.
 - Emit one entry per distinct changed component. Only when the change is genuinely page-wide,
   non-visual, or the UI CONTEXT is empty, return a SINGLE entry with "component": "",
   "path": "/" and mode "full".`;
@@ -202,20 +186,6 @@ export function formatBranchTree(branches: BranchRecord[]): string {
   );
 }
 
-/**
- * Validates the optional container `capture` spec the LLM picks to climb to and
- * screenshot. Only selector/text/role are valid (full has no container), and a
- * non-empty value is required; otherwise the climb is dropped.
- */
-function validateCapture(raw: unknown): LocatorSpec | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined;
-  const obj = raw as Record<string, unknown>;
-  if (!VALID_CAPTURE_MODES.includes(obj.mode as LocatorSpec["mode"])) return undefined;
-  const value = typeof obj.value === "string" ? obj.value.trim() : "";
-  if (!value) return undefined;
-  return { mode: obj.mode as LocatorSpec["mode"], value };
-}
-
 function validateComponent(
   raw: unknown,
   existingBranchNames: Set<string>
@@ -254,8 +224,7 @@ function validateComponent(
     if (mode !== "full") {
       const value = typeof target.value === "string" ? target.value.trim() : "";
       if (value) {
-        const capture = validateCapture(target.capture);
-        screenshotTarget = { mode, value, ...(capture ? { capture } : {}) };
+        screenshotTarget = { mode, value };
       }
     }
   }

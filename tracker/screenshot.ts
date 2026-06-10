@@ -175,12 +175,13 @@ function resolveLocator(
 }
 
 /**
- * Resolves the element to screenshot. The LLM locates the changed element, then
- * (when `target.capture` is set) we climb to the smallest meaningful container
- * that frames it — that container defines the branch and drives both the
- * screenshot and the measured geometry. Priority order:
- *  1. the climbed container (when `capture` is set and resolves);
- *  2. the located changed element;
+ * Resolves the element to screenshot. The LLM locates the changed element via
+ * `mode`/`value`, then we climb exactly one DOM level to its immediate parent —
+ * that parent container defines the branch and drives both the screenshot and
+ * the measured geometry. Priority order:
+ *  1. the located element's immediate parent (when it exists and isn't the
+ *     page root);
+ *  2. the located changed element (no usable parent);
  *  3. null (caller falls back to full page).
  */
 async function captureLocator(
@@ -193,30 +194,21 @@ async function captureLocator(
   const located = locateLoc.first();
   await located.waitFor({ state: "visible", timeout: 5000 });
 
-  const capture = target.capture;
-  if (!capture) return located;
-
   try {
-    if (capture.mode === "selector") {
-      // Climb from the located element to the nearest matching ancestor
-      // container (falling back to the element itself if none matches).
-      const elementHandle = await located.elementHandle();
-      if (elementHandle) {
-        const containerHandle = await page.evaluateHandle(
-          ({ el, sel }) => (el as Element).closest(sel) ?? el,
-          { el: elementHandle, sel: capture.value }
-        );
-        const containerElement = containerHandle.asElement();
-        if (containerElement) return containerElement;
-      }
-    } else {
-      // text/role container: resolve directly and use it if visible.
-      const containerLoc = resolveLocator(page, capture);
-      if (containerLoc) {
-        const container = containerLoc.first();
-        await container.waitFor({ state: "visible", timeout: 5000 });
-        return container;
-      }
+    const elementHandle = await located.elementHandle();
+    if (elementHandle) {
+      // Climb exactly one level to the immediate parent, but never to the page
+      // root (body/html) — a page-sized rect would corrupt spatial nesting, so
+      // fall back to the located element in that case.
+      const parentHandle = await page.evaluateHandle((el) => {
+        const parent = (el as Element).parentElement;
+        if (!parent) return null;
+        const tag = parent.tagName.toLowerCase();
+        if (tag === "body" || tag === "html") return null;
+        return parent;
+      }, elementHandle);
+      const parentElement = parentHandle.asElement();
+      if (parentElement) return parentElement;
     }
   } catch {
     // Any climb failure falls back to the located element below.
