@@ -409,9 +409,43 @@ export async function createDesignSnapshot(
 
     const { branches, nodes } = graph.exportGraph();
     const derived = deriveContainmentParents(branches, nodes);
+
+    // Nodes export in chronological (rowid) order, so each branch's list is
+    // oldest-first and the fork node can be picked by timestamp.
+    const nodesByBranch = new Map<string, IterationNode[]>();
+    for (const node of nodes) {
+      const list = nodesByBranch.get(node.branchId) ?? [];
+      list.push(node);
+      nodesByBranch.set(node.branchId, list);
+    }
+
+    // Pick the node on the (new) parent branch this branch forks from: the
+    // parent's state when the child first appeared (latest parent node at/just
+    // before the child's first node), falling back to the parent's first node.
+    // null when there is no parent or the parent has no nodes, in which case no
+    // fork edge is drawn. This keeps fork_node_id on the direct parent branch so
+    // every stored fork edge crosses exactly one level.
+    const reconcileFork = (
+      branchId: string,
+      parentBranchId: string | null
+    ): string | null => {
+      if (!parentBranchId) return null;
+      const parentNodes = nodesByBranch.get(parentBranchId) ?? [];
+      if (parentNodes.length === 0) return null;
+      const childFirst = nodesByBranch.get(branchId)?.[0];
+      if (!childFirst) return parentNodes[0].id;
+      let fork = parentNodes[0];
+      for (const candidate of parentNodes) {
+        if (candidate.timestamp <= childFirst.timestamp) fork = candidate;
+        else break;
+      }
+      return fork.id;
+    };
+
     graph.transaction(() => {
       for (const [branchId, parentBranchId] of derived) {
         graph.setBranchParent(branchId, parentBranchId);
+        graph.setBranchForkNode(branchId, reconcileFork(branchId, parentBranchId));
       }
     });
 

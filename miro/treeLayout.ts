@@ -1,11 +1,5 @@
-import OpenAI from "openai";
 import type { AnnotationPlacement } from "./annotationPlacement.js";
 import type { BranchRecord, IterationNode } from "../tracker/types.js";
-
-// Text-reasoning model used to propose a tree layout. Mirrors the model family
-// used by the other LLM passes (tracker/annotate.ts, miro/annotationPlacement.ts)
-// so configuration stays consistent.
-const LAYOUT_MODEL = "gpt-4o-mini";
 
 // Display width (board units) every screenshot renders at. Height is derived
 // from the PNG's real aspect ratio. Shared with miroClient so footprint math and
@@ -20,19 +14,10 @@ export const STICKY_H = 200;
 export const NOTE_MARGIN = 90;
 export const NOTE_GAP = 28;
 
-// Spacing used by the deterministic tidy-tree fallback: horizontal gap between
-// sibling clusters/subtrees and vertical gap between a branch row and its
-// children.
+// Spacing used by the layered tidy-tree layout: horizontal gap between sibling
+// clusters/subtrees and vertical gap between adjacent level bands.
 const H_GAP = 140;
 const V_GAP = 180;
-
-// Minimum clear separation required between any two cluster boxes for an
-// LLM-proposed layout to be accepted.
-const MIN_GAP = 24;
-
-// Above this many nodes we skip the LLM (token/cost blowup, and the deterministic
-// layout is reliable) and go straight to the tidy-tree fallback.
-const MAX_LLM_NODES = 40;
 
 export type MiroPosition = { x: number; y: number };
 export type MiroRelativePosition = { x: string; y: string };
@@ -291,220 +276,112 @@ function subtreeWidth(branch: BranchLayout): number {
   return Math.max(stripWidth(branch), childrenWidth(branch));
 }
 
+// Floor for a level band whose branches are all empty, so a level never
+// collapses to zero height and parents always sit clearly above children.
+const MIN_LEVEL_HEIGHT = IMAGE_W * DEFAULT_IMAGE_ASPECT;
+
+/**
+ * Visits every branch in the forest with its depth (roots at 0, children at
+ * depth+1), so callers can bucket branches into global levels.
+ */
+function forEachBranchWithDepth(
+  roots: BranchLayout[],
+  visit: (branch: BranchLayout, depth: number) => void
+): void {
+  const walk = (branch: BranchLayout, depth: number): void => {
+    visit(branch, depth);
+    for (const child of branch.children) walk(child, depth + 1);
+  };
+  for (const root of roots) walk(root, 0);
+}
+
+/**
+ * Computes a global Y band per tree depth: `levelHeight[d]` is the tallest
+ * branch row at depth `d` (floored so empty levels don't collapse), and
+ * `levelTop[d]` is that band's top, stacked so band `d` sits entirely above band
+ * `d+1`. This makes every branch at the same depth share one horizontal band.
+ */
+function computeLevelBands(roots: BranchLayout[]): {
+  levelTop: number[];
+  levelHeight: number[];
+} {
+  const levelHeight: number[] = [];
+  forEachBranchWithDepth(roots, (branch, depth) => {
+    const h = stripHeight(branch);
+    levelHeight[depth] = Math.max(levelHeight[depth] ?? 0, h);
+  });
+  for (let d = 0; d < levelHeight.length; d += 1) {
+    levelHeight[d] = Math.max(levelHeight[d] ?? 0, MIN_LEVEL_HEIGHT);
+  }
+
+  const levelTop: number[] = [];
+  let y = 0;
+  for (let d = 0; d < levelHeight.length; d += 1) {
+    levelTop[d] = y;
+    y += levelHeight[d] + V_GAP;
+  }
+  return { levelTop, levelHeight };
+}
+
 /**
  * Places a branch subtree: the branch's own screenshots form a horizontal row
- * (chronological, left-to-right) centered within the subtree's width, and each
- * child branch is laid out below, left-to-right. Subtree widths are computed
- * bottom-up so sibling subtrees never collide, which guarantees no two cluster
- * boxes overlap.
+ * (chronological, left-to-right) centered within the subtree's width, with each
+ * box vertically centered inside its depth's global level band. Child branches
+ * are laid out below, left-to-right. Subtree widths are computed bottom-up so
+ * sibling subtrees never collide, and the Y comes from the shared level bands so
+ * every branch at the same depth lines up on one horizontal band.
  */
 function placeSubtree(
   branch: BranchLayout,
   originX: number,
-  originY: number,
+  depth: number,
+  levelTop: number[],
+  levelHeight: number[],
   out: LayoutResult
 ): void {
   const totalWidth = subtreeWidth(branch);
   const ownWidth = stripWidth(branch);
-  const ownHeight = stripHeight(branch);
+  const bandCenter = levelTop[depth] + levelHeight[depth] / 2;
 
   let x = originX + (totalWidth - ownWidth) / 2;
   for (const box of branch.boxes) {
-    out.set(box.id, { x, y: originY });
+    out.set(box.id, { x, y: bandCenter - box.height / 2 });
     x += box.width + H_GAP;
   }
 
-  const childY = originY + ownHeight + (ownHeight > 0 ? V_GAP : 0);
   const kidsWidth = childrenWidth(branch);
   let childX = originX + (totalWidth - kidsWidth) / 2;
   for (const child of branch.children) {
-    placeSubtree(child, childX, childY, out);
+    placeSubtree(child, childX, depth + 1, levelTop, levelHeight, out);
     childX += subtreeWidth(child) + H_GAP;
   }
 }
 
 /**
- * Deterministic tidy-tree layout: lays each root subtree left-to-right at the
- * top, recursively nesting child branches below their parent. Always produces a
- * non-overlapping tree, used as the guaranteed fallback when no LLM layout is
- * available or the LLM's layout fails validation.
+ * Deterministic layered tidy-tree layout: every branch at depth `d` is placed in
+ * a single global horizontal band, so all branches of one level sit above all
+ * branches of the next level. Root subtrees are packed left-to-right and subtree
+ * widths are computed bottom-up, so no two cluster boxes overlap. This is the
+ * sole layout, guaranteeing a clean top-down tree with fork edges that always
+ * cross exactly one level downward.
  */
 export function tidyTreeLayout(roots: BranchLayout[]): LayoutResult {
+  const { levelTop, levelHeight } = computeLevelBands(roots);
   const out: LayoutResult = new Map();
   let originX = 0;
   for (const root of roots) {
-    placeSubtree(root, originX, 0, out);
+    placeSubtree(root, originX, 0, levelTop, levelHeight, out);
     originX += subtreeWidth(root) + H_GAP;
   }
   return out;
 }
 
-type Rect = { x: number; y: number; w: number; h: number };
-
-function rectsOverlap(a: Rect, b: Rect, gap: number): boolean {
-  return (
-    a.x < b.x + b.w + gap &&
-    b.x < a.x + a.w + gap &&
-    a.y < b.y + b.h + gap &&
-    b.y < a.y + a.h + gap
-  );
-}
-
-/** Collects the box ids contained in a branch subtree (own boxes + descendants). */
-function subtreeBoxIds(branch: BranchLayout): string[] {
-  const ids = branch.boxes.map((box) => box.id);
-  for (const child of branch.children) ids.push(...subtreeBoxIds(child));
-  return ids;
-}
-
-/**
- * Accepts an LLM layout only when it is complete (one position per box), free of
- * overlaps (boxes separated by at least MIN_GAP), keeps each branch's
- * screenshots in left-to-right chronological order, and places every child
- * branch strictly below its parent's row. Otherwise the deterministic layout is
- * used so the tree always reads cleanly with nothing overlapping.
- */
-function validateLayout(
-  layout: LayoutResult,
-  boxById: Map<string, NodeBox>,
-  roots: BranchLayout[]
-): boolean {
-  for (const id of boxById.keys()) {
-    if (!layout.has(id)) return false;
-  }
-
-  const entries = [...boxById.entries()];
-  const rects: Rect[] = entries.map(([id, box]) => {
-    const pos = layout.get(id)!;
-    return { x: pos.x, y: pos.y, w: box.width, h: box.height };
-  });
-  for (let i = 0; i < rects.length; i += 1) {
-    for (let j = i + 1; j < rects.length; j += 1) {
-      if (rectsOverlap(rects[i], rects[j], MIN_GAP)) return false;
-    }
-  }
-
-  const checkBranch = (branch: BranchLayout): boolean => {
-    // Chronological order: each screenshot starts to the right of the previous.
-    for (let i = 1; i < branch.boxes.length; i += 1) {
-      const prev = layout.get(branch.boxes[i - 1].id)!;
-      const curr = layout.get(branch.boxes[i].id)!;
-      if (curr.x < prev.x) return false;
-    }
-
-    // Children sit strictly below this branch's own row.
-    if (branch.boxes.length > 0) {
-      const ownBottom = Math.max(
-        ...branch.boxes.map((box) => layout.get(box.id)!.y + box.height)
-      );
-      for (const child of branch.children) {
-        const childIds = subtreeBoxIds(child);
-        for (const id of childIds) {
-          if (layout.get(id)!.y < ownBottom) return false;
-        }
-      }
-    }
-
-    return branch.children.every(checkBranch);
-  };
-
-  return roots.every(checkBranch);
-}
-
-const LAYOUT_SYSTEM_PROMPT = `You are a layout engine that positions screenshot clusters on an infinite 2D canvas to form a clean top-down tree.
-
-You are given a forest of component branches. Each branch has an ordered list of screenshots (chronological, oldest first) and may have child branches. Each screenshot is a rectangle ("box") with a given width and height.
-
-Assign a top-left (x, y) position to every box so that:
-- A branch's own screenshots form a single horizontal row, left-to-right in the given order.
-- Every child branch is placed BELOW its parent branch's row.
-- No two boxes overlap; leave at least the given gap of empty space between any two boxes (account for each box's width and height).
-- The overall result reads as a tidy top-down tree: parents above children, siblings spread horizontally.
-
-Return STRICT JSON in exactly this shape, one entry per box id:
-{ "positions": [ { "id": "<box id>", "x": <number>, "y": <number> } ] }
-
-Rules:
-- Output ONLY the JSON object. No prose, no markdown.
-- Include every box id you were given exactly once.
-- x grows right, y grows down. Any numeric coordinates are fine.`;
-
-type LayoutSpecBranch = {
-  branch: string;
-  nodes: string[];
-  children: LayoutSpecBranch[];
-};
-
-function toSpec(branch: BranchLayout): LayoutSpecBranch {
-  return {
-    branch: branch.branchId,
-    nodes: branch.boxes.map((box) => box.id),
-    children: branch.children.map(toSpec),
-  };
-}
-
-async function tryLlmLayout(
-  roots: BranchLayout[],
-  boxById: Map<string, NodeBox>
-): Promise<LayoutResult | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-  if (boxById.size === 0 || boxById.size > MAX_LLM_NODES) return null;
-
-  const spec = {
-    gap: MIN_GAP,
-    boxes: Object.fromEntries(
-      [...boxById.entries()].map(([id, box]) => [
-        id,
-        { w: Math.round(box.width), h: Math.round(box.height) },
-      ])
-    ),
-    tree: roots.map(toSpec),
-  };
-
-  try {
-    const client = new OpenAI({ apiKey });
-    const completion = await client.chat.completions.create({
-      model: LAYOUT_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: LAYOUT_SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: `Position these screenshot clusters into a tree:\n${JSON.stringify(spec)}`,
-        },
-      ],
-    });
-
-    const content = completion.choices[0]?.message?.content?.trim();
-    if (!content) return null;
-
-    const parsed = JSON.parse(content) as {
-      positions?: Array<{ id?: unknown; x?: unknown; y?: unknown }>;
-    };
-    if (!Array.isArray(parsed.positions)) return null;
-
-    const layout: LayoutResult = new Map();
-    for (const raw of parsed.positions) {
-      const id = typeof raw.id === "string" ? raw.id : null;
-      const x = Number(raw.x);
-      const y = Number(raw.y);
-      if (!id || !Number.isFinite(x) || !Number.isFinite(y)) continue;
-      if (!boxById.has(id)) continue;
-      layout.set(id, { x, y });
-    }
-    return layout;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Plans where every screenshot cluster sits on the board so they assemble into a
- * non-overlapping component tree. An LLM proposes positions first (honoring the
- * "use an LLM to determine the locations" intent); the proposal is accepted only
- * if it is complete, tree-shaped, and overlap-free, otherwise a deterministic
- * tidy-tree layout is used so the result is always clean.
+ * non-overlapping, strictly layered component tree: branches are bucketed into
+ * global level bands by depth (parents above children) and packed left-to-right
+ * so nothing overlaps. The layout is fully deterministic so the board always
+ * reads as a clean top-down tree with fork edges crossing exactly one level.
  */
 export async function planTreeLayout(
   branches: BranchRecord[],
@@ -514,11 +391,5 @@ export async function planTreeLayout(
   const boxById = new Map(boxes.map((box) => [box.id, box]));
   const nodesByBranch = groupNodesByBranch(nodes);
   const roots = buildBranchTree(branches, nodesByBranch, boxById);
-
-  const llm = await tryLlmLayout(roots, boxById);
-  if (llm && validateLayout(llm, boxById, roots)) {
-    return llm;
-  }
-
   return tidyTreeLayout(roots);
 }

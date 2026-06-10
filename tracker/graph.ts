@@ -319,6 +319,19 @@ export class DesignGraph {
       .run({ id, parentBranchId });
   }
 
+  /**
+   * Repoints a branch's fork node (the parent-branch node it visually splits
+   * from). Kept in sync with parent_branch_id so the stored fork edge always
+   * crosses exactly one level, from the direct parent branch to this branch.
+   * `main` is the root and has no fork.
+   */
+  setBranchForkNode(id: string, forkNodeId: string | null): void {
+    if (id === MAIN_BRANCH) return;
+    this.db
+      .prepare(`UPDATE branches SET fork_node_id = @forkNodeId WHERE id = @id`)
+      .run({ id, forkNodeId });
+  }
+
   addNode(node: IterationNode): void {
     this.db
       .prepare(
