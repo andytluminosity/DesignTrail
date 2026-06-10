@@ -9,9 +9,8 @@ import type { CommitType } from "./types.js";
 const VISION_MODEL = "gpt-4o-mini";
 
 // Bound the diff we feed per annotation call so a huge commit can't blow up the
-// prompt (and cost). The image plus the per-component summary carry most of the
-// signal; the diff is supporting context. Kept generous so the annotation can be
-// as detailed as possible.
+// prompt (and cost). The diff is the source of truth for annotation scope; the
+// image is supporting context for locating the changed UI.
 const MAX_DIFF_CHARS = 16000;
 
 /**
@@ -29,22 +28,29 @@ const MAX_DIFF_CHARS = 16000;
  *    annotations communicate design rationale; prioritize key information and
  *    keep notes tied to the specific element.
  */
-const SYSTEM_PROMPT = `You are a senior product designer writing concise annotations for ONE UI screenshot in a design-change tracker.
+const SYSTEM_PROMPT = `You are a senior product designer writing concise annotations for ONE COMMIT CHANGE in a design-change tracker.
 
-You are given: the screenshot image of a single component/area after a change, the component's name, a short summary of the change, the commit message, and the git diff. Annotate THIS component/screenshot.
+You are given: the screenshot image of a single component/area after a change, the component's name, a short summary of the change, the commit message, and the git diff.
 
-GOAL: Produce a set of short annotations that will later be SPLIT into separate sticky notes, where each sticky note labels a distinct section/element of the screenshot. Decompose the screenshot into its meaningful sections/elements and write ONE short note per section.
+CRITICAL SCOPE RULE: Annotate ONLY the UI element(s), copy, layout, state, or interaction that the COMMIT CHANGE actually added, removed, or modified. Treat the git diff and change summary as the source of truth. Treat the screenshot ONLY as visual context for finding the changed element and explaining its design effect. Do NOT annotate unchanged areas just because they are visible in the screenshot.
 
-For EACH distinct section/element visible in the screenshot (e.g. header, title, individual buttons, icons, inputs, labels, nav items, list rows, spacing/layout regions, states), write a numbered block in EXACTLY this format:
+GOAL: Produce a set of short annotations that will later be SPLIT into separate sticky notes, where each sticky note labels a distinct changed section/element. Decompose the COMMIT CHANGE into its meaningful changed elements and write ONE short note per changed element.
+
+For EACH distinct section/element changed by the commit (e.g. changed header text, newly added button, modified icon, updated input label, adjusted nav item, altered list row, spacing/layout region affected by the diff, or changed state), write a numbered block in EXACTLY this format:
 
 [n] <Section/element label>
 <Statement that fuses what the element is with the design rationale, e.g. "Green button helps the user feel comfortable." Lead with the element/change, then state the design effect or intent it serves (visual hierarchy, usability, accessibility, consistency, affordance, or user flow). Elaborate as much as needed on the design rationale.>
 
 Rules:
+- Base every note on the commit diff, commit message, or change summary. If an element is visible in the screenshot but not implicated by the commit change, omit it.
+- When the screenshot shows a larger container around a smaller change, annotate the smaller changed element, not the whole container.
+- If the commit change is a new nested component captured inside an ancestor screenshot, annotate the new or modified nested component only.
+- If only one visual element changed, return exactly one numbered block.
+- If the diff describes no locatable visual change in this screenshot, return exactly one block for the changed component/area described by the summary instead of inventorying the screenshot.
 - Write each note as a single confident sentence. State it as fact — NEVER use hedging or uncertain words like "likely", "probably", "may", "might", "could", "perhaps", or "seems".
 - Do NOT use separate "What:" / "Why:" labels. Combine the observation and the reason into one sentence.
 - Be brief. Cut filler, restating the obvious, and exhaustive visual description (exact pixels, hex codes, font sizes). Keep only what matters: the element and the design value it delivers.
-- Cover as many distinct sections/elements as are meaningfully present; prefer more granular blocks over fewer broad ones, since each becomes its own sticky note.
+- Cover as many distinct changed sections/elements as are meaningfully present; prefer more granular blocks over fewer broad ones, since each becomes its own sticky note.
 - Anchor each block to a concrete, locatable section/element so it can be placed precisely on the image later.
 - Use the exact "[n] <label>" then one sentence on the next line for every block. No other headings, preamble, or markdown.`;
 
@@ -86,11 +92,12 @@ async function annotateOne(
   if (!dataUrl) return input.summary;
 
   const userText =
-    `Component: ${input.branchId || "main"}\n` +
+    `Changed component/area: ${input.branchId || "main"}\n` +
     `Change type: ${input.type}\n` +
-    `Change summary: ${input.summary}\n\n` +
+    `Change summary (annotation scope): ${input.summary}\n\n` +
     `Commit message:\n${input.commitMessage}\n\n` +
-    `Git diff:\n${truncate(input.diff, MAX_DIFF_CHARS)}`;
+    `Git diff (source of truth for what changed):\n${truncate(input.diff, MAX_DIFF_CHARS)}\n\n` +
+    `Screenshot instruction: use the attached screenshot only to locate and contextualize the changed element(s); do not annotate unchanged visible UI.`;
 
   const completion = await client.chat.completions.create({
     model: VISION_MODEL,
