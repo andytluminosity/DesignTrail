@@ -85,6 +85,11 @@ type MiroTimelineState = {
   edges: MiroTimelineEdge[];
 };
 
+type CreateCommitNodeOptions = {
+  screenshotPath?: string;
+  publicBaseUrl?: string;
+};
+
 function getStoredMiroAccessToken(): string | null {
   if (!existsSync(TOKEN_FILE)) {
     return null;
@@ -198,6 +203,38 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function normalizeUrlBase(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
+function pathToUrlPath(value: string): string {
+  return value
+    .split(path.sep)
+    .join("/")
+    .replace(/^\/+/, "");
+}
+
+function getPublicScreenshotUrl(
+  commit: CommitData,
+  screenshotPath?: string,
+  publicBaseUrlOverride?: string
+): string {
+  const publicBaseUrl =
+    publicBaseUrlOverride ??
+    process.env.CAPTURE_PUBLIC_URL ??
+    process.env.PUBLIC_CAPTURE_URL ??
+    process.env.CAPTURE_URL ??
+    "http://localhost:3000";
+  const normalizedBase = normalizeUrlBase(publicBaseUrl);
+
+  if (screenshotPath) {
+    return `${normalizedBase}/${pathToUrlPath(screenshotPath)}`;
+  }
+
+  const repoCapturePath = commit.repoName ? `${commit.repoName}/` : "";
+  return `${normalizedBase}/captures/${repoCapturePath}${commit.hash}.png`;
+}
+
 function isMiroPosition(value: unknown): value is MiroPosition {
   return (
     typeof value === "object" &&
@@ -308,7 +345,10 @@ export async function createConnector({
   );
 }
 
-export async function createCommitNode(commit: CommitData): Promise<MiroTimelineNode | null> {
+export async function createCommitNode(
+  commit: CommitData,
+  options: CreateCommitNodeOptions = {}
+): Promise<MiroTimelineNode | null> {
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
 
@@ -323,8 +363,11 @@ export async function createCommitNode(commit: CommitData): Promise<MiroTimeline
   }
 
   const shortHash = commit.hash.slice(0, 7);
-  const repoCapturePath = commit.repoName ? `${commit.repoName}/` : "";
-  const screenshotUrl = `http://localhost:3000/captures/${repoCapturePath}${commit.hash}.png`;
+  const screenshotUrl = getPublicScreenshotUrl(
+    commit,
+    options.screenshotPath,
+    options.publicBaseUrl
+  );
   const metadataLines = [shortHash, commit.message];
   if (commit.source) metadataLines.push(`source: ${commit.source}`);
   if (commit.annotation) metadataLines.push(commit.annotation);

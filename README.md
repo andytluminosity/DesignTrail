@@ -120,6 +120,9 @@ Create a `.env` file in this directory:
 OPENAI_API_KEY=sk-...
 # Optional: override the page the screenshot is taken against (default below)
 CAPTURE_URL=http://localhost:3000
+# Optional: public base URL Miro can fetch screenshots from, e.g. an ngrok URL.
+# Defaults to CAPTURE_URL when omitted.
+CAPTURE_PUBLIC_URL=https://your-ngrok-host.ngrok-free.app
 ```
 
 `.env` is git-ignored.
@@ -260,6 +263,7 @@ system never crashes a commit.
 | ---------------- | ------------------------ | ------------------------------------------------ |
 | `OPENAI_API_KEY` | (required for analysis)  | Auth for the OpenAI call. Missing -> full-page fallback. |
 | `CAPTURE_URL`    | `http://localhost:3000`  | The page the screenshot is taken against.        |
+| `CAPTURE_PUBLIC_URL` | `CAPTURE_URL`        | Public base URL Miro uses to fetch saved screenshots. |
 
 Read from `.env` in the DesignTrail root, regardless of which repo triggered the hook.
 
@@ -267,7 +271,7 @@ Read from `.env` in the DesignTrail root, regardless of which repo triggered the
 
 ```text
 tracker/
-  capture.ts      Orchestrates the pipeline; resolves paths, loads .env, writes graph, logs
+  capture.ts      Thin CLI adapter around the core snapshot service
   git.ts          getLatestCommit, getDiff, getRepoName via simple-git
   llm.ts          analyzeCommit (OpenAI JSON mode, DOM-grounded, tree-aware) + safe fallback
   branch.ts       slug/resolveBranch/resolveParentBranch (component -> branch id)
@@ -279,6 +283,8 @@ tracker/
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
   types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
+src/core/
+  snapshotService.ts  Reusable createDesignSnapshot(...) workflow entry point
 captures/         Saved screenshots mirrored as the nested branch tree, captures/<repo>/<branch-path>/<NNN>-<shortHash>.png (git-ignored)
 data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 ```

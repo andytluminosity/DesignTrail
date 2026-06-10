@@ -128,6 +128,29 @@ function normalizeOptional(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function toPortablePath(value: string): string {
+  return value.split(path.sep).join("/");
+}
+
+function selectMiroScreenshotPath(
+  entries: DesignSnapshotEntry[],
+  screenshots: ScreenshotResult[]
+): string | undefined {
+  const successfulPaths = new Set(
+    screenshots.map((screenshot) =>
+      toPortablePath(path.relative(DESIGNTRAIL_ROOT, screenshot.outputPath))
+    )
+  );
+  const successfulEntries = entries.filter((entry) =>
+    successfulPaths.has(toPortablePath(entry.screenshotPath))
+  );
+
+  return (
+    successfulEntries.find((entry) => entry.branchId === MAIN_BRANCH)?.screenshotPath ??
+    successfulEntries[0]?.screenshotPath
+  );
+}
+
 /**
  * Creates a DesignTrail design snapshot for the latest commit in the current
  * working repository.
@@ -325,7 +348,9 @@ export async function createDesignSnapshot(
     graph.close();
   }
 
-  const miroNode = await createCommitNode(commit);
+  const miroNode = await createCommitNode(commit, {
+    screenshotPath: selectMiroScreenshotPath(entries, screenshots),
+  });
 
   return {
     commit,
