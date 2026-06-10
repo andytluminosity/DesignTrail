@@ -94,6 +94,7 @@ export type CommitScreenshot = {
   screenshotPath?: string;
   branchId: string;
   summary: string;
+  annotation?: string;
   type?: string;
 };
 
@@ -359,9 +360,10 @@ export async function createConnector({
 
 /**
  * Builds a single screenshot's sticky-note content: a per-component label
- * (short hash + branch, type, summary). The commit's anchor note (the first
- * screenshot, normally `main`) additionally carries the commit-level metadata
- * (message, source, annotation) so that context appears exactly once per row.
+ * (short hash + branch, type, summary, and the design annotation). The commit's
+ * anchor note (the first screenshot, normally `main`) additionally carries the
+ * commit-level metadata (message, source, commit annotation) so that context
+ * appears exactly once per row.
  */
 function buildStickyContent(
   commit: CommitData,
@@ -373,6 +375,7 @@ function buildStickyContent(
   const lines = [`${shortHash} · ${label}`];
   if (screenshot.type) lines.push(screenshot.type);
   if (screenshot.summary) lines.push(screenshot.summary);
+  if (screenshot.annotation) lines.push(screenshot.annotation);
   if (isAnchor) {
     lines.push(commit.message);
     if (commit.source) lines.push(`source: ${commit.source}`);

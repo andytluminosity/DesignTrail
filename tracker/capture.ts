@@ -23,6 +23,9 @@ function logCommit(hash: string, repo: string, entries: LogEntry[]): void {
     console.log(`  PARENT NODE:   ${e.parentId ?? "none"}`);
     console.log(`  TYPE:          ${e.type}`);
     console.log(`  SUMMARY:       ${e.summary}`);
+    if (e.annotation) {
+      console.log(`  ANNOTATION:    ${e.annotation.replace(/\n/g, "\n                 ")}`);
+    }
     console.log(`  SCREENSHOT:    ${e.screenshotPath}`);
   }
   console.log("========================");

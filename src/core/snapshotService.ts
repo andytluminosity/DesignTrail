@@ -6,6 +6,7 @@ import { getLatestCommit, getDiff, getRepoName } from "../../tracker/git.js";
 import { takeScreenshots, getSiteContext } from "../../tracker/screenshot.js";
 import type { ScreenshotJob } from "../../tracker/screenshot.js";
 import { analyzeCommit } from "../../tracker/llm.js";
+import { annotateScreenshots } from "../../tracker/annotate.js";
 import { DesignGraph } from "../../tracker/graph.js";
 import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
@@ -32,6 +33,7 @@ export type DesignSnapshotEntry = {
   parentId: string | null;
   type: string;
   summary: string;
+  annotation: string | null;
   screenshotPath: string;
 };
 
@@ -170,6 +172,7 @@ function selectMiroScreenshots(
     screenshotPath: entry.screenshotPath,
     branchId: entry.branchId,
     summary: entry.summary,
+    annotation: entry.annotation ?? undefined,
     type: entry.type,
   }));
 }
@@ -296,6 +299,7 @@ export async function createDesignSnapshot(
           parentId,
           type: change.type,
           summary: change.summary,
+          annotation: null,
           screenshotPath,
         });
       }
@@ -337,6 +341,7 @@ export async function createDesignSnapshot(
           parentId,
           type: "UI_CHANGE",
           summary,
+          annotation: null,
           screenshotPath,
         });
       }
@@ -380,6 +385,43 @@ export async function createDesignSnapshot(
         (e) => !removedNodeIds.has(`${commit.hash}:${e.branchId}`)
       );
     }
+
+    // Generate a unique, design-oriented annotation (What changed + a hedged
+    // guess at Why) for each surviving screenshot via a vision pass, then persist
+    // it on the node and back onto the entry. Runs after dedup so removed
+    // captures aren't annotated, and against the pre-mirror outputPath (the PNG
+    // still lives there at this point).
+    const entryByNodeId = new Map(
+      entries.map((entry) => [`${commit.hash}:${entry.branchId}`, entry])
+    );
+    const annotationInputs = screenshots
+      .map(({ outputPath }) => {
+        const nodeId = nodeByOutput.get(outputPath);
+        const entry = nodeId ? entryByNodeId.get(nodeId) : undefined;
+        if (!entry) return null;
+        return {
+          outputPath,
+          branchId: entry.branchId,
+          summary: entry.summary,
+          type: entry.type,
+          commitMessage: commit.message,
+          diff: commit.diff,
+        };
+      })
+      .filter((input): input is NonNullable<typeof input> => input !== null);
+
+    const annotations = await annotateScreenshots(annotationInputs);
+
+    graph.transaction(() => {
+      for (const { outputPath, annotation } of annotations) {
+        const nodeId = nodeByOutput.get(outputPath);
+        if (nodeId) {
+          graph.setNodeAnnotation(nodeId, annotation);
+          const entry = entryByNodeId.get(nodeId);
+          if (entry) entry.annotation = annotation;
+        }
+      }
+    });
 
     // Persist each captured element's geometry onto its node so the spatial board
     // can nest/position branches by real on-screen containment.

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   branch_id       TEXT NOT NULL,
   parent_id       TEXT,
   summary         TEXT,
+  annotation      TEXT,
   type            TEXT,
   screenshot_path TEXT,
   timestamp       INTEGER NOT NULL,
@@ -67,6 +68,7 @@ type NodeRow = {
   branch_id: string;
   parent_id: string | null;
   summary: string;
+  annotation: string | null;
   type: string;
   screenshot_path: string;
   timestamp: number;
@@ -129,6 +131,7 @@ function toIterationNode(row: NodeRow): IterationNode {
     branchId: row.branch_id,
     parentId: row.parent_id,
     summary: row.summary,
+    annotation: row.annotation ?? undefined,
     type: row.type as IterationNode["type"],
     screenshotPath: row.screenshot_path,
     timestamp: row.timestamp,
@@ -190,6 +193,9 @@ export class DesignGraph {
       if (!nodeCols.includes(col)) {
         db.exec(`ALTER TABLE nodes ADD COLUMN ${col} REAL`);
       }
+    }
+    if (!nodeCols.includes("annotation")) {
+      db.exec(`ALTER TABLE nodes ADD COLUMN annotation TEXT`);
     }
   }
 
@@ -323,6 +329,13 @@ export class DesignGraph {
    */
   deleteNode(id: string): void {
     this.db.prepare(`DELETE FROM nodes WHERE id = ?`).run(id);
+  }
+
+  /** Stores the design annotation generated for a node's captured screenshot. */
+  setNodeAnnotation(nodeId: string, annotation: string): void {
+    this.db
+      .prepare(`UPDATE nodes SET annotation = @annotation WHERE id = @id`)
+      .run({ id: nodeId, annotation });
   }
 
   /** Records the on-screen geometry of a node's located element. */

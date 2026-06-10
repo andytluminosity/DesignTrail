@@ -22,7 +22,8 @@ flowchart TD
   branch --> node["build IterationNode (parent = branch tip)"]
   node --> store["graph.ts: addNode + ensureBranch (SQLite)"]
   loop --> shot["screenshot.ts: takeScreenshots (one browser, N captures)"]
-  shot --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
+  shot --> annotate["annotate.ts: annotateScreenshots (vision) -> per-node annotation"]
+  annotate --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
   store --> db["/data/repo/graph.db"]
 ```
 
@@ -74,8 +75,8 @@ commits  (hash PK, message, diff, timestamp)                 -- per-commit data,
 branches (id PK, parent_branch_id, fork_node_id, created_at, -- the component tree
           nav_path, target_json)                             -- how to re-screenshot the branch
 nodes    (id PK = "<hash>:<branch>", commit_hash, branch_id, -- one per component change
-          parent_id, summary, type, screenshot_path, timestamp,
-          geom_x, geom_y, geom_w, geom_h, page_w, page_h)    -- located element's on-screen rect
+          parent_id, summary, annotation, type, screenshot_path, timestamp,
+          geom_x, geom_y, geom_w, geom_h, page_w, page_h)    -- annotation + located element's on-screen rect
 ```
 
 Each node also records the **on-screen geometry** of its located element (the
@@ -96,6 +97,8 @@ COMPONENT: sidebar
   PARENT NODE:   none
   TYPE:          UI_CHANGE
   SUMMARY:       Added collapse toggle to sidebar
+  ANNOTATION:    What: A collapse toggle now sits in the sidebar header.
+                 Why: Likely to reclaim horizontal space and improve focus on the main content.
   SCREENSHOT:    captures/TempRepo/main/sidebar/001-<hash>.png
 ========================
 ```
@@ -201,7 +204,10 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
 3. `analyzeCommit` sends the commit message + diff + live DOM map + existing component tree
    to OpenAI and gets back a list of changed components.
 4. For each component, a branch is resolved (reused or newly nested), an `IterationNode` is
-   written, and a targeted screenshot is captured (all captures share one browser).
+   written, and a targeted screenshot is captured (all captures share one browser). Each
+   surviving screenshot then gets a unique, design-oriented annotation (What changed + a
+   hedged guess at Why) from a vision pass (`annotate.ts`) that reads the captured image plus
+   the diff; it is stored on the node and surfaced in the visualizer and Miro sticky notes.
 5. Once the branch tree is finalized, the screenshots are mirrored into nested branch folders
    under `captures/<repo-name>/` so the directory layout matches the component tree (each
    branch folder holds its iteration PNGs plus its child-branch subfolders). SQLite remains

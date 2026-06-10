@@ -32,6 +32,10 @@ function renderNode(node: IterationNode, htmlDir: string): string {
        </a>`
     : `<div class="shot missing">no screenshot</div>`;
 
+  const annotation = node.annotation
+    ? `<div class="annotation">${escapeHtml(node.annotation)}</div>`
+    : "";
+
   return `
     <div class="node">
       ${img}
@@ -40,6 +44,7 @@ function renderNode(node: IterationNode, htmlDir: string): string {
         <code class="hash">${escapeHtml(shortHash(node.commitHash))}</code>
       </div>
       <div class="summary">${escapeHtml(node.summary)}</div>
+      ${annotation}
     </div>`;
 }
 
@@ -113,6 +118,10 @@ const STYLE = `
   .node-meta { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; }
   .hash { font-size: 11px; color: #8b949e; }
   .summary { font-size: 12px; color: #c9d1d9; line-height: 1.35; }
+  .annotation {
+    font-size: 11px; color: #8b949e; line-height: 1.4; margin-top: 6px;
+    padding-left: 8px; border-left: 2px solid #30363d; white-space: pre-line;
+  }
   .badge {
     font-size: 10px; font-weight: 700; letter-spacing: .03em;
     padding: 2px 6px; border-radius: 999px; border: 1px solid #30363d; color: #c9d1d9;
