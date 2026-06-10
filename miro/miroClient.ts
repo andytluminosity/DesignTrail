@@ -659,14 +659,19 @@ async function safeConnector(
   accessToken: string,
   boardId: string,
   startItemId: string,
-  endItemId: string
+  endItemId: string,
+  style?: MiroConnectorStyle
 ): Promise<void> {
   try {
-    await createConnector({ accessToken, boardId, startItemId, endItemId });
+    await createConnector({ accessToken, boardId, startItemId, endItemId, style });
   } catch (error) {
     console.error("Failed to draw tree connector:", getErrorMessage(error));
   }
 }
+
+// Chronology connectors (consecutive screenshots within one branch) render red
+// to set them apart from the default branch-fork connectors.
+const CHRONOLOGY_CONNECTOR_STYLE: MiroConnectorStyle = { strokeColor: "#ff0000" };
 
 // One screenshot node with everything precomputed for layout and drawing.
 type PreparedNode = {
@@ -881,33 +886,37 @@ export async function renderBoardFromGraph(
     })
   );
 
-  // Tree connectors: chronological chain within each branch, then a fork edge
-  // from each branch's fork point to that branch's first screenshot. Endpoints
-  // are resolved through the canonical map so an edge that referenced a collapsed
-  // duplicate now lands on its surviving image. Self-edges (both ends collapsed
-  // to the same image) and duplicate edges are dropped so each surviving image
-  // points to a given target at most once. Built after all images exist, then
-  // drawn in parallel.
+  // Tree connectors: a red chronological chain between consecutive screenshots
+  // within each branch, then a (default-colored) fork edge from each branch's
+  // fork point to that branch's first screenshot. Endpoints are resolved through
+  // the canonical map so an edge that referenced a collapsed duplicate now lands
+  // on its surviving image. Self-edges (both ends collapsed to the same image)
+  // and duplicate edges are dropped so each surviving image points to a given
+  // target at most once. Built after all images exist, then drawn in parallel.
   const resolveImageId = (nodeId: string): string | undefined =>
     imageIdByNode.get(resolveCanonical(nodeId));
 
   const drawnConnectors = new Set<string>();
   const connectorWork: Promise<void>[] = [];
-  const queueConnector = (startNodeId: string, endNodeId: string): void => {
+  const queueConnector = (
+    startNodeId: string,
+    endNodeId: string,
+    style?: MiroConnectorStyle
+  ): void => {
     const startId = resolveImageId(startNodeId);
     const endId = resolveImageId(endNodeId);
     if (!startId || !endId || startId === endId) return;
     const key = `${startId}->${endId}`;
     if (drawnConnectors.has(key)) return;
     drawnConnectors.add(key);
-    connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
+    connectorWork.push(safeConnector(accessToken, boardId, startId, endId, style));
   };
 
   const nodesByBranch = groupNodesByBranch(renderable);
 
   for (const branchNodes of nodesByBranch.values()) {
     for (let i = 1; i < branchNodes.length; i += 1) {
-      queueConnector(branchNodes[i - 1].id, branchNodes[i].id);
+      queueConnector(branchNodes[i - 1].id, branchNodes[i].id, CHRONOLOGY_CONNECTOR_STYLE);
     }
   }
 
