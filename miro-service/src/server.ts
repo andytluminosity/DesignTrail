@@ -8,16 +8,25 @@ import { createDesignSnapshot } from "../../src/core/snapshotService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-dotenv.config({ path: path.resolve(__dirname, "../../.env") });
+const DESIGNTRAIL_ROOT = path.resolve(__dirname, "../..");
+dotenv.config({ path: path.join(DESIGNTRAIL_ROOT, ".env") });
 
 const { MIRO_CLIENT_ID, MIRO_CLIENT_SECRET, MIRO_REDIRECT_URI } = process.env;
 
-const PORT = 3000;
-const TOKEN_FILE = path.resolve(__dirname, "../../.miro-token.json");
+const PORT = Number(process.env.PORT ?? 3002);
+const TOKEN_FILE = path.join(DESIGNTRAIL_ROOT, ".miro-token.json");
 let miroAccessToken: string | null = null;
 
 const app = express();
 app.use(express.json());
+app.use(
+  "/captures",
+  express.static(path.join(DESIGNTRAIL_ROOT, "captures"), {
+    setHeaders(res) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    },
+  })
+);
 
 type SnapshotRequestBody = {
   repoPath?: unknown;
@@ -179,6 +188,7 @@ app.post("/test-node", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Miro OAuth service listening on http://localhost:${PORT}`);
+  console.log(`DesignTrail service listening on http://localhost:${PORT}`);
   console.log(`Start the flow at http://localhost:${PORT}/login`);
+  console.log(`Serving captures from http://localhost:${PORT}/captures`);
 });

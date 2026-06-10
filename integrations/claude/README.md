@@ -20,7 +20,7 @@ flowchart TD
 
 1. The user invokes a DesignTrail capture command from Claude.
 2. Claude asks the user for a short annotation describing the intent of the change.
-3. Claude sends the annotation to DesignTrail with `source: "claude"`.
+3. Claude sends the target `repoPath`, annotation, and `source: "claude"` to DesignTrail.
 4. DesignTrail runs the shared snapshot workflow.
 5. DesignTrail stores the commit, component branches, nodes, screenshots, and geometry in SQLite.
 6. DesignTrail syncs the resulting snapshot to Miro when Miro sync is enabled.
@@ -34,6 +34,8 @@ The API contract for the future Claude command is documented in
 
 - Claude should call DesignTrail through `POST /snapshot`.
 - The endpoint should call `createDesignSnapshot(...)` from `src/core/snapshotService.ts`.
+- Claude should pass the absolute `repoPath` for the repository being captured.
 - Claude should pass `source: "claude"` so snapshots can be attributed to the integration.
 - Claude should not shell out to `tracker/capture.ts`; that file remains a CLI adapter.
 - The API layer should be thin: validate input, call the core service, and return the structured result.
+- The DesignTrail service should serve `/captures/...` so Miro can fetch screenshots through the configured public URL.
