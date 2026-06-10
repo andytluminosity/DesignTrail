@@ -21,6 +21,7 @@ import type {
 
 export type CreateDesignSnapshotOptions = {
   annotation?: string;
+  generateAiAnnotations?: boolean;
   repoPath?: string;
   source?: string;
 };
@@ -151,6 +152,7 @@ export async function createDesignSnapshot(
   options?: CreateDesignSnapshotOptions
 ): Promise<DesignSnapshotResult> {
   const repoPath = path.resolve(options?.repoPath ?? process.cwd());
+  const generateAiAnnotations = options?.generateAiAnnotations ?? true;
   const { hash, message } = await getLatestCommit(repoPath);
   const diff = await getDiff(hash, repoPath);
   const repoName = await getRepoName(repoPath);
@@ -351,42 +353,45 @@ export async function createDesignSnapshot(
       );
     }
 
-    // Generate a unique, design-oriented annotation (What changed + a hedged
-    // guess at Why) for each surviving screenshot via a vision pass, then persist
-    // it on the node and back onto the entry. Runs after dedup so removed
-    // captures aren't annotated, and against the pre-mirror outputPath (the PNG
-    // still lives there at this point).
     const entryByNodeId = new Map(
       entries.map((entry) => [`${commit.hash}:${entry.branchId}`, entry])
     );
-    const annotationInputs = screenshots
-      .map(({ outputPath }) => {
-        const nodeId = nodeByOutput.get(outputPath);
-        const entry = nodeId ? entryByNodeId.get(nodeId) : undefined;
-        if (!entry) return null;
-        return {
-          outputPath,
-          branchId: entry.branchId,
-          summary: entry.summary,
-          type: entry.type,
-          commitMessage: commit.message,
-          diff: commit.diff,
-        };
-      })
-      .filter((input): input is NonNullable<typeof input> => input !== null);
 
-    const annotations = await annotateScreenshots(annotationInputs);
+    if (generateAiAnnotations) {
+      // Generate a unique, design-oriented annotation (What changed + a hedged
+      // guess at Why) for each surviving screenshot via a vision pass, then persist
+      // it on the node and back onto the entry. Runs after dedup so removed
+      // captures aren't annotated, and against the pre-mirror outputPath (the PNG
+      // still lives there at this point).
+      const annotationInputs = screenshots
+        .map(({ outputPath }) => {
+          const nodeId = nodeByOutput.get(outputPath);
+          const entry = nodeId ? entryByNodeId.get(nodeId) : undefined;
+          if (!entry) return null;
+          return {
+            outputPath,
+            branchId: entry.branchId,
+            summary: entry.summary,
+            type: entry.type,
+            commitMessage: commit.message,
+            diff: commit.diff,
+          };
+        })
+        .filter((input): input is NonNullable<typeof input> => input !== null);
 
-    graph.transaction(() => {
-      for (const { outputPath, annotation } of annotations) {
-        const nodeId = nodeByOutput.get(outputPath);
-        if (nodeId) {
-          graph.setNodeAnnotation(nodeId, annotation);
-          const entry = entryByNodeId.get(nodeId);
-          if (entry) entry.annotation = annotation;
+      const annotations = await annotateScreenshots(annotationInputs);
+
+      graph.transaction(() => {
+        for (const { outputPath, annotation } of annotations) {
+          const nodeId = nodeByOutput.get(outputPath);
+          if (nodeId) {
+            graph.setNodeAnnotation(nodeId, annotation);
+            const entry = entryByNodeId.get(nodeId);
+            if (entry) entry.annotation = annotation;
+          }
         }
-      }
-    });
+      });
+    }
 
     // Persist each captured element's geometry onto its node so the spatial board
     // can nest/position branches by real on-screen containment.

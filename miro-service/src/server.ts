@@ -31,6 +31,7 @@ app.use(
 type SnapshotRequestBody = {
   repoPath?: unknown;
   annotation?: unknown;
+  generateAiAnnotations?: unknown;
   source?: unknown;
 };
 
@@ -91,12 +92,23 @@ app.get("/oauth/callback", async (req, res) => {
 });
 
 app.post("/snapshot", async (req, res) => {
-  const { repoPath, annotation, source } = req.body as SnapshotRequestBody;
+  const { repoPath, annotation, generateAiAnnotations, source } =
+    req.body as SnapshotRequestBody;
 
   if (typeof repoPath !== "string" || repoPath.trim().length === 0) {
     return res.status(400).json({
       success: false,
       error: "repoPath is required and must be a non-empty string",
+    });
+  }
+
+  if (
+    generateAiAnnotations !== undefined &&
+    typeof generateAiAnnotations !== "boolean"
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: "generateAiAnnotations must be a boolean when provided",
     });
   }
 
@@ -116,6 +128,7 @@ app.post("/snapshot", async (req, res) => {
     const result = await createDesignSnapshot({
       repoPath,
       annotation: normalizedAnnotation,
+      generateAiAnnotations,
       source: normalizedSource ?? "claude",
     });
 

@@ -40,6 +40,20 @@ async function flushOutput(): Promise<void> {
   ]);
 }
 
+function envOptionalString(name: string): string | undefined {
+  const trimmed = process.env[name]?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function envBoolean(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return defaultValue;
+  if (["1", "true", "yes", "y", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "n", "off"].includes(raw)) return false;
+  console.warn(`Ignoring invalid ${name} value "${process.env[name]}"; using ${defaultValue}.`);
+  return defaultValue;
+}
+
 async function promptForAnnotation(): Promise<string | undefined> {
   let input: NodeJS.ReadableStream = process.stdin;
   let output: NodeJS.WritableStream = process.stdout;
@@ -74,9 +88,18 @@ async function promptForAnnotation(): Promise<string | undefined> {
 
 async function main(): Promise<void> {
   const repoPath = path.resolve(process.argv[2] ?? process.cwd());
-  const annotation = await promptForAnnotation();
-  const source = process.env.DESIGNTRAIL_SOURCE?.trim() || "cli";
-  const result = await createDesignSnapshot({ repoPath, source, annotation });
+  const skipPrompt = envBoolean("DESIGNTRAIL_SKIP_PROMPT", false);
+  const annotation =
+    envOptionalString("DESIGNTRAIL_ANNOTATION") ??
+    (skipPrompt ? undefined : await promptForAnnotation());
+  const generateAiAnnotations = envBoolean("DESIGNTRAIL_AI_ANNOTATIONS", true);
+  const source = envOptionalString("DESIGNTRAIL_SOURCE") ?? "cli";
+  const result = await createDesignSnapshot({
+    repoPath,
+    source,
+    annotation,
+    generateAiAnnotations,
+  });
   logCommit(result.commit.hash, result.repoName, result.entries);
   console.log(
     `DesignTrail post-commit hook complete for ${result.commit.hash.slice(0, 8)}.`
