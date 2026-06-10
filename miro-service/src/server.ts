@@ -32,7 +32,6 @@ type SnapshotRequestBody = {
   repoPath?: unknown;
   annotation?: unknown;
   source?: unknown;
-  syncMiro?: unknown;
 };
 
 function normalizeOptionalString(value: unknown, field: string): string | undefined {
@@ -92,19 +91,12 @@ app.get("/oauth/callback", async (req, res) => {
 });
 
 app.post("/snapshot", async (req, res) => {
-  const { repoPath, annotation, source, syncMiro } = req.body as SnapshotRequestBody;
+  const { repoPath, annotation, source } = req.body as SnapshotRequestBody;
 
   if (typeof repoPath !== "string" || repoPath.trim().length === 0) {
     return res.status(400).json({
       success: false,
       error: "repoPath is required and must be a non-empty string",
-    });
-  }
-
-  if (syncMiro !== undefined && typeof syncMiro !== "boolean") {
-    return res.status(400).json({
-      success: false,
-      error: "syncMiro must be a boolean when provided",
     });
   }
 
@@ -125,7 +117,6 @@ app.post("/snapshot", async (req, res) => {
       repoPath,
       annotation: normalizedAnnotation,
       source: normalizedSource ?? "claude",
-      syncMiro,
     });
 
     return res.json({
@@ -141,7 +132,7 @@ app.post("/snapshot", async (req, res) => {
       repoPath: result.repoPath,
       entries: result.entries,
       screenshotCount: result.screenshots.length,
-      miroSynced: result.miroNode !== null,
+      miroSynced: result.miroNodes.length > 0,
     });
   } catch (error) {
     console.error("Snapshot creation failed:", error);

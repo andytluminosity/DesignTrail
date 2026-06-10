@@ -11,7 +11,7 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 - The app being captured is running at `CAPTURE_URL` (usually `http://localhost:3000`).
 - The DesignTrail service is running at `http://localhost:3002`.
-- For Miro sync, ngrok is forwarding to the DesignTrail service port and the public URL is configured in DesignTrail's environment.
+- Miro board rendering is manual via `npm run render-miro -- <repo>` after capture.
 
 ## Workflow
 
@@ -25,8 +25,7 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
   -d '{
     "repoPath": "<absolute-repo-path>",
     "annotation": "<user-annotation>",
-    "source": "claude",
-    "syncMiro": true
+    "source": "claude"
   }'
 ```
 
@@ -35,7 +34,7 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
    - Repository name and commit hash.
    - Commit message.
    - Screenshot count.
-   - Whether Miro synced.
+   - That Miro was not synced during capture.
    - Each returned entry's `branchId`, `type`, `summary`, and `screenshotPath`.
 
 ## Response Handling
@@ -56,7 +55,7 @@ Expected success shape:
   "repoPath": "/Users/mikezhang/Desktop/Development/TempRepo",
   "entries": [],
   "screenshotCount": 1,
-  "miroSynced": true
+  "miroSynced": false
 }
 ```
 

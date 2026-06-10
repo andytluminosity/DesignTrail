@@ -10,7 +10,6 @@ createDesignSnapshot({
   repoPath,
   annotation,
   source: "claude",
-  syncMiro,
 });
 ```
 
@@ -22,8 +21,7 @@ flowchart TD
   prompt --> request[Claude calls POST /snapshot]
   request --> snapshot[DesignTrail creates snapshot]
   snapshot --> sqlite[SQLite updated]
-  snapshot --> miro[Miro updated]
-  miro --> response[Claude receives snapshot result]
+  sqlite --> response[Claude receives snapshot result]
 ```
 
 ## Request
@@ -39,8 +37,7 @@ Content-Type: application/json
 {
   "repoPath": "/Users/mikezhang/Desktop/Development/TempRepo",
   "annotation": "Adjusted the project card accent color after design review.",
-  "source": "claude",
-  "syncMiro": true
+  "source": "claude"
 }
 ```
 
@@ -51,7 +48,6 @@ Content-Type: application/json
 | `repoPath` | `string` | Yes | Absolute path to the repository whose latest commit should be captured. |
 | `annotation` | `string` | No | Human-readable note collected by Claude before capture. |
 | `source` | `string` | No | Integration identifier. Defaults to `"claude"` when omitted. |
-| `syncMiro` | `boolean` | No | Whether to sync the snapshot to Miro. Omit or pass `true` for full sync; pass `false` for local-only tests. |
 
 ## Response
 
@@ -85,7 +81,7 @@ Content-Type: application/json
     }
   ],
   "screenshotCount": 1,
-  "miroSynced": true
+  "miroSynced": false
 }
 ```
 
@@ -99,7 +95,7 @@ Content-Type: application/json
 | `repoPath` | `string` | Absolute path to the repository captured. |
 | `entries` | `array` | Component graph nodes created for this snapshot. |
 | `screenshotCount` | `number` | Number of screenshots successfully written during capture. |
-| `miroSynced` | `boolean` | `true` when a Miro timeline node was created; `false` when Miro sync was disabled or skipped. |
+| `miroSynced` | `boolean` | Always `false` for snapshot capture; run `npm run render-miro -- <repo>` separately to refresh the Miro board. |
 
 ### Validation Error
 
@@ -120,5 +116,5 @@ Content-Type: application/json
 - The API should call the reusable snapshot service, not the CLI script.
 - The endpoint loads DesignTrail configuration from the DesignTrail root.
 - SQLite persistence happens inside the snapshot service.
-- Miro sync happens after screenshots are captured and persisted.
+- Miro sync is manual via `npm run render-miro -- <repo>` so smoke tests and capture automation do not wipe the board.
 - The DesignTrail service serves generated screenshots from `/captures/...`; ngrok should point at the service port when Miro needs public image URLs.

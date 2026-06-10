@@ -25,8 +25,6 @@ flowchart TD
   shot --> annotate["annotate.ts: annotateScreenshots (vision) -> per-node annotation"]
   annotate --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
   store --> db["/data/repo/graph.db"]
-  save --> miro["miroClient.ts: clearBoard + renderBoardFromGraph (wipe + redraw whole tree)"]
-  db --> miro
 ```
 
 The LLM runs **before** the screenshots. To keep its targeting grounded, DesignTrail first
@@ -215,10 +213,8 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
    branch folder holds its iteration PNGs plus its child-branch subfolders). SQLite remains
    the source of truth; the folder tree is reconciled from it after every capture. Captures
    from all watched repos are centralized here and namespaced per repo.
-6. Finally, the Miro board is wiped and **re-rendered in full** from the graph (see
-   [Rendering the board on Miro](#rendering-the-board-on-miro)). Because the whole tree is
-   redrawn every commit, positions are recomputed each time so the board always reflects the
-   complete, current design-evolution tree (including the new commit).
+6. Miro is not updated during capture. When you want the external board refreshed, run the
+   manual render script (see [Rendering the board on Miro](#rendering-the-board-on-miro)).
 
 The reusable core entry point is `createDesignSnapshot(options)` in
 `src/core/snapshotService.ts`. Integrations should pass `repoPath` explicitly
@@ -229,12 +225,11 @@ await createDesignSnapshot({
   repoPath: "/path/to/repo",
   source: "claude",
   annotation: "Optional note from the integration",
-  syncMiro: true,
 });
 ```
 
-Set `syncMiro: false` to capture and persist locally without creating/updating
-Miro items.
+`createDesignSnapshot` captures and persists locally only. Miro rendering is a separate,
+manual step because it wipes and redraws the configured board.
 
 ## LLM output contract
 
@@ -307,6 +302,7 @@ tracker/
   screenshot.ts   getSiteContext(url) for live DOM map + takeScreenshots(jobs, url) (one browser, full-page fallback)
   layout.ts       buildLayout: derives a spatial frame tree from node geometry (containment + reading order)
   visualize.ts    Renders the per-repo graph.html as a pan/zoom Figma/Miro-style spatial board
+  render-miro.ts  Manual CLI for wiping and redrawing the configured Miro board from SQLite
   backfill-geometry.ts  One-off: populates geometry for branches captured before geometry tracking
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
@@ -329,6 +325,7 @@ npm run capture -- <repo>  # Manually run the pipeline against a specific repo/c
 npm run track -- <repo>    # Install the tracking hook into one or more repos
 npm run untrack -- <repo>  # Remove the tracking hook from one or more repos
 npm run visualize -- <repo> # Render the graph to data/<repo>/graph.html (all repos if omitted)
+npm run render-miro -- <repo> # Wipe and redraw the configured Miro board from one repo's graph
 npm run backfill-geometry -- <repo> # Backfill on-screen geometry for pre-geometry nodes (all repos if omitted)
 ```
 
@@ -348,10 +345,15 @@ open data/TempRepo/graph.html
 
 ## Rendering the board on Miro
 
-When `syncMiro` is on (the default), `createDesignSnapshot` re-renders the entire
-design-evolution graph onto a Miro board after every commit via
-`renderBoardFromGraph` ([miro/miroClient.ts](miro/miroClient.ts)). It is a
-**wipe-and-rerender**, not an append:
+Miro board refreshes are manual and intentionally out-of-band from capture:
+
+```bash
+npm run render-miro -- TempRepo
+```
+
+The script reads `data/<repo>/graph.db` and calls `renderBoardFromGraph`
+([miro/miroClient.ts](miro/miroClient.ts)). It is a **wipe-and-rerender**, not an
+append:
 
 1. **Wipe.** `clearBoard` pages through the board and deletes every connector and
    item (in parallel), so each render starts from a clean slate. (This removes ALL
@@ -381,9 +383,9 @@ design-evolution graph onto a Miro board after every commit via
    you still see throttling.
 
 Because the board is rebuilt from SQLite every time, positions are recomputed on
-every commit and the board always shows the complete, current tree. Configure the
-board with `MIRO_BOARD_ID` and complete the OAuth flow in `miro-service/` first.
-Set `syncMiro: false` to capture and persist locally without touching Miro.
+each manual render and the board shows the complete tree for the selected repo.
+Configure the board with `MIRO_BOARD_ID` and complete the OAuth flow in
+`miro-service/` first. Capture/smoke-test flows never touch Miro directly.
 
 ## Manual testing
 

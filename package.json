@@ -8,6 +8,7 @@
     "track": "tsx tracker/install.ts",
     "untrack": "tsx tracker/uninstall.ts",
     "visualize": "tsx tracker/visualize.ts",
+    "render-miro": "tsx tracker/render-miro.ts",
     "backfill-geometry": "tsx tracker/backfill-geometry.ts"
   },
   "dependencies": {

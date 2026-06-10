@@ -11,9 +11,8 @@ import { DesignGraph } from "../../tracker/graph.js";
 import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
-import { renderBoardFromGraph } from "../../miro/miroClient.js";
+import type { RenderedBoardNode } from "../../miro/miroClient.js";
 import type {
-  BranchRecord,
   CommitData,
   IterationNode,
   ScreenshotResult,
@@ -24,7 +23,6 @@ export type CreateDesignSnapshotOptions = {
   annotation?: string;
   repoPath?: string;
   source?: string;
-  syncMiro?: boolean;
 };
 
 export type DesignSnapshotEntry = {
@@ -43,7 +41,7 @@ export type DesignSnapshotResult = {
   repoPath: string;
   entries: DesignSnapshotEntry[];
   screenshots: ScreenshotResult[];
-  miroNodes: Awaited<ReturnType<typeof renderBoardFromGraph>>;
+  miroNodes: RenderedBoardNode[];
 };
 
 /**
@@ -172,13 +170,6 @@ export async function createDesignSnapshot(
   let entries: DesignSnapshotEntry[] = [];
   const nodeByOutput = new Map<string, string>();
   let screenshots: ScreenshotResult[] = [];
-  // Full graph snapshot captured before the DB is closed, so the whole board can
-  // be re-rendered as a tree (not just this commit's nodes).
-  let boardExport: {
-    branches: BranchRecord[];
-    nodes: IterationNode[];
-    commits: Map<string, CommitData>;
-  } | null = null;
 
   try {
     // Read the live DOM (across pages) first so the LLM targets elements that
@@ -463,28 +454,13 @@ export async function createDesignSnapshot(
         : screenshot;
     });
 
-    // Snapshot the finalized graph (paths now point at the mirrored tree) plus
-    // commit metadata so the Miro board can be wiped and re-rendered in full.
-    const finalGraph = graph.exportGraph();
-    boardExport = {
-      branches: finalGraph.branches,
-      nodes: finalGraph.nodes,
-      commits: graph.getCommits(),
-    };
   } finally {
     graph.close();
   }
 
-  // Wipe the board and re-render the ENTIRE component tree (every commit's
-  // screenshots), so locations are recomputed and the new commit is included.
-  const miroNodes =
-    options?.syncMiro === false || !boardExport
-      ? []
-      : await renderBoardFromGraph(
-          boardExport.branches,
-          boardExport.nodes,
-          boardExport.commits
-        );
+  // Miro rendering is intentionally out-of-band because it wipes and rebuilds
+  // the entire board. Run `npm run render-miro -- <repo>` when a board refresh is desired.
+  const miroNodes: RenderedBoardNode[] = [];
 
   return {
     commit,

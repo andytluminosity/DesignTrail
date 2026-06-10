@@ -4,8 +4,8 @@ This folder documents the intended Claude integration for DesignTrail.
 
 The goal is not to make Claude own the capture workflow. Claude should act as a
 caller of the DesignTrail core service through a small API surface. DesignTrail
-continues to own git inspection, screenshot capture, SQLite persistence, and Miro
-sync.
+continues to own git inspection, screenshot capture, and SQLite persistence. Miro
+board rendering is a separate manual step.
 
 ## Intended Workflow
 
@@ -15,7 +15,6 @@ flowchart TD
   claude --> api[Claude calls POST /snapshot]
   api --> core[DesignTrail creates snapshot]
   core --> sqlite[SQLite updated]
-  core --> miro[Miro updated]
 ```
 
 1. The user invokes a DesignTrail capture command from Claude.
@@ -23,7 +22,7 @@ flowchart TD
 3. Claude sends the target `repoPath`, annotation, and `source: "claude"` to DesignTrail.
 4. DesignTrail runs the shared snapshot workflow.
 5. DesignTrail stores the commit, component branches, nodes, screenshots, and geometry in SQLite.
-6. DesignTrail syncs the resulting snapshot to Miro when Miro sync is enabled.
+6. The user can refresh Miro later with `npm run render-miro -- <repo>`.
 
 ## Contract
 
@@ -50,4 +49,4 @@ project command at `TempRepo/.claude/commands/capture-design.md`; run it as
 - Claude should pass `source: "claude"` so snapshots can be attributed to the integration.
 - Claude should not shell out to `tracker/capture.ts`; that file remains a CLI adapter.
 - The API layer should be thin: validate input, call the core service, and return the structured result.
-- The DesignTrail service should serve `/captures/...` so Miro can fetch screenshots through the configured public URL.
+- The DesignTrail service should serve `/captures/...` so the manual Miro render can fetch screenshots through the configured public URL.
