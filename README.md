@@ -208,6 +208,22 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
    the source of truth; the folder tree is reconciled from it after every capture. Captures
    from all watched repos are centralized here and namespaced per repo.
 
+The reusable core entry point is `createDesignSnapshot(options)` in
+`src/core/snapshotService.ts`. Integrations should pass `repoPath` explicitly
+instead of changing process state:
+
+```ts
+await createDesignSnapshot({
+  repoPath: "/path/to/repo",
+  source: "claude",
+  annotation: "Optional note from the integration",
+  syncMiro: true,
+});
+```
+
+Set `syncMiro: false` to capture and persist locally without creating/updating
+Miro items.
+
 ## LLM output contract
 
 `analyzeCommit({ diff, commitMessage, siteContext, existingBranches })`
@@ -263,7 +279,7 @@ system never crashes a commit.
 | ---------------- | ------------------------ | ------------------------------------------------ |
 | `OPENAI_API_KEY` | (required for analysis)  | Auth for the OpenAI call. Missing -> full-page fallback. |
 | `CAPTURE_URL`    | `http://localhost:3000`  | The page the screenshot is taken against.        |
-| `CAPTURE_PUBLIC_URL` | `CAPTURE_URL`        | Public base URL Miro uses to fetch saved screenshots. |
+| `CAPTURE_PUBLIC_URL` / `PUBLIC_CAPTURE_URL` | `CAPTURE_URL` | Public base URL Miro uses to fetch saved screenshots. |
 
 Read from `.env` in the DesignTrail root, regardless of which repo triggered the hook.
 

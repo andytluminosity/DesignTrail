@@ -30,9 +30,7 @@ function logCommit(hash: string, repo: string, entries: LogEntry[]): void {
 
 async function main(): Promise<void> {
   const repoPath = path.resolve(process.argv[2] ?? process.cwd());
-  process.chdir(repoPath);
-
-  const result = await createDesignSnapshot({ source: "cli" });
+  const result = await createDesignSnapshot({ repoPath, source: "cli" });
   logCommit(result.commit.hash, result.repoName, result.entries);
 }
 

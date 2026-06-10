@@ -19,7 +19,9 @@ import type {
 
 export type CreateDesignSnapshotOptions = {
   annotation?: string;
+  repoPath?: string;
   source?: string;
+  syncMiro?: boolean;
 };
 
 export type DesignSnapshotEntry = {
@@ -152,13 +154,14 @@ function selectMiroScreenshotPath(
 }
 
 /**
- * Creates a DesignTrail design snapshot for the latest commit in the current
- * working repository.
+ * Creates a DesignTrail design snapshot for the latest commit in the target
+ * repository. CLI callers can omit repoPath and use cwd; integrations should
+ * pass repoPath explicitly so they do not need to mutate process state.
  */
 export async function createDesignSnapshot(
   options?: CreateDesignSnapshotOptions
 ): Promise<DesignSnapshotResult> {
-  const repoPath = path.resolve(process.cwd());
+  const repoPath = path.resolve(options?.repoPath ?? process.cwd());
   const { hash, message } = await getLatestCommit(repoPath);
   const diff = await getDiff(hash, repoPath);
   const repoName = await getRepoName(repoPath);
@@ -348,9 +351,12 @@ export async function createDesignSnapshot(
     graph.close();
   }
 
-  const miroNode = await createCommitNode(commit, {
-    screenshotPath: selectMiroScreenshotPath(entries, screenshots),
-  });
+  const miroNode =
+    options?.syncMiro === false
+      ? null
+      : await createCommitNode(commit, {
+          screenshotPath: selectMiroScreenshotPath(entries, screenshots),
+        });
 
   return {
     commit,
