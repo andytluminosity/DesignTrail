@@ -447,6 +447,13 @@ export async function createDesignSnapshot(
         screenshotPathByNodeId.get(`${commit.hash}:${entry.branchId}`) ??
         entry.screenshotPath;
     }
+    screenshots = screenshots.map((screenshot) => {
+      const nodeId = nodeByOutput.get(screenshot.outputPath);
+      const screenshotPath = nodeId ? screenshotPathByNodeId.get(nodeId) : undefined;
+      return screenshotPath
+        ? { ...screenshot, outputPath: path.join(DESIGNTRAIL_ROOT, screenshotPath) }
+        : screenshot;
+    });
   } finally {
     graph.close();
   }
