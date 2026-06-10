@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import type { CommitData } from "../tracker/types.js";
+import type { BranchRecord, CommitData, IterationNode } from "../tracker/types.js";
 import {
   parseAnnotationBlocks,
   placeAnnotations,
@@ -9,6 +9,20 @@ import {
   type AnnotationBlock,
   type AnnotationPlacement,
 } from "./annotationPlacement.js";
+import {
+  computeClusterFootprint,
+  computeStickyLayout,
+  planTreeLayout,
+  DEFAULT_IMAGE_ASPECT,
+  IMAGE_W,
+  NOTE_MARGIN,
+  STICKY_W,
+  STICKY_H,
+  type ClusterFootprint,
+  type MiroPosition,
+  type MiroRelativePosition,
+  type NodeBox,
+} from "./treeLayout.js";
 
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -19,40 +33,168 @@ try {
 }
 
 const TOKEN_FILE = path.join(DESIGNTRAIL_ROOT, ".miro-token.json");
-const TIMELINE_STATE_FILE = path.join(DESIGNTRAIL_ROOT, ".designtrail", "miro-timeline.json");
 
-// Display width (board units) we render every screenshot at. Height is derived
-// from the PNG's real aspect ratio so we can map normalized element coordinates
-// onto exact board positions. Used as a default aspect when dimensions are
-// unknown.
-const IMAGE_W = 600;
-const DEFAULT_IMAGE_ASPECT = 0.66; // height/width fallback when PNG dims unreadable
-// Approximate on-board footprint of a sticky note, used for spacing math.
-const STICKY_W = 200;
-const STICKY_H = 200;
-// Gap between the image edge and the band of sticky notes, and between adjacent
-// notes sharing an edge.
-const NOTE_MARGIN = 90;
-const NOTE_GAP = 28;
+// Max in-flight Miro API calls. Miro rate-limits per user+app (HTTP 429), so
+// calls run in parallel but are globally capped at this concurrency. Kept modest
+// because concurrent writes to a single board trip 429s well before the raw
+// credit budget; retry/backoff handles any that still hit the limit.
+const MIRO_CONCURRENCY = Number(process.env.MIRO_CONCURRENCY ?? 4);
+// Minimum spacing between successive Miro request starts (token-bucket style), so
+// a burst of parallel work doesn't fire dozens of calls in the same instant.
+const MIN_MIRO_REQUEST_INTERVAL_MS = Number(process.env.MIRO_MIN_INTERVAL_MS ?? 200);
+// Retry policy for 429 / 5xx responses (and transient network errors).
+const MAX_MIRO_RETRIES = 8;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 60_000;
+// Max in-flight precompute tasks (PNG read + OpenAI vision placement) before the
+// board is drawn. Bounded so a large graph doesn't hammer the OpenAI API.
+const PRECOMPUTE_CONCURRENCY = 6;
 
-// A whole screenshot + its surrounding notes occupies this much board space, so
-// adjacent screenshots (columns) and commits (rows) don't collide.
-const TIMELINE_SPACING = 1200;
-const COLUMN_SPACING = IMAGE_W + 2 * (NOTE_MARGIN + STICKY_W) + 160; // ≈ 1340
+/**
+ * Caps how many async tasks run concurrently. A finished task hands its slot to
+ * the next waiter, so at most `max` tasks are ever in flight.
+ */
+class Semaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
 
-type Edge = "left" | "right" | "top" | "bottom";
+  constructor(private readonly max: number) {}
 
-type StickyLayoutItem = {
-  index: number;
-  position: MiroPosition;
-  // Relative endpoint on the image (e.g. "42%") the connector points at.
-  anchor: { x: string; y: string };
-};
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await task();
+    } finally {
+      this.release();
+    }
+  }
 
-type MiroPosition = {
-  x: number;
-  y: number;
-};
+  private acquire(): Promise<void> {
+    if (this.active < this.max) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      // Hand the held slot directly to the next waiter (active stays constant).
+      next();
+    } else {
+      this.active -= 1;
+    }
+  }
+}
+
+// Shared limiter for every Miro write so unbounded Promise.all bursts across the
+// render stay within MIRO_CONCURRENCY.
+const miroLimiter = new Semaphore(MIRO_CONCURRENCY);
+
+/**
+ * Runs `worker` over `items` with at most `limit` concurrent invocations,
+ * preserving input order in the returned results.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const runnerCount = Math.min(Math.max(1, limit), items.length);
+  const runners = Array.from({ length: runnerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Token-bucket spacing: tracks the earliest time the next request may start so
+// concurrent callers don't all fire in the same instant.
+let nextRequestAt = 0;
+async function throttle(): Promise<void> {
+  const now = Date.now();
+  const startAt = Math.max(now, nextRequestAt);
+  nextRequestAt = startAt + MIN_MIRO_REQUEST_INTERVAL_MS;
+  const wait = startAt - now;
+  if (wait > 0) await sleep(wait);
+}
+
+/**
+ * How long to wait before retrying a throttled/failed Miro response: prefer the
+ * `Retry-After` header (seconds), then `X-RateLimit-Reset` (epoch seconds),
+ * otherwise exponential backoff with jitter, all capped at MAX_BACKOFF_MS.
+ */
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("Retry-After");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, MAX_BACKOFF_MS);
+    }
+  }
+
+  const reset = response.headers.get("X-RateLimit-Reset");
+  if (reset) {
+    const resetMs = Number(reset) * 1000 - Date.now();
+    if (Number.isFinite(resetMs) && resetMs > 0) {
+      return Math.min(resetMs + 250, MAX_BACKOFF_MS);
+    }
+  }
+
+  const exponential = BASE_BACKOFF_MS * 2 ** attempt;
+  const jitter = Math.random() * BASE_BACKOFF_MS;
+  return Math.min(exponential + jitter, MAX_BACKOFF_MS);
+}
+
+/**
+ * Single entry point for every Miro HTTP call. Caps total concurrency, spaces
+ * out request starts, and retries 429 / 5xx responses (and transient network
+ * errors) with backoff that honors Miro's `Retry-After` header, so a rate-limited
+ * call waits and succeeds instead of being dropped. The retry holds its
+ * concurrency slot while backing off, which naturally pauses the whole render
+ * when the board is being throttled.
+ */
+async function miroFetch(url: string, init: RequestInit): Promise<Response> {
+  return miroLimiter.run(async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      await throttle();
+
+      let response: Response;
+      try {
+        response = await fetch(url, init);
+      } catch (error) {
+        if (attempt >= MAX_MIRO_RETRIES) throw error;
+        const exponential = BASE_BACKOFF_MS * 2 ** attempt;
+        await sleep(Math.min(exponential + Math.random() * BASE_BACKOFF_MS, MAX_BACKOFF_MS));
+        continue;
+      }
+
+      if (response.status !== 429 && response.status < 500) {
+        return response;
+      }
+      if (attempt >= MAX_MIRO_RETRIES) {
+        return response;
+      }
+
+      const delay = retryDelayMs(response, attempt);
+      // Drain the body so the connection can be reused before we back off.
+      await response.text().catch(() => undefined);
+      await sleep(delay);
+    }
+  });
+}
 
 type CreateMiroItemBase = {
   accessToken: string;
@@ -83,11 +225,6 @@ type MiroConnectorStyle = {
   [key: string]: string | undefined;
 };
 
-type MiroRelativePosition = {
-  x: string;
-  y: string;
-};
-
 type CreateMiroConnectorInput = {
   accessToken: string;
   boardId: string;
@@ -106,39 +243,13 @@ type MiroItemResponse = {
   [key: string]: unknown;
 };
 
-type MiroTimelineNode = {
-  commitHash: string;
-  miroNodeId: string;
-  nodeType: "image" | "sticky_note";
-  commitIndex: number;
-  position: MiroPosition;
-  previousNodeId: string | null;
-  createdAt: string;
+// One screenshot node that was successfully placed on the board.
+export type RenderedBoardNode = {
+  nodeId: string;
+  miroImageId: string;
 };
 
-type MiroTimelineEdge = {
-  previousNodeId: string;
-  currentNodeId: string;
-  previousCommitHash: string;
-  currentCommitHash: string;
-};
-
-type MiroTimelineState = {
-  commitIndex: number;
-  nodes: MiroTimelineNode[];
-  edges: MiroTimelineEdge[];
-};
-
-export type CommitScreenshot = {
-  screenshotPath?: string;
-  branchId: string;
-  summary: string;
-  annotation?: string;
-  type?: string;
-};
-
-type CreateCommitNodeOptions = {
-  screenshots: CommitScreenshot[];
+type RenderBoardOptions = {
   publicBaseUrl?: string;
 };
 
@@ -166,12 +277,24 @@ function getMiroHeaders(accessToken: string): Record<string, string> {
   };
 }
 
+function parseResponseBody(responseText: string): unknown {
+  if (!responseText) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return responseText;
+  }
+}
+
 async function postMiroItem(
   url: string,
   accessToken: string,
   body: Record<string, unknown>
 ): Promise<MiroItemResponse> {
-  const response = await fetch(url, {
+  const response = await miroFetch(url, {
     method: "POST",
     headers: getMiroHeaders(accessToken),
     body: JSON.stringify(body),
@@ -191,7 +314,7 @@ async function getMiroItem(
   boardId: string,
   itemId: string
 ): Promise<MiroItemResponse> {
-  const response = await fetch(
+  const response = await miroFetch(
     `https://api.miro.com/v2/boards/${boardId}/items/${encodeURIComponent(itemId)}`,
     {
       method: "GET",
@@ -206,49 +329,6 @@ async function getMiroItem(
   }
 
   return responseBody as MiroItemResponse;
-}
-
-function parseResponseBody(responseText: string): unknown {
-  if (!responseText) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(responseText);
-  } catch {
-    return responseText;
-  }
-}
-
-function loadTimelineState(): MiroTimelineState {
-  if (!existsSync(TIMELINE_STATE_FILE)) {
-    return { commitIndex: 0, nodes: [], edges: [] };
-  }
-
-  try {
-    const state = JSON.parse(readFileSync(TIMELINE_STATE_FILE, "utf8")) as Partial<MiroTimelineState>;
-
-    return {
-      commitIndex: typeof state.commitIndex === "number" ? state.commitIndex : 0,
-      nodes: Array.isArray(state.nodes) ? state.nodes : [],
-      edges: Array.isArray(state.edges) ? state.edges : [],
-    };
-  } catch (error) {
-    console.error("Could not read Miro timeline state; starting a new timeline:", error);
-    return { commitIndex: 0, nodes: [], edges: [] };
-  }
-}
-
-function saveTimelineState(state: MiroTimelineState): void {
-  mkdirSync(path.dirname(TIMELINE_STATE_FILE), { recursive: true });
-  writeFileSync(TIMELINE_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-}
-
-function getTimelinePosition(commitIndex: number): MiroPosition {
-  return {
-    x: 0,
-    y: commitIndex * TIMELINE_SPACING,
-  };
 }
 
 function getErrorMessage(error: unknown): string {
@@ -266,25 +346,104 @@ function pathToUrlPath(value: string): string {
     .replace(/^\/+/, "");
 }
 
-function getPublicScreenshotUrl(
-  commit: CommitData,
-  screenshotPath?: string,
-  publicBaseUrlOverride?: string
-): string {
-  const publicBaseUrl =
-    publicBaseUrlOverride ??
+/** Public URL Miro fetches a saved screenshot from, derived from its repo path. */
+function publicScreenshotUrl(screenshotPath: string, override?: string): string {
+  const base =
+    override ??
     process.env.CAPTURE_PUBLIC_URL ??
     process.env.PUBLIC_CAPTURE_URL ??
     process.env.CAPTURE_URL ??
     "http://localhost:3000";
-  const normalizedBase = normalizeUrlBase(publicBaseUrl);
+  return `${normalizeUrlBase(base)}/${pathToUrlPath(screenshotPath)}`;
+}
 
-  if (screenshotPath) {
-    return `${normalizedBase}/${pathToUrlPath(screenshotPath)}`;
+/**
+ * Pages through a board collection (items or connectors) and returns every id.
+ * Miro returns at most `limit` per page plus a `cursor` for the next page.
+ */
+async function listAllIds(
+  accessToken: string,
+  url: string
+): Promise<string[]> {
+  const ids: string[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const pageUrl = new URL(url);
+    pageUrl.searchParams.set("limit", "50");
+    if (cursor) pageUrl.searchParams.set("cursor", cursor);
+
+    const response = await miroFetch(pageUrl.toString(), {
+      method: "GET",
+      headers: getMiroHeaders(accessToken),
+    });
+    const body = parseResponseBody(await response.text());
+    if (!response.ok) {
+      throw new Error(`Miro API error ${response.status}: ${JSON.stringify(body)}`);
+    }
+
+    const data = (body as { data?: Array<{ id?: unknown }> })?.data;
+    if (Array.isArray(data)) {
+      for (const entry of data) {
+        if (entry?.id != null) ids.push(String(entry.id));
+      }
+    }
+    cursor = (body as { cursor?: string })?.cursor;
+  } while (cursor);
+
+  return ids;
+}
+
+async function deleteBoardResource(
+  accessToken: string,
+  url: string
+): Promise<void> {
+  const response = await miroFetch(url, {
+    method: "DELETE",
+    headers: getMiroHeaders(accessToken),
+  });
+  if (!response.ok && response.status !== 404) {
+    const body = parseResponseBody(await response.text());
+    throw new Error(`Miro API error ${response.status}: ${JSON.stringify(body)}`);
   }
+}
 
-  const repoCapturePath = commit.repoName ? `${commit.repoName}/` : "";
-  return `${normalizedBase}/captures/${repoCapturePath}${commit.hash}.png`;
+/**
+ * Wipes the entire board: deletes all connectors first, then every item.
+ * Individual failures are logged but never abort the wipe, so a stale element
+ * can't block the re-render that follows.
+ */
+export async function clearBoard(accessToken: string, boardId: string): Promise<void> {
+  const base = `https://api.miro.com/v2/boards/${boardId}`;
+
+  const [connectorIds, itemIds] = await Promise.all([
+    listAllIds(accessToken, `${base}/connectors`).catch((error) => {
+      console.error("Failed to list Miro connectors:", getErrorMessage(error));
+      return [] as string[];
+    }),
+    listAllIds(accessToken, `${base}/items`).catch((error) => {
+      console.error("Failed to list Miro items:", getErrorMessage(error));
+      return [] as string[];
+    }),
+  ]);
+
+  // Delete connectors and items together; the limiter inside deleteBoardResource
+  // caps how many run at once. A connector already removed via an item deletion
+  // just returns 404, which is ignored.
+  const urls = [
+    ...connectorIds.map((id) => `${base}/connectors/${encodeURIComponent(id)}`),
+    ...itemIds.map((id) => `${base}/items/${encodeURIComponent(id)}`),
+  ];
+
+  await Promise.all(
+    urls.map(async (url) => {
+      try {
+        await deleteBoardResource(accessToken, url);
+      } catch (error) {
+        console.error(`Failed to delete ${url}:`, getErrorMessage(error));
+      }
+    })
+  );
 }
 
 function isMiroPosition(value: unknown): value is MiroPosition {
@@ -406,116 +565,24 @@ export async function createConnector({
 
 /**
  * Builds a screenshot's HEADER sticky-note content: a per-component label
- * (short hash + branch, type, summary). The per-element design annotation is no
- * longer embedded here — it is split into its own notes placed around the image.
- * The commit's anchor note (the first screenshot, normally `main`) additionally
- * carries the commit-level metadata (message, source, commit annotation) so that
- * context appears exactly once per row.
+ * (short hash + branch, type, summary) plus the commit-level metadata (message,
+ * source, commit annotation) for the commit this node belongs to.
  */
 function buildStickyContent(
-  commit: CommitData,
-  shortHash: string,
-  screenshot: CommitScreenshot,
-  isAnchor: boolean
+  node: IterationNode,
+  commit: CommitData | undefined
 ): string {
-  const label = screenshot.branchId || "main";
+  const shortHash = node.commitHash.slice(0, 7);
+  const label = node.branchId || "main";
   const lines = [`${shortHash} · ${label}`];
-  if (screenshot.type) lines.push(screenshot.type);
-  if (screenshot.summary) lines.push(screenshot.summary);
-  if (isAnchor) {
-    lines.push(commit.message);
+  if (node.type) lines.push(node.type);
+  if (node.summary) lines.push(node.summary);
+  if (commit) {
+    if (commit.message) lines.push(commit.message);
     if (commit.source) lines.push(`source: ${commit.source}`);
     if (commit.annotation) lines.push(commit.annotation);
   }
   return lines.join("\n");
-}
-
-/**
- * Given an image's center and on-board size, lays each annotation out in the
- * margin nearest its element. Notes are bucketed by the closest edge, then
- * spaced apart along that edge so they don't overlap, while staying aligned to
- * the element they describe. Each item also carries the relative point on the
- * image (e.g. "42%") a connector should point at.
- */
-function computeStickyLayout(
-  imageCenter: MiroPosition,
-  imageW: number,
-  imageH: number,
-  placements: AnnotationPlacement[]
-): StickyLayoutItem[] {
-  const left = imageCenter.x - imageW / 2;
-  const top = imageCenter.y - imageH / 2;
-  const right = left + imageW;
-  const bottom = top + imageH;
-
-  type Item = {
-    index: number;
-    edge: Edge;
-    anchorAbs: MiroPosition;
-    anchorRel: MiroRelativePosition;
-  };
-
-  const items: Item[] = placements.map((placement) => {
-    const anchorAbs: MiroPosition = {
-      x: left + placement.x * imageW,
-      y: top + placement.y * imageH,
-    };
-    const distances: Record<Edge, number> = {
-      left: placement.x,
-      right: 1 - placement.x,
-      top: placement.y,
-      bottom: 1 - placement.y,
-    };
-    const edge = (Object.keys(distances) as Edge[]).reduce((best, candidate) =>
-      distances[candidate] < distances[best] ? candidate : best
-    );
-    return {
-      index: placement.index,
-      edge,
-      anchorAbs,
-      anchorRel: {
-        x: `${(placement.x * 100).toFixed(2)}%`,
-        y: `${(placement.y * 100).toFixed(2)}%`,
-      },
-    };
-  });
-
-  const result: StickyLayoutItem[] = [];
-
-  for (const edge of ["left", "right", "top", "bottom"] as Edge[]) {
-    const group = items.filter((item) => item.edge === edge);
-    if (group.length === 0) continue;
-
-    const vertical = edge === "left" || edge === "right";
-    group.sort((a, b) =>
-      vertical ? a.anchorAbs.y - b.anchorAbs.y : a.anchorAbs.x - b.anchorAbs.x
-    );
-
-    const minSpacing = vertical ? STICKY_H + NOTE_GAP : STICKY_W + NOTE_GAP;
-
-    // Fixed cross-axis coordinate of this edge's note band.
-    let bandX = imageCenter.x;
-    let bandY = imageCenter.y;
-    if (edge === "left") bandX = left - NOTE_MARGIN - STICKY_W / 2;
-    if (edge === "right") bandX = right + NOTE_MARGIN + STICKY_W / 2;
-    if (edge === "top") bandY = top - NOTE_MARGIN - STICKY_H / 2;
-    if (edge === "bottom") bandY = bottom + NOTE_MARGIN + STICKY_H / 2;
-
-    let previous = -Infinity;
-    for (const item of group) {
-      if (vertical) {
-        const y = Math.max(item.anchorAbs.y, previous + minSpacing);
-        previous = y;
-        result.push({ index: item.index, position: { x: bandX, y }, anchor: item.anchorRel });
-      } else {
-        const x = Math.max(item.anchorAbs.x, previous + minSpacing);
-        previous = x;
-        result.push({ index: item.index, position: { x, y: bandY }, anchor: item.anchorRel });
-      }
-    }
-  }
-
-  return result;
 }
 
 /**
@@ -540,183 +607,265 @@ async function uploadAnnotationNotes(params: {
   );
   const blockByIndex = new Map(params.blocks.map((block) => [block.index, block]));
 
-  for (const item of layout) {
-    const block = blockByIndex.get(item.index);
-    if (!block) continue;
+  await Promise.all(
+    layout.map(async (item) => {
+      const block = blockByIndex.get(item.index);
+      if (!block) return;
 
-    try {
-      const note = await createMiroStickyNote({
-        accessToken: params.accessToken,
-        boardId: params.boardId,
-        content: block.text,
-        position: item.position,
-        width: STICKY_W,
-      });
-      await createConnector({
-        accessToken: params.accessToken,
-        boardId: params.boardId,
-        startItemId: note.id,
-        endItemId: params.imageItemId,
-        endPosition: item.anchor,
-      });
-    } catch (error: unknown) {
-      console.error("Failed to place annotation note:", getErrorMessage(error));
-    }
+      try {
+        const note = await createMiroStickyNote({
+          accessToken: params.accessToken,
+          boardId: params.boardId,
+          content: block.text,
+          position: item.position,
+          width: STICKY_W,
+        });
+        await createConnector({
+          accessToken: params.accessToken,
+          boardId: params.boardId,
+          startItemId: note.id,
+          endItemId: params.imageItemId,
+          endPosition: item.anchor,
+        });
+      } catch (error: unknown) {
+        console.error("Failed to place annotation note:", getErrorMessage(error));
+      }
+    })
+  );
+}
+
+function groupNodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]> {
+  const map = new Map<string, IterationNode[]>();
+  for (const node of nodes) {
+    const list = map.get(node.branchId) ?? [];
+    list.push(node);
+    map.set(node.branchId, list);
+  }
+  return map;
+}
+
+async function safeConnector(
+  accessToken: string,
+  boardId: string,
+  startItemId: string,
+  endItemId: string
+): Promise<void> {
+  try {
+    await createConnector({ accessToken, boardId, startItemId, endItemId });
+  } catch (error) {
+    console.error("Failed to draw tree connector:", getErrorMessage(error));
   }
 }
 
-export async function createCommitNode(
-  commit: CommitData,
-  options: CreateCommitNodeOptions = { screenshots: [] }
-): Promise<MiroTimelineNode[]> {
+// One screenshot node with everything precomputed for layout and drawing.
+type PreparedNode = {
+  node: IterationNode;
+  imageH: number;
+  blocks: AnnotationBlock[];
+  placements: AnnotationPlacement[];
+  footprint: ClusterFootprint;
+  url: string;
+};
+
+/**
+ * Wipes the board and re-renders the ENTIRE design-evolution graph as a spatial
+ * component tree: every iteration node's screenshot, its header note, and its
+ * per-element annotation notes (with connectors), plus tree connectors showing
+ * per-branch chronology and branch forks. Positions come from planTreeLayout so
+ * screenshots assemble into a non-overlapping tree. Called fresh on every commit
+ * so the board always reflects the full, current graph.
+ */
+export async function renderBoardFromGraph(
+  branches: BranchRecord[],
+  nodes: IterationNode[],
+  commitsByHash: Map<string, CommitData>,
+  options: RenderBoardOptions = {}
+): Promise<RenderedBoardNode[]> {
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
 
   if (!accessToken) {
-    console.error("No stored Miro access token found. Complete OAuth first; skipping Miro upload.");
+    console.error("No stored Miro access token found. Complete OAuth first; skipping Miro render.");
     return [];
   }
 
   if (!boardId) {
-    console.error("MIRO_BOARD_ID is missing. Skipping Miro upload.");
+    console.error("MIRO_BOARD_ID is missing. Skipping Miro render.");
     return [];
   }
 
-  const shortHash = commit.hash.slice(0, 7);
-  // Fall back to a single commit-level capture so a commit always lands on the
-  // board even when no per-component screenshot succeeded.
-  const screenshots: CommitScreenshot[] =
-    options.screenshots.length > 0
-      ? options.screenshots
-      : [{ branchId: "", summary: "" }];
+  // Keep only nodes whose screenshot file actually exists on disk.
+  const renderable = nodes.filter(
+    (node) =>
+      node.screenshotPath &&
+      existsSync(path.join(DESIGNTRAIL_ROOT, node.screenshotPath))
+  );
 
-  const timelineState = loadTimelineState();
-  const commitIndex = timelineState.commitIndex;
-  const rowY = getTimelinePosition(commitIndex).y;
-  const previousNode = timelineState.nodes.at(-1) ?? null;
-
-  let anchorNode: MiroTimelineNode | null = null;
-
-  for (let i = 0; i < screenshots.length; i += 1) {
-    const screenshot = screenshots[i];
-    const isAnchor = anchorNode === null;
-    const position: MiroPosition = { x: i * COLUMN_SPACING, y: rowY };
-    const screenshotUrl = getPublicScreenshotUrl(
-      commit,
-      screenshot.screenshotPath,
-      options.publicBaseUrl
-    );
-
-    try {
-      const imageItem = await createMiroImage({
-        accessToken,
-        boardId,
-        url: screenshotUrl,
-        position,
-        width: IMAGE_W,
-      });
-
-      // Derive the on-board image height from the PNG's real aspect ratio so
-      // annotations map to exact element positions.
-      const absPng = screenshot.screenshotPath
-        ? path.join(DESIGNTRAIL_ROOT, screenshot.screenshotPath)
-        : null;
-      const dims = absPng ? await readPngDimensions(absPng) : null;
+  // Precompute, per node: image height, annotation blocks, vision-placed
+  // annotation positions, the cluster footprint, and the public image URL.
+  const prepared: PreparedNode[] = await mapWithConcurrency(
+    renderable,
+    PRECOMPUTE_CONCURRENCY,
+    async (node) => {
+      const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
+      const dims = await readPngDimensions(absPng);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const left = position.x - IMAGE_W / 2;
-      const top = position.y - imageH / 2;
-
-      // Header note carries the commit/component metadata and is the commit's
-      // timeline anchor. Sits diagonally off the image's top-left corner so it
-      // stays clear of the per-element note bands.
-      const headerNote = await createMiroStickyNote({
-        accessToken,
-        boardId,
-        content: buildStickyContent(commit, shortHash, screenshot, isAnchor),
-        position: {
-          x: left - NOTE_MARGIN - STICKY_W / 2,
-          y: top - NOTE_MARGIN - STICKY_H / 2,
-        },
-        width: STICKY_W,
-      });
-
-      // Split the annotation into per-element notes positioned around the image.
-      // A vision model decides each note's on-image location; on any failure we
-      // fall back to a single combined note beside the image so the commit is
-      // never blocked.
-      const annotation = (screenshot.annotation ?? "").trim();
+      const annotation = (node.annotation ?? "").trim();
       const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
       const placements =
-        absPng && blocks.length > 0 ? await placeAnnotations(absPng, blocks) : null;
+        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
+      const footprint = computeClusterFootprint(imageH, placements);
+      return {
+        node,
+        imageH,
+        blocks,
+        placements,
+        footprint,
+        url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
+      };
+    }
+  );
 
-      if (placements && placements.length > 0) {
-        await uploadAnnotationNotes({
+  if (prepared.length === 0) {
+    console.error("No renderable screenshots found for this repo; skipping Miro render.");
+    return [];
+  }
+
+  // Wipe the whole board so the re-render starts from a clean slate.
+  await clearBoard(accessToken, boardId);
+
+  const boxes: NodeBox[] = prepared.map((p) => ({
+    id: p.node.id,
+    width: p.footprint.width,
+    height: p.footprint.height,
+    imageCenterOffset: p.footprint.imageCenterOffset,
+  }));
+  const layout = await planTreeLayout(branches, nodes, boxes);
+
+  const imageIdByNode = new Map<string, string>();
+  const rendered: RenderedBoardNode[] = [];
+
+  // Insert phase: draw every screenshot in parallel. Each node creates its image
+  // first (annotation connectors need the image id), then fires its header and
+  // annotation notes together. The shared limiter caps total concurrency.
+  await Promise.all(
+    prepared.map(async (p) => {
+      const box = layout.get(p.node.id);
+      if (!box) return;
+
+      const imageCenter: MiroPosition = {
+        x: box.x + p.footprint.imageCenterOffset.x,
+        y: box.y + p.footprint.imageCenterOffset.y,
+      };
+
+      let imageItemId: string;
+      try {
+        const imageItem = await createMiroImage({
           accessToken,
           boardId,
-          imageItemId: imageItem.id,
-          imageCenter: position,
-          imageH,
-          blocks,
-          placements,
+          url: p.url,
+          position: imageCenter,
+          width: IMAGE_W,
         });
-      } else if (annotation) {
-        await createMiroStickyNote({
+        imageItemId = imageItem.id;
+        imageIdByNode.set(p.node.id, imageItem.id);
+        rendered.push({ nodeId: p.node.id, miroImageId: imageItem.id });
+      } catch (error: unknown) {
+        console.error(
+          `Failed to render Miro screenshot (${p.node.branchId || "main"}):`,
+          getErrorMessage(error)
+        );
+        return;
+      }
+
+      const left = imageCenter.x - IMAGE_W / 2;
+      const top = imageCenter.y - p.imageH / 2;
+
+      // Header note carries the commit/component metadata, sitting diagonally
+      // off the image's top-left corner so it stays clear of the note bands.
+      const noteWork: Promise<unknown>[] = [
+        createMiroStickyNote({
           accessToken,
           boardId,
-          content: annotation,
+          content: buildStickyContent(p.node, commitsByHash.get(p.node.commitHash)),
           position: {
-            x: position.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
-            y: position.y,
+            x: left - NOTE_MARGIN - STICKY_W / 2,
+            y: top - NOTE_MARGIN - STICKY_H / 2,
           },
           width: STICKY_W,
-        });
+        }).catch((error: unknown) =>
+          console.error("Failed to place header note:", getErrorMessage(error))
+        ),
+      ];
+
+      // Per-element annotation notes around the image; on a missing placement we
+      // fall back to a single combined note beside the image.
+      if (p.placements.length > 0 && p.blocks.length > 0) {
+        noteWork.push(
+          uploadAnnotationNotes({
+            accessToken,
+            boardId,
+            imageItemId,
+            imageCenter,
+            imageH: p.imageH,
+            blocks: p.blocks,
+            placements: p.placements,
+          })
+        );
+      } else if ((p.node.annotation ?? "").trim()) {
+        noteWork.push(
+          createMiroStickyNote({
+            accessToken,
+            boardId,
+            content: (p.node.annotation ?? "").trim(),
+            position: {
+              x: imageCenter.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
+              y: imageCenter.y,
+            },
+            width: STICKY_W,
+          }).catch((error: unknown) =>
+            console.error("Failed to place annotation note:", getErrorMessage(error))
+          )
+        );
       }
 
-      console.log(
-        `Miro screenshot uploaded (${screenshot.branchId || "main"}): note ${headerNote.id}`
-      );
+      await Promise.all(noteWork);
+    })
+  );
 
-      // The first screenshot that lands becomes the commit's timeline anchor so
-      // commit-to-commit chaining stays one node per commit.
-      if (anchorNode === null) {
-        anchorNode = {
-          commitHash: commit.hash,
-          miroNodeId: headerNote.id,
-          nodeType: "sticky_note",
-          commitIndex,
-          position,
-          previousNodeId: previousNode?.miroNodeId ?? null,
-          createdAt: new Date().toISOString(),
-        };
+  // Tree connectors: chronological chain within each branch, then a fork edge
+  // from each branch's fork point to that branch's first screenshot. Built after
+  // all images exist, then drawn in parallel.
+  const renderedByBranch = groupNodesByBranch(
+    renderable.filter((node) => imageIdByNode.has(node.id))
+  );
+
+  const connectorWork: Promise<void>[] = [];
+
+  for (const branchNodes of renderedByBranch.values()) {
+    for (let i = 1; i < branchNodes.length; i += 1) {
+      const startId = imageIdByNode.get(branchNodes[i - 1].id);
+      const endId = imageIdByNode.get(branchNodes[i].id);
+      if (startId && endId) {
+        connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
       }
-    } catch (error: unknown) {
-      console.error(
-        `Failed to upload Miro screenshot (${screenshot.branchId || "main"}):`,
-        getErrorMessage(error)
-      );
     }
   }
 
-  if (!anchorNode) {
-    console.error("No Miro screenshots could be uploaded for this commit.");
-    return [];
+  for (const branch of branches) {
+    if (!branch.forkNodeId) continue;
+    const first = renderedByBranch.get(branch.id)?.[0];
+    if (!first) continue;
+    const startId = imageIdByNode.get(branch.forkNodeId);
+    const endId = imageIdByNode.get(first.id);
+    if (startId && endId) {
+      connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
+    }
   }
 
-  timelineState.nodes.push(anchorNode);
+  await Promise.all(connectorWork);
 
-  if (previousNode) {
-    timelineState.edges.push({
-      previousNodeId: previousNode.miroNodeId,
-      currentNodeId: anchorNode.miroNodeId,
-      previousCommitHash: previousNode.commitHash,
-      currentCommitHash: commit.hash,
-    });
-  }
+  console.log(`Miro board re-rendered: ${rendered.length} screenshot(s) in a component tree.`);
 
-  timelineState.commitIndex = commitIndex + 1;
-  saveTimelineState(timelineState);
-
-  console.log(`Miro timeline node stored at y=${rowY}`);
-
-  return [anchorNode];
+  return rendered;
 }

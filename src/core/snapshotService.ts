@@ -11,9 +11,9 @@ import { DesignGraph } from "../../tracker/graph.js";
 import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
-import { createCommitNode } from "../../miro/miroClient.js";
-import type { CommitScreenshot } from "../../miro/miroClient.js";
+import { renderBoardFromGraph } from "../../miro/miroClient.js";
 import type {
+  BranchRecord,
   CommitData,
   IterationNode,
   ScreenshotResult,
@@ -43,7 +43,7 @@ export type DesignSnapshotResult = {
   repoPath: string;
   entries: DesignSnapshotEntry[];
   screenshots: ScreenshotResult[];
-  miroNodes: Awaited<ReturnType<typeof createCommitNode>>;
+  miroNodes: Awaited<ReturnType<typeof renderBoardFromGraph>>;
 };
 
 /**
@@ -134,10 +134,6 @@ function normalizeOptional(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function toPortablePath(value: string): string {
-  return value.split(path.sep).join("/");
-}
-
 /** SHA-256 of a file's bytes, or null if it can't be read. */
 async function hashFile(absPath: string): Promise<string | null> {
   try {
@@ -146,35 +142,6 @@ async function hashFile(absPath: string): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-function selectMiroScreenshots(
-  entries: DesignSnapshotEntry[],
-  screenshots: ScreenshotResult[]
-): CommitScreenshot[] {
-  const successfulPaths = new Set(
-    screenshots.map((screenshot) =>
-      toPortablePath(path.relative(DESIGNTRAIL_ROOT, screenshot.outputPath))
-    )
-  );
-  const successfulEntries = entries.filter((entry) =>
-    successfulPaths.has(toPortablePath(entry.screenshotPath))
-  );
-
-  // main first (the anchor for the commit's timeline node), then the rest.
-  const ordered = [...successfulEntries].sort((a, b) => {
-    if (a.branchId === MAIN_BRANCH) return -1;
-    if (b.branchId === MAIN_BRANCH) return 1;
-    return 0;
-  });
-
-  return ordered.map((entry) => ({
-    screenshotPath: entry.screenshotPath,
-    branchId: entry.branchId,
-    summary: entry.summary,
-    annotation: entry.annotation ?? undefined,
-    type: entry.type,
-  }));
 }
 
 /**
@@ -205,6 +172,13 @@ export async function createDesignSnapshot(
   let entries: DesignSnapshotEntry[] = [];
   const nodeByOutput = new Map<string, string>();
   let screenshots: ScreenshotResult[] = [];
+  // Full graph snapshot captured before the DB is closed, so the whole board can
+  // be re-rendered as a tree (not just this commit's nodes).
+  let boardExport: {
+    branches: BranchRecord[];
+    nodes: IterationNode[];
+    commits: Map<string, CommitData>;
+  } | null = null;
 
   try {
     // Read the live DOM (across pages) first so the LLM targets elements that
@@ -454,16 +428,29 @@ export async function createDesignSnapshot(
         ? { ...screenshot, outputPath: path.join(DESIGNTRAIL_ROOT, screenshotPath) }
         : screenshot;
     });
+
+    // Snapshot the finalized graph (paths now point at the mirrored tree) plus
+    // commit metadata so the Miro board can be wiped and re-rendered in full.
+    const finalGraph = graph.exportGraph();
+    boardExport = {
+      branches: finalGraph.branches,
+      nodes: finalGraph.nodes,
+      commits: graph.getCommits(),
+    };
   } finally {
     graph.close();
   }
 
+  // Wipe the board and re-render the ENTIRE component tree (every commit's
+  // screenshots), so locations are recomputed and the new commit is included.
   const miroNodes =
-    options?.syncMiro === false
+    options?.syncMiro === false || !boardExport
       ? []
-      : await createCommitNode(commit, {
-          screenshots: selectMiroScreenshots(entries, screenshots),
-        });
+      : await renderBoardFromGraph(
+          boardExport.branches,
+          boardExport.nodes,
+          boardExport.commits
+        );
 
   return {
     commit,

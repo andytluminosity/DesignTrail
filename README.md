@@ -25,6 +25,8 @@ flowchart TD
   shot --> annotate["annotate.ts: annotateScreenshots (vision) -> per-node annotation"]
   annotate --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
   store --> db["/data/repo/graph.db"]
+  save --> miro["miroClient.ts: clearBoard + renderBoardFromGraph (wipe + redraw whole tree)"]
+  db --> miro
 ```
 
 The LLM runs **before** the screenshots. To keep its targeting grounded, DesignTrail first
@@ -213,6 +215,10 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
    branch folder holds its iteration PNGs plus its child-branch subfolders). SQLite remains
    the source of truth; the folder tree is reconciled from it after every capture. Captures
    from all watched repos are centralized here and namespaced per repo.
+6. Finally, the Miro board is wiped and **re-rendered in full** from the graph (see
+   [Rendering the board on Miro](#rendering-the-board-on-miro)). Because the whole tree is
+   redrawn every commit, positions are recomputed each time so the board always reflects the
+   complete, current design-evolution tree (including the new commit).
 
 The reusable core entry point is `createDesignSnapshot(options)` in
 `src/core/snapshotService.ts`. Integrations should pass `repoPath` explicitly
@@ -305,6 +311,10 @@ tracker/
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
   types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
+miro/
+  miroClient.ts   clearBoard + renderBoardFromGraph: wipe the board and redraw the whole component tree
+  treeLayout.ts   computeClusterFootprint + planTreeLayout (LLM positions, validated, deterministic fallback)
+  annotationPlacement.ts  Splits annotations into blocks + vision-places each on its screenshot
 src/core/
   snapshotService.ts  Reusable createDesignSnapshot(...) workflow entry point
 captures/         Saved screenshots mirrored as the nested branch tree, captures/<repo>/<branch-path>/<NNN>-<shortHash>.png (git-ignored)
@@ -335,6 +345,45 @@ npm run visualize -- TempRepo   # one repo
 npm run visualize               # every repo found under data/
 open data/TempRepo/graph.html
 ```
+
+## Rendering the board on Miro
+
+When `syncMiro` is on (the default), `createDesignSnapshot` re-renders the entire
+design-evolution graph onto a Miro board after every commit via
+`renderBoardFromGraph` ([miro/miroClient.ts](miro/miroClient.ts)). It is a
+**wipe-and-rerender**, not an append:
+
+1. **Wipe.** `clearBoard` pages through the board and deletes every connector and
+   item (in parallel), so each render starts from a clean slate. (This removes ALL
+   content on the configured `MIRO_BOARD_ID`, so use a board dedicated to
+   DesignTrail.) The wipe fully completes before any inserts begin.
+2. **Footprint.** For each iteration node with a screenshot, the image is sized at
+   a fixed width (height from the PNG's real aspect ratio) and its per-element
+   annotations are vision-placed ([miro/annotationPlacement.ts](miro/annotationPlacement.ts)).
+   `computeClusterFootprint` then measures the full bounding box of the cluster
+   (image + header note + every annotation note).
+3. **Layout.** `planTreeLayout` ([miro/treeLayout.ts](miro/treeLayout.ts)) assigns
+   each cluster a non-overlapping position so the screenshots assemble into the
+   component tree (branches nested under their parent, each branch's iterations in a
+   chronological row). An **LLM proposes the positions**; the proposal is accepted
+   only if it is complete, tree-shaped, and overlap-free (no screenshot or sticky
+   note overlapping anything), otherwise a deterministic tidy-tree layout is used so
+   the result is always clean.
+4. **Draw.** Each screenshot is placed with its header note and per-element
+   annotation notes (each connected to the element it describes), then tree
+   connectors are drawn: a chronological chain within each branch and a fork edge
+   from each branch's fork point to that branch's first screenshot. Inserts run in
+   parallel (images first, then connectors that reference them), globally capped by
+   a concurrency limiter and spaced by a minimum request interval. Every Miro call
+   goes through one wrapper that retries `429` / `5xx` responses with backoff that
+   honors Miro's `Retry-After` header, so a rate-limited call waits and succeeds
+   instead of being dropped. Tune `MIRO_CONCURRENCY` and `MIRO_MIN_INTERVAL_MS` if
+   you still see throttling.
+
+Because the board is rebuilt from SQLite every time, positions are recomputed on
+every commit and the board always shows the complete, current tree. Configure the
+board with `MIRO_BOARD_ID` and complete the OAuth flow in `miro-service/` first.
+Set `syncMiro: false` to capture and persist locally without touching Miro.
 
 ## Manual testing
 

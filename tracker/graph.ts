@@ -215,6 +215,30 @@ export class DesignGraph {
       });
   }
 
+  /** Every recorded commit keyed by hash, so node headers can show commit metadata. */
+  getCommits(): Map<string, CommitData> {
+    const rows = this.db.prepare(`SELECT * FROM commits`).all() as {
+      hash: string;
+      message: string;
+      diff: string;
+      timestamp: number;
+      source: string | null;
+      annotation: string | null;
+    }[];
+    const map = new Map<string, CommitData>();
+    for (const row of rows) {
+      map.set(row.hash, {
+        hash: row.hash,
+        message: row.message,
+        diff: row.diff,
+        timestamp: row.timestamp,
+        source: row.source ?? undefined,
+        annotation: row.annotation ?? undefined,
+      });
+    }
+    return map;
+  }
+
   getBranches(): BranchRecord[] {
     const rows = this.db
       .prepare(`SELECT * FROM branches ORDER BY created_at ASC, id ASC`)
