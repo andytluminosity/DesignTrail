@@ -22,7 +22,7 @@ flowchart TD
   branch --> node["build IterationNode (parent = branch tip)"]
   node --> store["graph.ts: addNode + ensureBranch (SQLite)"]
   loop --> shot["screenshot.ts: takeScreenshots (one browser, N captures)"]
-  shot --> save["save PNG to captures/repo/hash/component.png"]
+  shot --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
   store --> db["/data/repo/graph.db"]
 ```
 
@@ -96,7 +96,7 @@ COMPONENT: sidebar
   PARENT NODE:   none
   TYPE:          UI_CHANGE
   SUMMARY:       Added collapse toggle to sidebar
-  SCREENSHOT:    captures/TempRepo/<hash>/sidebar.png
+  SCREENSHOT:    captures/TempRepo/main/sidebar/001-<hash>.png
 ========================
 ```
 
@@ -199,8 +199,11 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
    to OpenAI and gets back a list of changed components.
 4. For each component, a branch is resolved (reused or newly nested), an `IterationNode` is
    written, and a targeted screenshot is captured (all captures share one browser).
-5. PNGs are saved to `captures/<repo-name>/<commit-hash>/<component>.png` inside DesignTrail
-   (captures from all watched repos are centralized here and namespaced per repo).
+5. Once the branch tree is finalized, the screenshots are mirrored into nested branch folders
+   under `captures/<repo-name>/` so the directory layout matches the component tree (each
+   branch folder holds its iteration PNGs plus its child-branch subfolders). SQLite remains
+   the source of truth; the folder tree is reconciled from it after every capture. Captures
+   from all watched repos are centralized here and namespaced per repo.
 
 ## LLM output contract
 
@@ -276,7 +279,7 @@ tracker/
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
   types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
-captures/         Saved screenshots, namespaced as captures/<repo>/<hash>/<component>.png (git-ignored)
+captures/         Saved screenshots mirrored as the nested branch tree, captures/<repo>/<branch-path>/<NNN>-<shortHash>.png (git-ignored)
 data/             Per-repo SQLite graphs at data/<repo>/graph.db (git-ignored)
 ```
 
@@ -311,7 +314,7 @@ open data/TempRepo/graph.html
 # Start the dev server for the app you track (must serve CAPTURE_URL)
 # then either commit from the watched repo:
 git commit -m "tweak layout"
-# ...the tracker runs automatically, writes captures/<repo>/<hash>/<component>.png
+# ...the tracker runs automatically, mirrors screenshots into captures/<repo>/<branch-path>/
 # and updates data/<repo>/graph.db
 
 # or manually capture a specific repo:

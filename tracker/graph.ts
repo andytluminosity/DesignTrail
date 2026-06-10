@@ -315,6 +315,17 @@ export class DesignGraph {
       });
   }
 
+  /**
+   * Repoints a node at its screenshot's current location. Used when the folder
+   * mirror moves PNGs into their nested branch folders, keeping the DB (the
+   * source of truth) consistent with where the files actually live.
+   */
+  setNodeScreenshotPath(nodeId: string, relPath: string): void {
+    this.db
+      .prepare(`UPDATE nodes SET screenshot_path = @path WHERE id = @id`)
+      .run({ id: nodeId, path: relPath });
+  }
+
   /** Runs the given mutations atomically in a single transaction. */
   transaction(fn: () => void): void {
     this.db.transaction(fn)();

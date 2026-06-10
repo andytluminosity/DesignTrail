@@ -1,11 +1,13 @@
 import path from "path";
 import { fileURLToPath } from "url";
+import fse from "fs-extra";
 import { getLatestCommit, getDiff, getRepoName } from "./git.js";
 import { takeScreenshots, getSiteContext } from "./screenshot.js";
 import type { ScreenshotJob } from "./screenshot.js";
 import { analyzeCommit } from "./llm.js";
 import { DesignGraph } from "./graph.js";
 import { deriveContainmentParents } from "./layout.js";
+import { planFolderLayout } from "./treeStore.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "./branch.js";
 import { createCommitNode } from "../miro/miroClient.js";
 import type { CommitData, IterationNode, ScreenshotTarget } from "./types.js";
@@ -38,6 +40,57 @@ function containerTarget(branchId: string, target: ScreenshotTarget): Screenshot
 // Resolve the tracker's own root (DesignTrail) so the pipeline works no matter
 // which repo's git hook triggered it (e.g. DesignTrail itself or TempRepo).
 const TRACKER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Recursively removes directories left empty under `dir` (post-order), so the
+ * old flat `captures/<repo>/<hash>/` folders disappear once their PNGs move
+ * into the nested branch tree. `dir` itself is preserved.
+ */
+async function pruneEmptyDirs(dir: string): Promise<void> {
+  if (!(await fse.pathExists(dir))) return;
+  for (const entry of await fse.readdir(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      const child = path.join(dir, entry.name);
+      await pruneEmptyDirs(child);
+      const remaining = await fse.readdir(child);
+      if (remaining.length === 0) await fse.remove(child);
+    }
+  }
+}
+
+/**
+ * Mirrors the (now finalized) branch tree onto disk: moves each node's PNG into
+ * its nested branch folder and repoints the node's screenshot_path so the DB
+ * (source of truth) stays consistent. Reconciliation is idempotent — nodes
+ * already in place are skipped — so reparenting across commits just relocates a
+ * branch's files on the next run.
+ */
+async function materializeFolderTree(
+  graph: DesignGraph,
+  repoName: string
+): Promise<void> {
+  const { branches, nodes } = graph.exportGraph();
+  const moves = planFolderLayout(branches, nodes, repoName);
+
+  const applied: { nodeId: string; desiredPath: string }[] = [];
+  for (const move of moves) {
+    if (move.currentPath === move.desiredPath) continue;
+    const from = path.join(TRACKER_ROOT, move.currentPath);
+    const to = path.join(TRACKER_ROOT, move.desiredPath);
+    if (move.currentPath && (await fse.pathExists(from))) {
+      await fse.move(from, to, { overwrite: true });
+    }
+    applied.push({ nodeId: move.nodeId, desiredPath: move.desiredPath });
+  }
+
+  graph.transaction(() => {
+    for (const { nodeId, desiredPath } of applied) {
+      graph.setNodeScreenshotPath(nodeId, desiredPath);
+    }
+  });
+
+  await pruneEmptyDirs(path.join(TRACKER_ROOT, "captures", repoName));
+}
 
 // Load env (OPENAI_API_KEY, optional CAPTURE_URL) from the tracker root, since
 // the current working directory will be the committing repo, not DesignTrail.
@@ -264,6 +317,10 @@ async function main(): Promise<void> {
       graph.setBranchParent(branchId, parentBranchId);
     }
   });
+
+  // Mirror the finalized branch tree onto disk: captures/<repo>/ becomes the
+  // nested component tree, each branch folder holding its iteration PNGs.
+  await materializeFolderTree(graph, repoName);
 
   graph.close();
 

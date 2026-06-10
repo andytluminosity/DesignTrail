@@ -51,7 +51,7 @@ export type IterationNode = {
   parentId: string | null; // previous node on the SAME component branch, null if first
   summary: string;
   type: CommitType;
-  screenshotPath: string; // relative, e.g. captures/<repo>/<hash>/<branchId>.png
+  screenshotPath: string; // relative path into the nested branch-tree mirror, e.g. captures/<repo>/main/sidebar/<NNN>-<shortHash>.png
   timestamp: number;
   // On-screen rect of the captured container at capture time (the climbed
   // `capture` element, or the located element when no container was chosen).
