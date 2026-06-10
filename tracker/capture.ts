@@ -33,6 +33,13 @@ function logCommit(hash: string, repo: string, entries: LogEntry[]): void {
   console.log("========================");
 }
 
+async function flushOutput(): Promise<void> {
+  await Promise.all([
+    new Promise<void>((resolve) => process.stdout.write("", () => resolve())),
+    new Promise<void>((resolve) => process.stderr.write("", () => resolve())),
+  ]);
+}
+
 async function promptForAnnotation(): Promise<string | undefined> {
   let input: NodeJS.ReadableStream = process.stdin;
   let output: NodeJS.WritableStream = process.stdout;
@@ -71,13 +78,19 @@ async function main(): Promise<void> {
   const source = process.env.DESIGNTRAIL_SOURCE?.trim() || "cli";
   const result = await createDesignSnapshot({ repoPath, source, annotation });
   logCommit(result.commit.hash, result.repoName, result.entries);
+  console.log(
+    `DesignTrail post-commit hook complete for ${result.commit.hash.slice(0, 8)}.`
+  );
 }
 
 main()
-  .then(() => {
+  .then(async () => {
+    await flushOutput();
     process.exit(0);
   })
-  .catch((err) => {
+  .catch(async (err) => {
     console.error("Capture failed:", err);
+    console.error("The git commit was created, but DesignTrail did not finish cleanly.");
+    await flushOutput();
     process.exit(1);
   });
