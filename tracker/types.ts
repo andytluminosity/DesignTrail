@@ -86,6 +86,17 @@ export type ScreenshotResult = {
   geometry?: NodeGeometry;
 };
 
+// One container captured while climbing the live DOM ancestor chain above a
+// job's located element. branchId is derived from the container's DOM identity
+// (its id/first class), or "main" for the full-page capture taken once the climb
+// reaches body/html.
+export type AncestorCapture = {
+  branchId: string;
+  outputPath: string;
+  geometry?: NodeGeometry;
+  navPath: string; // route the ancestor was captured on
+};
+
 export type PageContext = {
   path: string;
   elements: UiElement[];

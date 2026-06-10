@@ -202,11 +202,6 @@ export async function createDesignSnapshot(
       // captured full-page.
       graph.ensureBranch(MAIN_BRANCH, null, null, "/", { mode: "full" });
 
-      // Branches created in THIS commit (trigger cascading ancestor updates) and
-      // branches that already received a node this commit (skipped by the cascade).
-      const newBranches: string[] = [];
-      const nodedBranches = new Set<string>();
-
       const addNodeAndJob = (
         branchId: string,
         summary: string,
@@ -232,7 +227,6 @@ export async function createDesignSnapshot(
           screenshotPath,
           timestamp: commit.timestamp,
         });
-        nodedBranches.add(branchId);
 
         const outputPath = path.join(DESIGNTRAIL_ROOT, screenshotPath);
         nodeByOutput.set(outputPath, `${commit.hash}:${branchId}`);
@@ -253,7 +247,6 @@ export async function createDesignSnapshot(
               : resolveParentBranch(change.parentBranch, graph.getBranchNames());
           const forkNodeId = parentBranchId ? graph.getBranchTip(parentBranchId) : null;
           graph.ensureBranch(branchId, parentBranchId, forkNodeId, navPath, target);
-          if (branchId !== MAIN_BRANCH) newBranches.push(branchId);
         } else {
           graph.setBranchCapture(branchId, navPath, target);
         }
@@ -277,51 +270,58 @@ export async function createDesignSnapshot(
           screenshotPath,
         });
       }
-
-      // Cascading ancestor updates: whenever a new component (branch) is added,
-      // every ancestor up to the root gets a fresh node re-capturing its own
-      // component, reflecting the new descendant.
-      const triggeredBy = new Map<string, Set<string>>();
-      for (const created of newBranches) {
-        let current = graph.getBranch(created)?.parentBranchId ?? null;
-        while (current) {
-          if (!triggeredBy.has(current)) triggeredBy.set(current, new Set());
-          triggeredBy.get(current)!.add(created);
-          current = graph.getBranch(current)?.parentBranchId ?? null;
-        }
-      }
-
-      for (const [ancestor, children] of triggeredBy) {
-        if (nodedBranches.has(ancestor)) continue;
-
-        const branch = graph.getBranch(ancestor);
-        const target = containerTarget(ancestor, branch?.target ?? fallbackTarget(ancestor));
-        const navPath = branch?.navPath ?? "/";
-        const summary = `Updated to reflect new nested component(s): ${[...children]
-          .sort()
-          .join(", ")}`;
-
-        const { parentId, screenshotPath } = addNodeAndJob(
-          ancestor,
-          summary,
-          "UI_CHANGE",
-          target,
-          navPath
-        );
-
-        entries.push({
-          branchId: ancestor,
-          parentBranchId: branch?.parentBranchId ?? null,
-          parentId,
-          type: "UI_CHANGE",
-          summary,
-          annotation: null,
-          screenshotPath,
-        });
-      }
     });
 
-    screenshots = await takeScreenshots(jobs, CAPTURE_URL);
+    const { results, ancestors } = await takeScreenshots(jobs, CAPTURE_URL);
+    screenshots = results;
+
+    // Climb-the-DOM ancestor capture: takeScreenshots walked the live container
+    // chain above each located component up to the page root, capturing every
+    // ancestor container (branch id derived from its DOM identity) plus a
+    // full-page `main`. Materialize each as a node on its branch, reusing the
+    // branch when it already exists. Branches a level-0 component already noded
+    // this commit were skipped during capture, so there is no collision here.
+    graph.transaction(() => {
+      for (const ancestor of ancestors) {
+        const { branchId, outputPath, navPath } = ancestor;
+
+        if (branchId !== MAIN_BRANCH && !graph.branchExists(branchId)) {
+          // Provisional parent = main; real nesting is fixed below from geometry.
+          const forkNodeId = graph.getBranchTip(MAIN_BRANCH);
+          const target = fallbackTarget(branchId);
+          graph.ensureBranch(branchId, MAIN_BRANCH, forkNodeId, navPath, target);
+        }
+
+        const parentId = graph.getBranchTip(branchId);
+        const nodeId = `${commit.hash}:${branchId}`;
+        const screenshotPath = path.relative(DESIGNTRAIL_ROOT, outputPath);
+
+        graph.addNode({
+          id: nodeId,
+          commitHash: commit.hash,
+          branchId,
+          parentId,
+          summary: "Updated to reflect a nested change",
+          type: "UI_CHANGE",
+          screenshotPath,
+          timestamp: commit.timestamp,
+        });
+
+        nodeByOutput.set(outputPath, nodeId);
+        const branchRecord = graph.getBranch(branchId);
+        const entry: DesignSnapshotEntry = {
+          branchId,
+          parentBranchId: branchRecord?.parentBranchId ?? null,
+          parentId,
+          type: "UI_CHANGE",
+          summary: "Updated to reflect a nested change",
+          annotation: null,
+          screenshotPath,
+        };
+        entries.push(entry);
+        screenshots.push({ outputPath, geometry: ancestor.geometry });
+      }
+    });
 
     // Drop captures that are byte-identical to the previous node on the SAME
     // branch. An unchanged capture records no new visual information and would

@@ -105,6 +105,10 @@ CONTAINER MODEL — "mode"/"value" LOCATE the change; the tracker FRAMES the bra
   screenshots/measures that immediate parent container — that parent is what DEFINES this
   component's branch. So choose "mode"/"value" such that the located element's direct parent
   is the meaningful frame for this component.
+- You only need to identify the single changed element. The tracker then climbs the ENTIRE
+  DOM ancestor chain above that parent (grandparent, great-grandparent, ... up to the page
+  root), capturing each enclosing container as its own branch automatically. So do NOT try to
+  enumerate or name the surrounding containers yourself — just locate the precise change.
 - A change that affects a container AS A WHOLE belongs to that container's own branch: locate
   a direct child of that container so the one-level climb lands on the container itself.
 - A NAMED component is ALWAYS a concrete on-screen area, so it MUST use mode selector/text/role

@@ -58,7 +58,7 @@ async function backfillRepo(repo: string): Promise<void> {
       return;
     }
 
-    const results = await takeScreenshots(jobs, CAPTURE_URL);
+    const { results } = await takeScreenshots(jobs, CAPTURE_URL);
 
     let updated = 0;
     graph.transaction(() => {

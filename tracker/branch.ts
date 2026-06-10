@@ -25,6 +25,22 @@ export function resolveBranch(component?: string): string {
 }
 
 /**
+ * Derives a stable branch id from a climbed DOM container's identity: its `id`
+ * (preferred) else its first class name. Returns null for anonymous containers
+ * (no id/class) — those can't get a stable, reusable branch id across commits,
+ * so the climb skips noding them but keeps climbing through them.
+ */
+export function deriveDomBranchId(identity: {
+  id?: string;
+  firstClass?: string;
+}): string | null {
+  const raw = identity.id?.trim() || identity.firstClass?.trim() || "";
+  if (!raw) return null;
+  const id = slug(raw);
+  return id || null;
+}
+
+/**
  * Resolves the parent branch a NEW branch nests under. Only honored when it
  * names a branch that actually exists; otherwise falls back to "main". This is
  * the deterministic backstop if the LLM picks a parent not in the tree.

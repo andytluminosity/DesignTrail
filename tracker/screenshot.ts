@@ -3,12 +3,14 @@ import fse from "fs-extra";
 import { chromium } from "playwright";
 import type { ElementHandle, Locator, Page } from "playwright";
 import type {
+  AncestorCapture,
   NodeGeometry,
   PageContext,
   ScreenshotResult,
   ScreenshotTarget,
   UiElement,
 } from "./types.js";
+import { deriveDomBranchId, MAIN_BRANCH } from "./branch.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
@@ -175,46 +177,70 @@ function resolveLocator(
 }
 
 /**
+ * Returns `el`'s immediate parent element handle, or null when the parent is the
+ * page root (body/html) or there is none. A page-sized rect would corrupt
+ * spatial nesting, so the root is treated as "no usable parent".
+ */
+async function parentElementHandle(
+  page: Page,
+  el: ElementHandle
+): Promise<ElementHandle | null> {
+  const handle = await page.evaluateHandle((node) => {
+    const parent = (node as Element).parentElement;
+    if (!parent) return null;
+    const tag = parent.tagName.toLowerCase();
+    if (tag === "body" || tag === "html") return null;
+    return parent;
+  }, el);
+  return handle.asElement() as ElementHandle | null;
+}
+
+/** Reads a climbed container's DOM identity (id + first class) for branch derivation. */
+async function readIdentity(
+  el: ElementHandle
+): Promise<{ id?: string; firstClass?: string }> {
+  return await el.evaluate((node) => {
+    const e = node as HTMLElement;
+    const id = e.id || undefined;
+    const firstClass =
+      typeof e.className === "string" && e.className.trim()
+        ? e.className.trim().split(/\s+/)[0]
+        : undefined;
+    return { id, firstClass };
+  });
+}
+
+/**
  * Resolves the element to screenshot. The LLM locates the changed element via
  * `mode`/`value`, then we climb exactly one DOM level to its immediate parent —
  * that parent container defines the branch and drives both the screenshot and
  * the measured geometry. Priority order:
  *  1. the located element's immediate parent (when it exists and isn't the
  *     page root);
- *  2. the located changed element (no usable parent);
- *  3. null (caller falls back to full page).
+ *  2. the located changed element (no usable parent).
+ * Returns null when the target can't be located at all.
  */
 async function captureLocator(
   page: Page,
   target: ScreenshotTarget
-): Promise<Locator | ElementHandle | null> {
+): Promise<ElementHandle | null> {
   const locateLoc = resolveLocator(page, target);
   if (!locateLoc) return null;
 
   const located = locateLoc.first();
   await located.waitFor({ state: "visible", timeout: 5000 });
 
+  const elementHandle = await located.elementHandle();
+  if (!elementHandle) return null;
+
   try {
-    const elementHandle = await located.elementHandle();
-    if (elementHandle) {
-      // Climb exactly one level to the immediate parent, but never to the page
-      // root (body/html) — a page-sized rect would corrupt spatial nesting, so
-      // fall back to the located element in that case.
-      const parentHandle = await page.evaluateHandle((el) => {
-        const parent = (el as Element).parentElement;
-        if (!parent) return null;
-        const tag = parent.tagName.toLowerCase();
-        if (tag === "body" || tag === "html") return null;
-        return parent;
-      }, elementHandle);
-      const parentElement = parentHandle.asElement();
-      if (parentElement) return parentElement;
-    }
+    const parentElement = await parentElementHandle(page, elementHandle);
+    if (parentElement) return parentElement;
   } catch {
     // Any climb failure falls back to the located element below.
   }
 
-  return located;
+  return elementHandle;
 }
 
 /** Full scrollable document dimensions of the currently loaded page. */
@@ -261,18 +287,78 @@ export type ScreenshotJob = {
 };
 
 /**
- * Captures a single job on an already-open page: navigates to its route, then
- * screenshots the located element, falling back to full page on any
- * failure. Returns the file written plus the located element's geometry. Throws
- * only if navigation itself fails (so the caller can decide).
+ * Climbs the live DOM ancestor chain above the already-captured container
+ * (`fromHandle`), capturing each ancestor up to body/html. Each ancestor's
+ * branch id is derived from its DOM identity (id, else first class); anonymous
+ * wrappers (no stable id) are skipped for capture but still climbed through, so
+ * the chain always reaches the page root. Once body/html is reached, a single
+ * full-page capture is taken and tagged for the `main` branch.
+ *
+ * Ancestor PNGs are written alongside the job's own output (same commit dir),
+ * named by derived branch id. `seenBranches` dedupes within the climb so a
+ * branch is captured at most once.
+ */
+async function climbAncestors(
+  page: Page,
+  fromHandle: ElementHandle,
+  outputDir: string,
+  navPath: string
+): Promise<AncestorCapture[]> {
+  const ancestors: AncestorCapture[] = [];
+  const seenBranches = new Set<string>();
+  let current: ElementHandle | null = fromHandle;
+
+  // Bound the climb defensively in case of an unexpected DOM cycle.
+  for (let depth = 0; depth < 64; depth++) {
+    const parent: ElementHandle | null = await parentElementHandle(page, current);
+    if (!parent) {
+      // Reached body/html: the topmost level is the whole page => main branch.
+      const mainPath = path.join(outputDir, `${MAIN_BRANCH}.png`);
+      await page.screenshot({ path: mainPath, fullPage: true });
+      ancestors.push({
+        branchId: MAIN_BRANCH,
+        outputPath: mainPath,
+        geometry: await fullPageGeometry(page),
+        navPath,
+      });
+      break;
+    }
+
+    const branchId = deriveDomBranchId(await readIdentity(parent));
+    if (branchId && !seenBranches.has(branchId)) {
+      seenBranches.add(branchId);
+      const ancestorPath = path.join(outputDir, `${branchId}.png`);
+      try {
+        await parent.screenshot({ path: ancestorPath });
+        const geometry = await readGeometry(parent, page);
+        ancestors.push({ branchId, outputPath: ancestorPath, geometry, navPath });
+        console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
+      } catch {
+        // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+      }
+    }
+
+    current = parent;
+  }
+
+  return ancestors;
+}
+
+/**
+ * Captures a single job on an already-open page: navigates to its route,
+ * screenshots the located element's immediate parent container (the job's own
+ * branch), then climbs the DOM ancestor chain capturing each container up to
+ * `main`. Falls back to a full page capture (with no ancestors) on any failure.
+ * Throws only if navigation itself fails (so the caller can decide).
  */
 async function captureOnePage(
   page: Page,
   job: ScreenshotJob,
   url: string
-): Promise<ScreenshotResult> {
+): Promise<{ self: ScreenshotResult; ancestors: AncestorCapture[] }> {
   const { outputPath, target, navPath = "/" } = job;
-  await fse.ensureDir(path.dirname(outputPath));
+  const outputDir = path.dirname(outputPath);
+  await fse.ensureDir(outputDir);
 
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
   await page.waitForTimeout(2000);
@@ -286,7 +372,8 @@ async function captureOnePage(
         // was chosen), so geometry == the captured container's rect.
         const geometry = await readGeometry(element, page);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
-        return { outputPath, geometry };
+        const ancestors = await climbAncestors(page, element, outputDir, navPath);
+        return { self: { outputPath, geometry }, ancestors };
       }
     } catch {
       console.warn(
@@ -302,21 +389,30 @@ async function captureOnePage(
   // spatial tree with a page-sized rect (which would mis-nest the branch).
   const geometry = target.mode === "full" ? await fullPageGeometry(page) : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
-  return { outputPath, geometry };
+  return { self: { outputPath, geometry }, ancestors: [] };
 }
 
 /**
  * Captures many targeted screenshots reusing a SINGLE browser/page (one launch
  * for N component captures). A failure on one job does not abort the rest.
- * Returns one result per successfully captured job (with geometry when known).
+ * Returns one `result` per successfully captured job, plus the deduped set of
+ * `ancestors` discovered by climbing the DOM container chain of each job (a
+ * given ancestor branch is captured once per run, first climb wins).
  */
 export async function takeScreenshots(
   jobs: ScreenshotJob[],
   url: string
-): Promise<ScreenshotResult[]> {
-  if (jobs.length === 0) return [];
+): Promise<{ results: ScreenshotResult[]; ancestors: AncestorCapture[] }> {
+  if (jobs.length === 0) return { results: [], ancestors: [] };
 
   const results: ScreenshotResult[] = [];
+  const ancestors: AncestorCapture[] = [];
+  // Seed with each job's OWN branch (its output filename is `<branchId>.png`) so
+  // a climbed ancestor that derives the same id never overwrites a level-0
+  // capture's PNG or double-nodes a branch the job already owns.
+  const seenAncestorBranches = new Set<string>(
+    jobs.map((job) => path.basename(job.outputPath, ".png"))
+  );
   let browser;
   try {
     browser = await chromium.launch();
@@ -324,7 +420,13 @@ export async function takeScreenshots(
 
     for (const job of jobs) {
       try {
-        results.push(await captureOnePage(page, job, url));
+        const { self, ancestors: jobAncestors } = await captureOnePage(page, job, url);
+        results.push(self);
+        for (const ancestor of jobAncestors) {
+          if (seenAncestorBranches.has(ancestor.branchId)) continue;
+          seenAncestorBranches.add(ancestor.branchId);
+          ancestors.push(ancestor);
+        }
       } catch (err) {
         console.warn(
           `Could not capture ${job.navPath ?? "/"} for ${job.outputPath}. Skipping this one.`
@@ -340,7 +442,7 @@ export async function takeScreenshots(
   } finally {
     await browser?.close();
   }
-  return results;
+  return { results, ancestors };
 }
 
 export async function takeScreenshot(
@@ -349,6 +451,6 @@ export async function takeScreenshot(
   url: string,
   navPath: string = "/"
 ): Promise<ScreenshotResult | undefined> {
-  const [result] = await takeScreenshots([{ outputPath, target, navPath }], url);
-  return result;
+  const { results } = await takeScreenshots([{ outputPath, target, navPath }], url);
+  return results[0];
 }
