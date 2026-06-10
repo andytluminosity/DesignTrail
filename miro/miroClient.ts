@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from "fs";
+import { readFile } from "fs/promises";
+import { createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { BranchRecord, CommitData, IterationNode } from "../tracker/types.js";
@@ -335,6 +337,15 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** SHA-256 hex of a file's bytes, or null if it can't be read. */
+async function hashFileBytes(absPath: string): Promise<string | null> {
+  try {
+    return createHash("sha256").update(await readFile(absPath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 function normalizeUrlBase(url: string): string {
   return url.replace(/\/+$/, "");
 }
@@ -665,6 +676,10 @@ type PreparedNode = {
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
+  // SHA-256 of the screenshot bytes, used to collapse byte-identical captures so
+  // each unique image renders exactly once. null when the file can't be hashed,
+  // in which case the node is treated as unique.
+  hash: string | null;
 };
 
 /**
@@ -708,7 +723,10 @@ export async function renderBoardFromGraph(
     PRECOMPUTE_CONCURRENCY,
     async (node) => {
       const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
-      const dims = await readPngDimensions(absPng);
+      const [dims, hash] = await Promise.all([
+        readPngDimensions(absPng),
+        hashFileBytes(absPng),
+      ]);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
       const annotation = (node.annotation ?? "").trim();
       const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
@@ -722,6 +740,7 @@ export async function renderBoardFromGraph(
         placements,
         footprint,
         url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
+        hash,
       };
     }
   );
@@ -731,10 +750,39 @@ export async function renderBoardFromGraph(
     return [];
   }
 
+  // Collapse byte-identical screenshots so each unique image renders exactly
+  // once. The first node (in chronological export order) holding a given image
+  // hash is the canonical survivor; every later duplicate maps to it. Nodes that
+  // can't be hashed are treated as unique. Only survivors are laid out and drawn;
+  // connectors re-point through `canonicalNodeId` so the tree stays connected
+  // through the surviving image instead of pointing at a dropped duplicate.
+  const canonicalNodeId = new Map<string, string>();
+  const survivorByHash = new Map<string, string>();
+  const preparedToDraw: PreparedNode[] = [];
+  for (const p of prepared) {
+    if (p.hash) {
+      const survivor = survivorByHash.get(p.hash);
+      if (survivor) {
+        canonicalNodeId.set(p.node.id, survivor);
+        continue;
+      }
+      survivorByHash.set(p.hash, p.node.id);
+    }
+    canonicalNodeId.set(p.node.id, p.node.id);
+    preparedToDraw.push(p);
+  }
+  const resolveCanonical = (nodeId: string): string =>
+    canonicalNodeId.get(nodeId) ?? nodeId;
+
+  const collapsed = prepared.length - preparedToDraw.length;
+  if (collapsed > 0) {
+    console.log(`Collapsed ${collapsed} duplicate screenshot(s) into ${preparedToDraw.length} unique image(s).`);
+  }
+
   // Wipe the whole board so the re-render starts from a clean slate.
   await clearBoard(accessToken, boardId);
 
-  const boxes: NodeBox[] = prepared.map((p) => ({
+  const boxes: NodeBox[] = preparedToDraw.map((p) => ({
     id: p.node.id,
     width: p.footprint.width,
     height: p.footprint.height,
@@ -749,7 +797,7 @@ export async function renderBoardFromGraph(
   // first (annotation connectors need the image id), then fires its header and
   // annotation notes together. The shared limiter caps total concurrency.
   await Promise.all(
-    prepared.map(async (p) => {
+    preparedToDraw.map(async (p) => {
       const box = layout.get(p.node.id);
       if (!box) return;
 
@@ -834,33 +882,40 @@ export async function renderBoardFromGraph(
   );
 
   // Tree connectors: chronological chain within each branch, then a fork edge
-  // from each branch's fork point to that branch's first screenshot. Built after
-  // all images exist, then drawn in parallel.
-  const renderedByBranch = groupNodesByBranch(
-    renderable.filter((node) => imageIdByNode.has(node.id))
-  );
+  // from each branch's fork point to that branch's first screenshot. Endpoints
+  // are resolved through the canonical map so an edge that referenced a collapsed
+  // duplicate now lands on its surviving image. Self-edges (both ends collapsed
+  // to the same image) and duplicate edges are dropped so each surviving image
+  // points to a given target at most once. Built after all images exist, then
+  // drawn in parallel.
+  const resolveImageId = (nodeId: string): string | undefined =>
+    imageIdByNode.get(resolveCanonical(nodeId));
 
+  const drawnConnectors = new Set<string>();
   const connectorWork: Promise<void>[] = [];
+  const queueConnector = (startNodeId: string, endNodeId: string): void => {
+    const startId = resolveImageId(startNodeId);
+    const endId = resolveImageId(endNodeId);
+    if (!startId || !endId || startId === endId) return;
+    const key = `${startId}->${endId}`;
+    if (drawnConnectors.has(key)) return;
+    drawnConnectors.add(key);
+    connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
+  };
 
-  for (const branchNodes of renderedByBranch.values()) {
+  const nodesByBranch = groupNodesByBranch(renderable);
+
+  for (const branchNodes of nodesByBranch.values()) {
     for (let i = 1; i < branchNodes.length; i += 1) {
-      const startId = imageIdByNode.get(branchNodes[i - 1].id);
-      const endId = imageIdByNode.get(branchNodes[i].id);
-      if (startId && endId) {
-        connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
-      }
+      queueConnector(branchNodes[i - 1].id, branchNodes[i].id);
     }
   }
 
   for (const branch of branches) {
     if (!branch.forkNodeId) continue;
-    const first = renderedByBranch.get(branch.id)?.[0];
+    const first = nodesByBranch.get(branch.id)?.[0];
     if (!first) continue;
-    const startId = imageIdByNode.get(branch.forkNodeId);
-    const endId = imageIdByNode.get(first.id);
-    if (startId && endId) {
-      connectorWork.push(safeConnector(accessToken, boardId, startId, endId));
-    }
+    queueConnector(branch.forkNodeId, first.id);
   }
 
   await Promise.all(connectorWork);
