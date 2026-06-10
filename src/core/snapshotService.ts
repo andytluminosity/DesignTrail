@@ -1,4 +1,5 @@
 import path from "path";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import fse from "fs-extra";
 import { getLatestCommit, getDiff, getRepoName } from "../../tracker/git.js";
@@ -134,6 +135,16 @@ function toPortablePath(value: string): string {
   return value.split(path.sep).join("/");
 }
 
+/** SHA-256 of a file's bytes, or null if it can't be read. */
+async function hashFile(absPath: string): Promise<string | null> {
+  try {
+    const buf = await fse.readFile(absPath);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 function selectMiroScreenshotPath(
   entries: DesignSnapshotEntry[],
   screenshots: ScreenshotResult[]
@@ -178,7 +189,7 @@ export async function createDesignSnapshot(
 
   const graph = await DesignGraph.load(repoName);
   const jobs: ScreenshotJob[] = [];
-  const entries: DesignSnapshotEntry[] = [];
+  let entries: DesignSnapshotEntry[] = [];
   const nodeByOutput = new Map<string, string>();
   let screenshots: ScreenshotResult[] = [];
 
@@ -322,6 +333,43 @@ export async function createDesignSnapshot(
     });
 
     screenshots = await takeScreenshots(jobs, CAPTURE_URL);
+
+    // Drop captures that are byte-identical to the previous node on the SAME
+    // branch. An unchanged capture records no new visual information and would
+    // otherwise litter the branch with duplicate PNGs under different names —
+    // most commonly a cascading `main` re-capture triggered by a change that is
+    // only visible on another route. Comparing against the parent node (the
+    // branch tip before this commit) keeps the per-branch history meaningful.
+    const removedOutputs = new Set<string>();
+    const removedNodeIds = new Set<string>();
+    for (const { outputPath } of screenshots) {
+      const nodeId = nodeByOutput.get(outputPath);
+      if (!nodeId) continue;
+      const node = graph.getNode(nodeId);
+      if (!node?.parentId) continue;
+      const parent = graph.getNode(node.parentId);
+      if (!parent) continue;
+
+      const [newHash, parentHash] = await Promise.all([
+        hashFile(outputPath),
+        hashFile(path.join(DESIGNTRAIL_ROOT, parent.screenshotPath)),
+      ]);
+      if (newHash && parentHash && newHash === parentHash) {
+        removedOutputs.add(outputPath);
+        removedNodeIds.add(nodeId);
+      }
+    }
+
+    if (removedNodeIds.size > 0) {
+      graph.transaction(() => {
+        for (const id of removedNodeIds) graph.deleteNode(id);
+      });
+      await Promise.all([...removedOutputs].map((p) => fse.remove(p)));
+      screenshots = screenshots.filter((s) => !removedOutputs.has(s.outputPath));
+      entries = entries.filter(
+        (e) => !removedNodeIds.has(`${commit.hash}:${e.branchId}`)
+      );
+    }
 
     // Persist each captured element's geometry onto its node so the spatial board
     // can nest/position branches by real on-screen containment.

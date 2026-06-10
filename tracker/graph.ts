@@ -309,6 +309,22 @@ export class DesignGraph {
       });
   }
 
+  getNode(id: string): IterationNode | null {
+    const row = this.db.prepare(`SELECT * FROM nodes WHERE id = ?`).get(id) as
+      | NodeRow
+      | undefined;
+    return row ? toIterationNode(row) : null;
+  }
+
+  /**
+   * Removes a node (e.g. a duplicate capture that recorded no visual change).
+   * The branch tip naturally falls back to the previous node, so the chain
+   * stays intact for subsequent commits.
+   */
+  deleteNode(id: string): void {
+    this.db.prepare(`DELETE FROM nodes WHERE id = ?`).run(id);
+  }
+
   /** Records the on-screen geometry of a node's located element. */
   setNodeGeometry(nodeId: string, geom: NodeGeometry): void {
     this.db
