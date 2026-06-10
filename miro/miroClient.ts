@@ -14,6 +14,11 @@ try {
 const TOKEN_FILE = path.join(DESIGNTRAIL_ROOT, ".miro-token.json");
 const TIMELINE_STATE_FILE = path.join(DESIGNTRAIL_ROOT, ".designtrail", "miro-timeline.json");
 const TIMELINE_SPACING = 200;
+// Horizontal gap between a single commit's screenshots, laid out left-to-right.
+const COLUMN_SPACING = 420;
+// Small downward nudge so a screenshot's label sits below its image instead of
+// fully covering it.
+const STICKY_NOTE_OFFSET_Y = 40;
 
 type MiroPosition = {
   x: number;
@@ -85,8 +90,15 @@ type MiroTimelineState = {
   edges: MiroTimelineEdge[];
 };
 
-type CreateCommitNodeOptions = {
+export type CommitScreenshot = {
   screenshotPath?: string;
+  branchId: string;
+  summary: string;
+  type?: string;
+};
+
+type CreateCommitNodeOptions = {
+  screenshots: CommitScreenshot[];
   publicBaseUrl?: string;
 };
 
@@ -345,83 +357,131 @@ export async function createConnector({
   );
 }
 
+/**
+ * Builds a single screenshot's sticky-note content: a per-component label
+ * (short hash + branch, type, summary). The commit's anchor note (the first
+ * screenshot, normally `main`) additionally carries the commit-level metadata
+ * (message, source, annotation) so that context appears exactly once per row.
+ */
+function buildStickyContent(
+  commit: CommitData,
+  shortHash: string,
+  screenshot: CommitScreenshot,
+  isAnchor: boolean
+): string {
+  const label = screenshot.branchId || "main";
+  const lines = [`${shortHash} · ${label}`];
+  if (screenshot.type) lines.push(screenshot.type);
+  if (screenshot.summary) lines.push(screenshot.summary);
+  if (isAnchor) {
+    lines.push(commit.message);
+    if (commit.source) lines.push(`source: ${commit.source}`);
+    if (commit.annotation) lines.push(commit.annotation);
+  }
+  return lines.join("\n");
+}
+
 export async function createCommitNode(
   commit: CommitData,
-  options: CreateCommitNodeOptions = {}
-): Promise<MiroTimelineNode | null> {
+  options: CreateCommitNodeOptions = { screenshots: [] }
+): Promise<MiroTimelineNode[]> {
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
 
   if (!accessToken) {
     console.error("No stored Miro access token found. Complete OAuth first; skipping Miro upload.");
-    return null;
+    return [];
   }
 
   if (!boardId) {
     console.error("MIRO_BOARD_ID is missing. Skipping Miro upload.");
-    return null;
+    return [];
   }
 
   const shortHash = commit.hash.slice(0, 7);
-  const screenshotUrl = getPublicScreenshotUrl(
-    commit,
-    options.screenshotPath,
-    options.publicBaseUrl
-  );
-  const metadataLines = [shortHash, commit.message];
-  if (commit.source) metadataLines.push(`source: ${commit.source}`);
-  if (commit.annotation) metadataLines.push(commit.annotation);
-  const metadataContent = metadataLines.join("\n");
+  // Fall back to a single commit-level capture so a commit always lands on the
+  // board even when no per-component screenshot succeeded.
+  const screenshots: CommitScreenshot[] =
+    options.screenshots.length > 0
+      ? options.screenshots
+      : [{ branchId: "", summary: "" }];
+
   const timelineState = loadTimelineState();
   const commitIndex = timelineState.commitIndex;
-  const position = getTimelinePosition(commitIndex);
+  const rowY = getTimelinePosition(commitIndex).y;
   const previousNode = timelineState.nodes.at(-1) ?? null;
 
-  try {
-    const image = await createMiroImage({
-      accessToken,
-      boardId,
-      url: screenshotUrl,
-      position,
-    });
-    const metadata = await createMiroStickyNote({
-      accessToken,
-      boardId,
-      content: metadataContent,
-      position,
-    });
+  let anchorNode: MiroTimelineNode | null = null;
 
-    console.log(`Miro commit metadata created: ${metadata.id}`);
+  for (let i = 0; i < screenshots.length; i += 1) {
+    const screenshot = screenshots[i];
+    const isAnchor = anchorNode === null;
+    const position: MiroPosition = { x: i * COLUMN_SPACING, y: rowY };
+    const screenshotUrl = getPublicScreenshotUrl(
+      commit,
+      screenshot.screenshotPath,
+      options.publicBaseUrl
+    );
 
-    const timelineNode: MiroTimelineNode = {
-      commitHash: commit.hash,
-      miroNodeId: metadata.id,
-      nodeType: "sticky_note",
-      commitIndex,
-      position,
-      previousNodeId: previousNode?.miroNodeId ?? null,
-      createdAt: new Date().toISOString(),
-    };
-
-    timelineState.nodes.push(timelineNode);
-
-    if (previousNode) {
-      timelineState.edges.push({
-        previousNodeId: previousNode.miroNodeId,
-        currentNodeId: metadata.id,
-        previousCommitHash: previousNode.commitHash,
-        currentCommitHash: commit.hash,
+    try {
+      await createMiroImage({
+        accessToken,
+        boardId,
+        url: screenshotUrl,
+        position,
       });
+      const note = await createMiroStickyNote({
+        accessToken,
+        boardId,
+        content: buildStickyContent(commit, shortHash, screenshot, isAnchor),
+        position: { x: position.x, y: position.y + STICKY_NOTE_OFFSET_Y },
+      });
+
+      console.log(
+        `Miro screenshot uploaded (${screenshot.branchId || "main"}): note ${note.id}`
+      );
+
+      // The first screenshot that lands becomes the commit's timeline anchor so
+      // commit-to-commit chaining stays one node per commit.
+      if (anchorNode === null) {
+        anchorNode = {
+          commitHash: commit.hash,
+          miroNodeId: note.id,
+          nodeType: "sticky_note",
+          commitIndex,
+          position,
+          previousNodeId: previousNode?.miroNodeId ?? null,
+          createdAt: new Date().toISOString(),
+        };
+      }
+    } catch (error: unknown) {
+      console.error(
+        `Failed to upload Miro screenshot (${screenshot.branchId || "main"}):`,
+        getErrorMessage(error)
+      );
     }
-
-    timelineState.commitIndex = commitIndex + 1;
-    saveTimelineState(timelineState);
-
-    console.log(`Miro timeline node stored at y=${position.y}`);
-
-    return timelineNode;
-  } catch (error: unknown) {
-    console.error("Failed to create Miro commit node:", getErrorMessage(error));
-    return null;
   }
+
+  if (!anchorNode) {
+    console.error("No Miro screenshots could be uploaded for this commit.");
+    return [];
+  }
+
+  timelineState.nodes.push(anchorNode);
+
+  if (previousNode) {
+    timelineState.edges.push({
+      previousNodeId: previousNode.miroNodeId,
+      currentNodeId: anchorNode.miroNodeId,
+      previousCommitHash: previousNode.commitHash,
+      currentCommitHash: commit.hash,
+    });
+  }
+
+  timelineState.commitIndex = commitIndex + 1;
+  saveTimelineState(timelineState);
+
+  console.log(`Miro timeline node stored at y=${rowY}`);
+
+  return [anchorNode];
 }

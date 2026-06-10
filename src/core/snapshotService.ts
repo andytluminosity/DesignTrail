@@ -11,6 +11,7 @@ import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
 import { createCommitNode } from "../../miro/miroClient.js";
+import type { CommitScreenshot } from "../../miro/miroClient.js";
 import type {
   CommitData,
   IterationNode,
@@ -40,7 +41,7 @@ export type DesignSnapshotResult = {
   repoPath: string;
   entries: DesignSnapshotEntry[];
   screenshots: ScreenshotResult[];
-  miroNode: Awaited<ReturnType<typeof createCommitNode>>;
+  miroNodes: Awaited<ReturnType<typeof createCommitNode>>;
 };
 
 /**
@@ -145,10 +146,10 @@ async function hashFile(absPath: string): Promise<string | null> {
   }
 }
 
-function selectMiroScreenshotPath(
+function selectMiroScreenshots(
   entries: DesignSnapshotEntry[],
   screenshots: ScreenshotResult[]
-): string | undefined {
+): CommitScreenshot[] {
   const successfulPaths = new Set(
     screenshots.map((screenshot) =>
       toPortablePath(path.relative(DESIGNTRAIL_ROOT, screenshot.outputPath))
@@ -158,10 +159,19 @@ function selectMiroScreenshotPath(
     successfulPaths.has(toPortablePath(entry.screenshotPath))
   );
 
-  return (
-    successfulEntries.find((entry) => entry.branchId === MAIN_BRANCH)?.screenshotPath ??
-    successfulEntries[0]?.screenshotPath
-  );
+  // main first (the anchor for the commit's timeline node), then the rest.
+  const ordered = [...successfulEntries].sort((a, b) => {
+    if (a.branchId === MAIN_BRANCH) return -1;
+    if (b.branchId === MAIN_BRANCH) return 1;
+    return 0;
+  });
+
+  return ordered.map((entry) => ({
+    screenshotPath: entry.screenshotPath,
+    branchId: entry.branchId,
+    summary: entry.summary,
+    type: entry.type,
+  }));
 }
 
 /**
@@ -399,11 +409,11 @@ export async function createDesignSnapshot(
     graph.close();
   }
 
-  const miroNode =
+  const miroNodes =
     options?.syncMiro === false
-      ? null
+      ? []
       : await createCommitNode(commit, {
-          screenshotPath: selectMiroScreenshotPath(entries, screenshots),
+          screenshots: selectMiroScreenshots(entries, screenshots),
         });
 
   return {
@@ -412,6 +422,6 @@ export async function createDesignSnapshot(
     repoPath,
     entries,
     screenshots,
-    miroNode,
+    miroNodes,
   };
 }
