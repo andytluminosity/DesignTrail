@@ -1,4 +1,6 @@
 import path from "path";
+import { createReadStream, createWriteStream } from "fs";
+import readline from "readline/promises";
 import {
   createDesignSnapshot,
   type DesignSnapshotEntry,
@@ -31,13 +33,51 @@ function logCommit(hash: string, repo: string, entries: LogEntry[]): void {
   console.log("========================");
 }
 
+async function promptForAnnotation(): Promise<string | undefined> {
+  let input: NodeJS.ReadableStream = process.stdin;
+  let output: NodeJS.WritableStream = process.stdout;
+  let ttyInput: ReturnType<typeof createReadStream> | undefined;
+  let ttyOutput: ReturnType<typeof createWriteStream> | undefined;
+
+  try {
+    ttyInput = createReadStream("/dev/tty");
+    ttyOutput = createWriteStream("/dev/tty");
+    input = ttyInput;
+    output = ttyOutput;
+  } catch {
+    if (!process.stdin.isTTY) {
+      console.warn("No interactive terminal available; continuing without annotation.");
+      return undefined;
+    }
+  }
+
+  const rl = readline.createInterface({ input, output });
+  try {
+    const answer = await rl.question(
+      "DesignTrail annotation for this commit (press Enter to skip): "
+    );
+    const trimmed = answer.trim();
+    return trimmed ? trimmed : undefined;
+  } finally {
+    rl.close();
+    ttyInput?.destroy();
+    ttyOutput?.destroy();
+  }
+}
+
 async function main(): Promise<void> {
   const repoPath = path.resolve(process.argv[2] ?? process.cwd());
-  const result = await createDesignSnapshot({ repoPath, source: "cli" });
+  const annotation = await promptForAnnotation();
+  const source = process.env.DESIGNTRAIL_SOURCE?.trim() || "cli";
+  const result = await createDesignSnapshot({ repoPath, source, annotation });
   logCommit(result.commit.hash, result.repoName, result.entries);
 }
 
-main().catch((err) => {
-  console.error("Capture failed:", err);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("Capture failed:", err);
+    process.exit(1);
+  });
