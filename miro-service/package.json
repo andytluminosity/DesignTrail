@@ -2,10 +2,11 @@
   "name": "miro-service",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "src/server.ts",
   "scripts": {
-    "start": "ts-node src/server.ts",
-    "dev": "ts-node src/server.ts",
+    "start": "tsx src/server.ts",
+    "dev": "tsx src/server.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -21,6 +22,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.2",
     "ts-node": "^10.9.2",
+    "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
 }

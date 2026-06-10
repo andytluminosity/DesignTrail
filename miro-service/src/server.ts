@@ -3,7 +3,11 @@ import axios from "axios";
 import dotenv from "dotenv";
 import { writeFileSync } from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+import { createDesignSnapshot } from "../../src/core/snapshotService.js";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const { MIRO_CLIENT_ID, MIRO_CLIENT_SECRET, MIRO_REDIRECT_URI } = process.env;
@@ -14,6 +18,23 @@ let miroAccessToken: string | null = null;
 
 const app = express();
 app.use(express.json());
+
+type SnapshotRequestBody = {
+  repoPath?: unknown;
+  annotation?: unknown;
+  source?: unknown;
+  syncMiro?: unknown;
+};
+
+function normalizeOptionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`${field} must be a string`);
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
 
 app.get("/login", (_req, res) => {
   const authorizeUrl =
@@ -58,6 +79,67 @@ app.get("/oauth/callback", async (req, res) => {
   } catch (error: any) {
     console.error("Miro token exchange failed:", error.response?.data ?? error.message);
     return res.status(500).send("OAuth failed");
+  }
+});
+
+app.post("/snapshot", async (req, res) => {
+  const { repoPath, annotation, source, syncMiro } = req.body as SnapshotRequestBody;
+
+  if (typeof repoPath !== "string" || repoPath.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "repoPath is required and must be a non-empty string",
+    });
+  }
+
+  if (syncMiro !== undefined && typeof syncMiro !== "boolean") {
+    return res.status(400).json({
+      success: false,
+      error: "syncMiro must be a boolean when provided",
+    });
+  }
+
+  let normalizedAnnotation: string | undefined;
+  let normalizedSource: string | undefined;
+  try {
+    normalizedAnnotation = normalizeOptionalString(annotation, "annotation");
+    normalizedSource = normalizeOptionalString(source, "source");
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const result = await createDesignSnapshot({
+      repoPath,
+      annotation: normalizedAnnotation,
+      source: normalizedSource ?? "claude",
+      syncMiro,
+    });
+
+    return res.json({
+      success: true,
+      commit: {
+        hash: result.commit.hash,
+        message: result.commit.message,
+        timestamp: result.commit.timestamp,
+        source: result.commit.source,
+        annotation: result.commit.annotation,
+      },
+      repoName: result.repoName,
+      repoPath: result.repoPath,
+      entries: result.entries,
+      screenshotCount: result.screenshots.length,
+      miroSynced: result.miroNode !== null,
+    });
+  } catch (error) {
+    console.error("Snapshot creation failed:", error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Snapshot creation failed",
+    });
   }
 });
 
