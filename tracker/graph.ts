@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS commits (
   hash      TEXT PRIMARY KEY,
   message   TEXT,
   diff      TEXT,
-  timestamp INTEGER NOT NULL
+  timestamp INTEGER NOT NULL,
+  source    TEXT,
+  annotation TEXT
 );
 
 CREATE TABLE IF NOT EXISTS branches (
@@ -161,6 +163,16 @@ export class DesignGraph {
    * SQLite has no "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info first.
    */
   private static migrate(db: Database.Database): void {
+    const commitCols = (db.prepare(`PRAGMA table_info(commits)`).all() as {
+      name: string;
+    }[]).map((c) => c.name);
+    if (!commitCols.includes("source")) {
+      db.exec(`ALTER TABLE commits ADD COLUMN source TEXT`);
+    }
+    if (!commitCols.includes("annotation")) {
+      db.exec(`ALTER TABLE commits ADD COLUMN annotation TEXT`);
+    }
+
     const branchCols = (db.prepare(`PRAGMA table_info(branches)`).all() as {
       name: string;
     }[]).map((c) => c.name);
@@ -184,14 +196,16 @@ export class DesignGraph {
   upsertCommit(commit: CommitData): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO commits (hash, message, diff, timestamp)
-         VALUES (@hash, @message, @diff, @timestamp)`
+        `INSERT OR IGNORE INTO commits (hash, message, diff, timestamp, source, annotation)
+         VALUES (@hash, @message, @diff, @timestamp, @source, @annotation)`
       )
       .run({
         hash: commit.hash,
         message: commit.message,
         diff: commit.diff,
         timestamp: commit.timestamp,
+        source: commit.source ?? null,
+        annotation: commit.annotation ?? null,
       });
   }
 

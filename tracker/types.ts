@@ -4,6 +4,8 @@ export type CommitData = {
   diff: string;
   timestamp: number;
   repoName?: string;
+  source?: string;
+  annotation?: string;
 };
 
 // On-screen geometry of a located element, in page (document) pixels. pageW/pageH

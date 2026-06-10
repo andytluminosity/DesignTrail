@@ -9,5 +9,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["tracker/**/*.ts"]
+  "include": ["tracker/**/*.ts", "src/**/*.ts", "miro/**/*.ts"]
 }

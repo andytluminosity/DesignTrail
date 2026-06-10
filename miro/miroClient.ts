@@ -325,7 +325,10 @@ export async function createCommitNode(commit: CommitData): Promise<MiroTimeline
   const shortHash = commit.hash.slice(0, 7);
   const repoCapturePath = commit.repoName ? `${commit.repoName}/` : "";
   const screenshotUrl = `http://localhost:3000/captures/${repoCapturePath}${commit.hash}.png`;
-  const metadataContent = `${shortHash}\n${commit.message}`;
+  const metadataLines = [shortHash, commit.message];
+  if (commit.source) metadataLines.push(`source: ${commit.source}`);
+  if (commit.annotation) metadataLines.push(commit.annotation);
+  const metadataContent = metadataLines.join("\n");
   const timelineState = loadTimelineState();
   const commitIndex = timelineState.commitIndex;
   const position = getTimelinePosition(commitIndex);
