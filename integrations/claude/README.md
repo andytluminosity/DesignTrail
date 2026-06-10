@@ -27,8 +27,20 @@ flowchart TD
 
 ## Contract
 
-The API contract for the future Claude command is documented in
+The API contract for the Claude command is documented in
 [`capture-design.md`](./capture-design.md).
+
+## Command
+
+The recommended Claude Code slash command is installed as a user command at
+`~/.claude/commands/capture-design.md`, so it can be run from any repository with
+`/user:capture-design`. It is intentionally thin: collect an annotation, resolve
+the current repository path, call `POST /snapshot`, and summarize the structured
+response.
+
+For local testing from `TempRepo`, the same command is also available as a
+project command at `TempRepo/.claude/commands/capture-design.md`; run it as
+`/project:capture-design` after restarting Claude Code in `TempRepo`.
 
 ## Implementation Notes
 
