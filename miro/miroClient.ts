@@ -1402,6 +1402,7 @@ export async function renderBoardFromGraph(
     nodes: mainNodes,
     prepared: mainPrepared,
     commitsByHash,
+    annotationsByNode,
     offsetX: full.maxRight + TREE_GAP,
     keyPrefix: "commit:",
     title: "Commit overview (one per commit)",
