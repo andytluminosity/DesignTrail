@@ -8,6 +8,7 @@
 // are returned separately for an auto-laid-out tray.
 
 import type { BranchRecord, IterationNode, NodeGeometry } from "./types.js";
+import { MAIN_BRANCH } from "./branch.js";
 
 export type FrameNode = {
   branch: BranchRecord;
@@ -24,14 +25,14 @@ export type Layout = {
   unpositioned: FrameNode[]; // branches with no usable geometry (tray)
 };
 
-const CONTAIN_EPS = 2; // px tolerance so sub-pixel rounding doesn't break containment
+export const CONTAIN_EPS = 2; // px tolerance so sub-pixel rounding doesn't break containment
 
-function area(g: NodeGeometry): number {
+export function area(g: NodeGeometry): number {
   return Math.max(0, g.w) * Math.max(0, g.h);
 }
 
 /** True when `outer` is strictly larger than and fully encloses `inner`. */
-function contains(outer: NodeGeometry, inner: NodeGeometry): boolean {
+export function contains(outer: NodeGeometry, inner: NodeGeometry): boolean {
   return (
     area(outer) > area(inner) &&
     inner.x >= outer.x - CONTAIN_EPS &&
@@ -67,7 +68,7 @@ function nodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]> {
  * Representative geometry per branch = the latest node on that branch that
  * actually has geometry. Branches with no measured node are omitted.
  */
-function geometryByBranch(
+export function geometryByBranch(
   branches: BranchRecord[],
   nodes: IterationNode[]
 ): Map<string, NodeGeometry> {
@@ -89,12 +90,20 @@ function geometryByBranch(
  * containment), or null when nothing contains it (it is a spatial root). Shared
  * by the spatial viz and by persistence so the stored branch tree matches the
  * board. Branches without geometry are omitted entirely.
+ *
+ * Containment is scoped by route: geometry is measured in per-route page pixels,
+ * so two branches captured on different `navPath`s never nest by overlapping
+ * rects (e.g. a `/dashboard` grid landing under a `/settings` panel). `main` is
+ * the universal page root and stays a valid container candidate for any route.
  */
 export function deriveContainmentParents(
   branches: BranchRecord[],
   nodes: IterationNode[]
 ): Map<string, string | null> {
   const geoms = geometryByBranch(branches, nodes);
+  const navPathByBranch = new Map(
+    branches.map((b) => [b.id, b.navPath ?? null] as const)
+  );
   const entries = [...geoms.entries()];
   const parents = new Map<string, string | null>();
 
@@ -103,6 +112,11 @@ export function deriveContainmentParents(
     let bestGeom: NodeGeometry | null = null;
     for (const [otherId, og] of entries) {
       if (otherId === id) continue;
+      // Only nest within the same route; `main` is the universal root candidate.
+      const sameRoute =
+        otherId === MAIN_BRANCH ||
+        navPathByBranch.get(otherId) === navPathByBranch.get(id);
+      if (!sameRoute) continue;
       if (!contains(og, g)) continue;
       if (!bestGeom || area(og) < area(bestGeom)) {
         bestId = otherId;

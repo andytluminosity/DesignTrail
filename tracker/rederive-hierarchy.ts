@@ -6,6 +6,7 @@ import { DesignGraph } from "./graph.js";
 import { takeScreenshots } from "./screenshot.js";
 import type { ScreenshotJob } from "./screenshot.js";
 import { MAIN_BRANCH } from "./branch.js";
+import { planBranchPromotion } from "./prune.js";
 import type { IterationNode } from "./types.js";
 
 // One-off repair for branch hierarchies derived before the DOM-containment
@@ -132,6 +133,52 @@ async function rederiveRepo(repo: string): Promise<void> {
     for (const [child, parent] of ancestry) {
       if (child === MAIN_BRANCH) continue;
       console.log(`  ${child} -> ${parent}`);
+    }
+
+    // Collapse transparent wrapper branches the geometry-gated climb no longer
+    // visits. A branch is a removable wrapper when every one of its nodes is the
+    // nested-change placeholder (not a real component) AND it appears in no new
+    // containment chain — i.e. a redundant full-page/overflow wrapper such as the
+    // #root / app-shell twins that the new climb skips. We delete their nodes so
+    // planBranchPromotion hoists any remaining children into their place, leaving
+    // exactly the tree a fresh capture would now produce. Real components are
+    // always protected, so a leaf that simply failed to re-capture this run is
+    // never dropped. Orphan PNGs on disk are left untouched here (re-render reads
+    // the DB); run `npm run render-miro -- <repo>` afterward to redraw the board.
+    const inChain = new Set<string>([MAIN_BRANCH]);
+    for (const [child, parent] of ancestry) {
+      inChain.add(child);
+      inChain.add(parent);
+    }
+    for (const job of jobs) inChain.add(job.jobId);
+
+    const removableWrappers = branches.filter(
+      (b) =>
+        b.id !== MAIN_BRANCH &&
+        !inChain.has(b.id) &&
+        !isRealComponent(grouped.get(b.id) ?? [])
+    );
+
+    if (removableWrappers.length > 0) {
+      graph.transaction(() => {
+        for (const wrapper of removableWrappers) {
+          for (const node of grouped.get(wrapper.id) ?? []) graph.deleteNode(node.id);
+        }
+        const { branches: prunedBranches, nodes: prunedNodes } = graph.exportGraph();
+        const promotion = planBranchPromotion(prunedBranches, prunedNodes);
+        for (const update of promotion.branchUpdates) {
+          graph.setBranchParent(update.id, update.parentBranchId);
+          graph.setBranchForkNode(update.id, update.forkNodeId);
+        }
+        for (const id of promotion.deletedBranchIds) graph.deleteBranch(id);
+      });
+      console.log(
+        `${repo}: collapsed ${removableWrappers.length} transparent wrapper branch(es): ` +
+          removableWrappers.map((b) => b.id).join(", ")
+      );
+      console.log(
+        `${repo}: run 'npm run render-miro -- ${repo}' to redraw the board from the cleaned tree.`
+      );
     }
   } finally {
     graph.close();

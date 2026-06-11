@@ -8,7 +8,7 @@ import type { ScreenshotJob } from "../../tracker/screenshot.js";
 import { analyzeCommit } from "../../tracker/llm.js";
 import { annotateScreenshots } from "../../tracker/annotate.js";
 import { DesignGraph } from "../../tracker/graph.js";
-import { deriveContainmentParents } from "../../tracker/layout.js";
+import { contains, deriveContainmentParents, geometryByBranch } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
 import { MAIN_BRANCH } from "../../tracker/branch.js";
@@ -741,7 +741,20 @@ export async function createDesignSnapshot(
     const derived = new Map<string, string | null>(
       deriveContainmentParents(branches, nodes)
     );
-    for (const [child, parent] of ancestry) derived.set(child, parent);
+    // The DOM climb is authoritative for nesting, but only apply an ancestry edge
+    // when geometry actually confirms the climbed parent encloses the child (or
+    // the parent is `main`, the universal root, or geometry is unknown so we
+    // can't disprove it). This guards against an overflow/clipped ancestor whose
+    // measured box is smaller than its child being forced in as the parent,
+    // keeping the invariant that a child is always a smaller, contained box.
+    const branchGeometry = geometryByBranch(branches, nodes);
+    for (const [child, parent] of ancestry) {
+      const childGeom = branchGeometry.get(child);
+      const parentGeom = branchGeometry.get(parent);
+      if (parent === MAIN_BRANCH || !childGeom || !parentGeom || contains(parentGeom, childGeom)) {
+        derived.set(child, parent);
+      }
+    }
 
     // Nodes export in chronological (rowid) order, so each branch's list is
     // oldest-first and the fork node can be picked by timestamp.

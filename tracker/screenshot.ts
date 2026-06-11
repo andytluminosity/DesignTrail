@@ -12,9 +12,16 @@ import type {
 } from "./types.js";
 import { MAIN_BRANCH } from "./branch.js";
 import { computeContainerIdentity, keyToBranchId } from "./domKey.js";
+import { area, contains } from "./layout.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
+
+// Minimum relative growth an identifiable ancestor must add over the last
+// captured level (and how close to the full page counts as "the whole page")
+// before it earns its own branch. Anything within this band of the level below
+// it, or of the page rect, is a transparent wrapper that `main` already covers.
+const WRAPPER_MARGIN = 0.04;
 
 /**
  * Extracts a compact map of real, visible elements on the currently loaded page
@@ -337,11 +344,16 @@ async function climbAncestors(
   fromHandle: ElementHandle,
   outputDir: string,
   navPath: string,
-  located: ElementHandle
+  located: ElementHandle,
+  selfGeometry?: NodeGeometry
 ): Promise<AncestorCapture[]> {
   const ancestors: AncestorCapture[] = [];
   const seenBranches = new Set<string>();
   let current: ElementHandle | null = fromHandle;
+  // Rect of the last level actually captured (starts at the job's own
+  // container), so each promoted ancestor must add a meaningfully larger,
+  // fully-containing box over it.
+  let lastRect: NodeGeometry | undefined = selfGeometry;
 
   try {
     // Highlight the changed element so it stands out in the wider ancestor shots.
@@ -375,22 +387,41 @@ async function climbAncestors(
       // wrapper div into a container.
       const branchId = identity.meaningful ? keyToBranchId(identity) : null;
       if (branchId && !seenBranches.has(branchId)) {
-        seenBranches.add(branchId);
-        const ancestorPath = path.join(outputDir, `${branchId}.png`);
-        try {
-          await parent.screenshot({ path: ancestorPath });
-          const geometry = await readGeometry(parent, page);
-          ancestors.push({
-            branchId,
-            outputPath: ancestorPath,
-            geometry,
-            navPath,
-            label: identity.label,
-            selector: identity.selector,
-          });
-          console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
-        } catch {
-          // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+        const geometry = await readGeometry(parent, page);
+        // Skip "transparent wrapper" ancestors: a meaningful container only earns
+        // its own branch when its rect is a meaningfully larger box that fully
+        // encloses the last captured level AND is not effectively the whole page
+        // (which the unconditional `main` capture below already represents). This
+        // drops near-identical full-page wrappers (e.g. #root / app-shell twins)
+        // and overflow ancestors whose clipped box is smaller than their content,
+        // so a child is never nested under a parent that doesn't truly contain a
+        // larger region of it. We still climb THROUGH such wrappers so the chain
+        // reaches the root. When geometry is unknown we can't judge, so we keep
+        // the ancestor (legacy behavior).
+        const isRedundantWrapper =
+          !!geometry &&
+          !!lastRect &&
+          (!contains(geometry, lastRect) ||
+            area(geometry) <= area(lastRect) * (1 + WRAPPER_MARGIN) ||
+            area(geometry) >= geometry.pageW * geometry.pageH * (1 - WRAPPER_MARGIN));
+        if (!isRedundantWrapper) {
+          seenBranches.add(branchId);
+          const ancestorPath = path.join(outputDir, `${branchId}.png`);
+          try {
+            await parent.screenshot({ path: ancestorPath });
+            ancestors.push({
+              branchId,
+              outputPath: ancestorPath,
+              geometry,
+              navPath,
+              label: identity.label,
+              selector: identity.selector,
+            });
+            if (geometry) lastRect = geometry;
+            console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
+          } catch {
+            // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+          }
         }
       }
 
@@ -448,7 +479,8 @@ async function captureOnePage(
           container,
           outputDir,
           navPath,
-          changedElement
+          changedElement,
+          geometry
         );
         const chain = [selfBranchId, ...ancestors.map((a) => a.branchId)];
         return {
