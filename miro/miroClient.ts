@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import type {
@@ -52,6 +52,8 @@ try {
 }
 
 const TOKEN_FILE = path.join(DESIGNTRAIL_ROOT, ".miro-token.json");
+const DESIGNTRAIL_DATA_DIR = path.join(DESIGNTRAIL_ROOT, ".designtrail");
+const MIRO_RENDER_STATE_FILE = path.join(DESIGNTRAIL_DATA_DIR, "miro-render-state.json");
 
 // Max in-flight Miro API calls. Miro rate-limits per user+app (HTTP 429), so
 // calls run in parallel but are globally capped at this concurrency. Kept modest
@@ -279,6 +281,21 @@ type MiroItemResponse = {
   [key: string]: unknown;
 };
 
+type MiroGroupResponse = {
+  id: string;
+  [key: string]: unknown;
+};
+
+type MiroRenderGroupState = {
+  boardId: string;
+  groupId: string;
+  createdAt: string;
+  itemCount: number;
+  connectorCount: number;
+  connectorsIncluded: boolean;
+  ungroupedConnectorIds?: string[];
+};
+
 // One screenshot node that was successfully placed on the board.
 export type RenderedBoardNode = {
   nodeId: string;
@@ -293,6 +310,33 @@ type RenderableAnnotationBlock = AnnotationBlock & {
   visual: AnnotationVisual;
   labelText: string;
 };
+
+class GeneratedMiroItems {
+  private readonly itemIds = new Set<string>();
+  private readonly connectorIds = new Set<string>();
+
+  addItem(item: MiroItemResponse | string | undefined): void {
+    const id = typeof item === "string" ? item : item?.id;
+    if (id) this.itemIds.add(id);
+  }
+
+  addConnector(connector: MiroItemResponse | string | undefined): void {
+    const id = typeof connector === "string" ? connector : connector?.id;
+    if (id) this.connectorIds.add(id);
+  }
+
+  getItems(): string[] {
+    return [...this.itemIds];
+  }
+
+  getConnectors(): string[] {
+    return [...this.connectorIds];
+  }
+
+  getAll(): string[] {
+    return [...this.itemIds, ...this.connectorIds];
+  }
+}
 
 function getStoredMiroAccessToken(): string | null {
   if (!existsSync(TOKEN_FILE)) {
@@ -316,6 +360,47 @@ function getMiroHeaders(accessToken: string): Record<string, string> {
     Authorization: `Bearer ${accessToken}`,
     "Content-Type": "application/json",
   };
+}
+
+function readMiroRenderGroupState(): MiroRenderGroupState | null {
+  if (!existsSync(MIRO_RENDER_STATE_FILE)) return null;
+
+  try {
+    const raw = JSON.parse(readFileSync(MIRO_RENDER_STATE_FILE, "utf8")) as Partial<
+      MiroRenderGroupState
+    >;
+    if (typeof raw.boardId !== "string" || typeof raw.groupId !== "string") {
+      return null;
+    }
+
+    return {
+      boardId: raw.boardId,
+      groupId: raw.groupId,
+      createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date(0).toISOString(),
+      itemCount: Number.isFinite(raw.itemCount) ? Number(raw.itemCount) : 0,
+      connectorCount: Number.isFinite(raw.connectorCount) ? Number(raw.connectorCount) : 0,
+      connectorsIncluded: raw.connectorsIncluded === true,
+      ungroupedConnectorIds: Array.isArray(raw.ungroupedConnectorIds)
+        ? raw.ungroupedConnectorIds.filter((id): id is string => typeof id === "string")
+        : undefined,
+    };
+  } catch (error) {
+    console.error("Could not read Miro render group state:", getErrorMessage(error));
+    return null;
+  }
+}
+
+function writeMiroRenderGroupState(state: MiroRenderGroupState): void {
+  mkdirSync(DESIGNTRAIL_DATA_DIR, { recursive: true });
+  writeFileSync(MIRO_RENDER_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function clearMiroRenderGroupState(): void {
+  try {
+    rmSync(MIRO_RENDER_STATE_FILE, { force: true });
+  } catch (error) {
+    console.error("Could not clear Miro render group state:", getErrorMessage(error));
+  }
 }
 
 function parseResponseBody(responseText: string): unknown {
@@ -348,6 +433,34 @@ async function postMiroItem(
   }
 
   return responseBody as MiroItemResponse;
+}
+
+async function createMiroGroup(
+  accessToken: string,
+  boardId: string,
+  itemIds: string[]
+): Promise<MiroGroupResponse> {
+  const response = await miroFetch(
+    `https://api.miro.com/v2/boards/${boardId}/groups`,
+    {
+      method: "POST",
+      headers: getMiroHeaders(accessToken),
+      body: JSON.stringify({ data: { items: itemIds } }),
+    }
+  );
+  const responseText = await response.text();
+  const responseBody = parseResponseBody(responseText);
+
+  if (!response.ok) {
+    throw new Error(`Miro API error ${response.status}: ${JSON.stringify(responseBody)}`);
+  }
+
+  const id = (responseBody as { id?: unknown })?.id;
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error(`Miro group response did not include an id: ${JSON.stringify(responseBody)}`);
+  }
+
+  return { ...(responseBody as Record<string, unknown>), id };
 }
 
 async function getMiroItem(
@@ -449,6 +562,27 @@ async function deleteBoardResource(
   }
 }
 
+async function deleteMiroGroupWithItems(
+  accessToken: string,
+  boardId: string,
+  groupId: string
+): Promise<"deleted" | "missing"> {
+  const url = new URL(
+    `https://api.miro.com/v2/boards/${boardId}/groups/${encodeURIComponent(groupId)}`
+  );
+  url.searchParams.set("delete_items", "true");
+
+  const response = await miroFetch(url.toString(), {
+    method: "DELETE",
+    headers: getMiroHeaders(accessToken),
+  });
+  if (response.ok || response.status === 204) return "deleted";
+  if (response.status === 404) return "missing";
+
+  const body = parseResponseBody(await response.text());
+  throw new Error(`Miro API error ${response.status}: ${JSON.stringify(body)}`);
+}
+
 /**
  * Wipes the entire board: deletes all connectors first, then every item.
  * Individual failures are logged but never abort the wipe, so a stale element
@@ -484,6 +618,124 @@ export async function clearBoard(accessToken: string, boardId: string): Promise<
         console.error(`Failed to delete ${url}:`, getErrorMessage(error));
       }
     })
+  );
+}
+
+async function deleteTrackedConnectors(
+  accessToken: string,
+  boardId: string,
+  connectorIds: string[]
+): Promise<void> {
+  if (connectorIds.length === 0) return;
+
+  const base = `https://api.miro.com/v2/boards/${boardId}`;
+  await Promise.all(
+    connectorIds.map(async (id) => {
+      try {
+        await deleteBoardResource(accessToken, `${base}/connectors/${encodeURIComponent(id)}`);
+      } catch (error) {
+        console.error(`Failed to delete tracked Miro connector ${id}:`, getErrorMessage(error));
+      }
+    })
+  );
+}
+
+async function clearPreviousDesignTrailRender(
+  accessToken: string,
+  boardId: string
+): Promise<void> {
+  const state = readMiroRenderGroupState();
+  if (!state || state.boardId !== boardId) {
+    if (state) clearMiroRenderGroupState();
+    await clearBoard(accessToken, boardId);
+    return;
+  }
+
+  try {
+    const result = await deleteMiroGroupWithItems(accessToken, boardId, state.groupId);
+    clearMiroRenderGroupState();
+
+    if (result === "missing") {
+      console.warn(
+        `Saved Miro render group ${state.groupId} was not found; falling back to full board clear.`
+      );
+      await clearBoard(accessToken, boardId);
+      return;
+    }
+
+    await deleteTrackedConnectors(accessToken, boardId, state.ungroupedConnectorIds ?? []);
+    console.log(
+      `Deleted previous DesignTrail Miro group ${state.groupId} ` +
+        `(${state.itemCount} item(s), ${state.connectorCount} connector(s)).`
+    );
+  } catch (error) {
+    console.error(
+      `Failed to delete saved Miro render group ${state.groupId}; falling back to full board clear:`,
+      getErrorMessage(error)
+    );
+    clearMiroRenderGroupState();
+    await clearBoard(accessToken, boardId);
+  }
+}
+
+async function persistDesignTrailRenderGroup(
+  accessToken: string,
+  boardId: string,
+  generatedItems: GeneratedMiroItems
+): Promise<void> {
+  const itemIds = generatedItems.getItems();
+  const connectorIds = generatedItems.getConnectors();
+  if (itemIds.length < 2) {
+    clearMiroRenderGroupState();
+    console.warn("Miro render created fewer than two groupable items; skipping group state.");
+    return;
+  }
+
+  let group: MiroGroupResponse;
+  let connectorsIncluded = true;
+  try {
+    group = await createMiroGroup(accessToken, boardId, generatedItems.getAll());
+  } catch (error) {
+    if (connectorIds.length === 0) {
+      clearMiroRenderGroupState();
+      console.error("Failed to create Miro render group:", getErrorMessage(error));
+      return;
+    }
+
+    console.warn(
+      "Failed to include connectors in Miro render group; retrying with board items only:",
+      getErrorMessage(error)
+    );
+    try {
+      group = await createMiroGroup(accessToken, boardId, itemIds);
+      connectorsIncluded = false;
+    } catch (retryError) {
+      clearMiroRenderGroupState();
+      console.error("Failed to create Miro render group:", getErrorMessage(retryError));
+      return;
+    }
+  }
+
+  writeMiroRenderGroupState({
+    boardId,
+    groupId: group.id,
+    createdAt: new Date().toISOString(),
+    itemCount: itemIds.length,
+    connectorCount: connectorIds.length,
+    connectorsIncluded,
+    ungroupedConnectorIds:
+      !connectorsIncluded && connectorIds.length > 0 ? connectorIds : undefined,
+  });
+  console.log(
+    `Saved DesignTrail Miro group ${group.id} for next render cleanup ` +
+      `(${itemIds.length} item(s), ${connectorIds.length} connector(s), ` +
+      `connectors ${
+        connectorIds.length === 0
+          ? "not present"
+          : connectorsIncluded
+            ? "included"
+            : "tracked separately"
+      }).`
   );
 }
 
@@ -754,6 +1006,7 @@ function buildStickyContent(params: {
 async function uploadAnnotationMarks(params: {
   accessToken: string;
   boardId: string;
+  generatedItems: GeneratedMiroItems;
   imageItemId: string;
   imageCenter: MiroPosition;
   imageH: number;
@@ -792,13 +1045,15 @@ async function uploadAnnotationMarks(params: {
                 width: STICKY_W,
                 color: params.color,
               });
-        await createConnector({
+        params.generatedItems.addItem(mark);
+        const connector = await createConnector({
           accessToken: params.accessToken,
           boardId: params.boardId,
           startItemId: mark.id,
           endItemId: params.imageItemId,
           endPosition: item.anchor,
         });
+        params.generatedItems.addConnector(connector);
       } catch (error: unknown) {
         console.error("Failed to place annotation mark:", getErrorMessage(error));
       }
@@ -809,6 +1064,7 @@ async function uploadAnnotationMarks(params: {
 async function uploadManualAnnotationNote(params: {
   accessToken: string;
   boardId: string;
+  generatedItems: GeneratedMiroItems;
   imageItemId: string;
   imageCenter: MiroPosition;
   imageH: number;
@@ -840,6 +1096,7 @@ async function uploadManualAnnotationNote(params: {
         item.position.x
       )}, ${Math.round(item.position.y)}).`
     );
+    params.generatedItems.addItem(note);
   } catch (error: unknown) {
     console.error(
       `Failed to create manual annotation note for ${params.nodeId}:`,
@@ -849,13 +1106,14 @@ async function uploadManualAnnotationNote(params: {
   }
 
   try {
-    await createConnector({
+    const connector = await createConnector({
       accessToken: params.accessToken,
       boardId: params.boardId,
       startItemId: note.id,
       endItemId: params.imageItemId,
       endPosition: item.anchor,
     });
+    params.generatedItems.addConnector(connector);
     console.log(`Manual annotation connector created for ${params.nodeId}: ${note.id}.`);
   } catch (error: unknown) {
     console.error(
@@ -878,12 +1136,14 @@ function groupNodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]
 async function safeConnector(
   accessToken: string,
   boardId: string,
+  generatedItems: GeneratedMiroItems,
   startItemId: string,
   endItemId: string,
   style?: MiroConnectorStyle
 ): Promise<void> {
   try {
-    await createConnector({ accessToken, boardId, startItemId, endItemId, style });
+    const connector = await createConnector({ accessToken, boardId, startItemId, endItemId, style });
+    generatedItems.addConnector(connector);
   } catch (error) {
     console.error("Failed to draw tree connector:", getErrorMessage(error));
   }
@@ -918,6 +1178,7 @@ type DrawTreeArgs = {
   prepared: PreparedNode[];
   commitsByHash: Map<string, CommitData>;
   annotationsByNode: Map<string, AnnotationRecord[]>;
+  generatedItems: GeneratedMiroItems;
   // Board-units this tree is shifted to the right, so two trees sit side by side.
   offsetX: number;
   // Namespaces image-item lookups so the SAME node id can be drawn in both trees
@@ -947,6 +1208,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
     prepared,
     commitsByHash,
     annotationsByNode,
+    generatedItems,
     offsetX,
     keyPrefix,
     title,
@@ -989,33 +1251,39 @@ async function drawTree(args: DrawTreeArgs): Promise<{
     Math.min(minY, title ? titleY - STICKY_H / 2 : minY) - TREE_FRAME_PADDING;
   const frameBottom = bottomEdge + TREE_FRAME_PADDING;
 
-  await createMiroShape({
-    accessToken,
-    boardId,
-    shape: "rectangle",
-    position: {
-      x: (frameLeft + frameRight) / 2,
-      y: (frameTop + frameBottom) / 2,
-    },
-    width: frameRight - frameLeft,
-    height: frameBottom - frameTop,
-    fillColor: "#f2f2f2",
-    borderColor: "#808080",
-    borderWidth: "2",
-  }).catch((error: unknown) =>
-    console.error("Failed to place tree frame:", getErrorMessage(error))
-  );
-
-  if (title) {
-    await createMiroStickyNote({
+  try {
+    const frame = await createMiroShape({
       accessToken,
       boardId,
-      content: title,
-      position: { x: offsetX + (minX + rightEdge) / 2, y: titleY },
-      width: IMAGE_W,
-    }).catch((error: unknown) =>
-      console.error("Failed to place tree title note:", getErrorMessage(error))
-    );
+      shape: "rectangle",
+      position: {
+        x: (frameLeft + frameRight) / 2,
+        y: (frameTop + frameBottom) / 2,
+      },
+      width: frameRight - frameLeft,
+      height: frameBottom - frameTop,
+      fillColor: "#f2f2f2",
+      borderColor: "#808080",
+      borderWidth: "2",
+    });
+    generatedItems.addItem(frame);
+  } catch (error: unknown) {
+    console.error("Failed to place tree frame:", getErrorMessage(error));
+  }
+
+  if (title) {
+    try {
+      const titleNote = await createMiroStickyNote({
+        accessToken,
+        boardId,
+        content: title,
+        position: { x: offsetX + (minX + rightEdge) / 2, y: titleY },
+        width: IMAGE_W,
+      });
+      generatedItems.addItem(titleNote);
+    } catch (error: unknown) {
+      console.error("Failed to place tree title note:", getErrorMessage(error));
+    }
   }
 
   // Insert phase: draw every screenshot in parallel. Each node creates its image
@@ -1041,6 +1309,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
           width: IMAGE_W,
         });
         imageItemId = imageItem.id;
+        generatedItems.addItem(imageItem);
         imageIdByNode.set(keyPrefix + p.node.id, imageItem.id);
         rendered.push({ nodeId: p.node.id, miroImageId: imageItem.id });
       } catch (error: unknown) {
@@ -1070,9 +1339,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
             y: top - NOTE_MARGIN - STICKY_H / 2,
           },
           width: STICKY_W,
-        }).catch((error: unknown) =>
-          console.error("Failed to place header note:", getErrorMessage(error))
-        ),
+        })
+          .then((note) => generatedItems.addItem(note))
+          .catch((error: unknown) =>
+            console.error("Failed to place header note:", getErrorMessage(error))
+          ),
       ];
 
       if (p.manualAnnotation) {
@@ -1080,6 +1351,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
           uploadManualAnnotationNote({
             accessToken,
             boardId,
+            generatedItems,
             imageItemId,
             imageCenter,
             imageH: p.imageH,
@@ -1097,6 +1369,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
           uploadAnnotationMarks({
             accessToken,
             boardId,
+            generatedItems,
             imageItemId,
             imageCenter,
             imageH: p.imageH,
@@ -1117,9 +1390,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
             },
             width: STICKY_W,
             color: p.aiAnnotationColor,
-          }).catch((error: unknown) =>
-            console.error("Failed to place annotation note:", getErrorMessage(error))
-          )
+          })
+            .then((note) => generatedItems.addItem(note))
+            .catch((error: unknown) =>
+              console.error("Failed to place annotation note:", getErrorMessage(error))
+            )
         );
       }
 
@@ -1148,7 +1423,9 @@ async function drawTree(args: DrawTreeArgs): Promise<{
     const key = `${startId}->${endId}`;
     if (drawnConnectors.has(key)) return;
     drawnConnectors.add(key);
-    connectorWork.push(safeConnector(accessToken, boardId, startId, endId, style));
+    connectorWork.push(
+      safeConnector(accessToken, boardId, generatedItems, startId, endId, style)
+    );
   };
 
   // Chronology runs between consecutive DRAWN nodes of each branch. Prepared
@@ -1173,14 +1450,15 @@ async function drawTree(args: DrawTreeArgs): Promise<{
 }
 
 /**
- * Wipes the board and re-renders the ENTIRE design-evolution graph as TWO spatial
- * component trees side by side: a significance-pruned tree first (where screenshots
- * that are only a minor change from their parent have been hidden), then the
- * full-history tree to its right. Children re-anchor upward in the pruned tree and
- * leaves are preserved. Each node draws its screenshot, header note, and
- * per-element annotation notes; tree connectors show per-branch chronology and
- * branch forks. Positions come from planTreeLayout so each tree is non-overlapping.
- * Called fresh on every render so the board always reflects the full, current graph.
+ * Clears the previous DesignTrail-generated group and re-renders the ENTIRE
+ * design-evolution graph as TWO spatial component trees side by side: a
+ * significance-pruned tree first (where screenshots that are only a minor change
+ * from their parent have been hidden), then the full-history tree to its right.
+ * Children re-anchor upward in the pruned tree and leaves are preserved. Each
+ * node draws its screenshot, header note, and per-element annotation notes; tree
+ * connectors show per-branch chronology and branch forks. Positions come from
+ * planTreeLayout so each tree is non-overlapping. Called fresh on every render so
+ * the board always reflects the full, current graph.
  */
 export async function renderBoardFromGraph(
   branches: BranchRecord[],
@@ -1285,8 +1563,8 @@ export async function renderBoardFromGraph(
     return [];
   }
 
-  // Wipe the whole board so the re-render starts from a clean slate.
-  await clearBoard(accessToken, boardId);
+  await clearPreviousDesignTrailRender(accessToken, boardId);
+  const generatedItems = new GeneratedMiroItems();
 
   // Tree 1: the significance-pruned view. Compute the prune plan (one vision call
   // per hierarchy level band), apply it to IN-MEMORY graph copies (the DB is
@@ -1308,6 +1586,7 @@ export async function renderBoardFromGraph(
     prepared: prunedPrepared,
     commitsByHash,
     annotationsByNode,
+    generatedItems,
     offsetX: 0,
     keyPrefix: "pruned:",
     title: "Significant changes only",
@@ -1323,6 +1602,7 @@ export async function renderBoardFromGraph(
     prepared,
     commitsByHash,
     annotationsByNode,
+    generatedItems,
     offsetX: pruned.maxRight + TREE_GAP,
     keyPrefix: "",
     title: "Full history",
@@ -1333,6 +1613,7 @@ export async function renderBoardFromGraph(
     `Miro board re-rendered: significant-changes (${pruned.rendered.length}) and ` +
       `full history (${full.rendered.length}) trees.`
   );
+  await persistDesignTrailRenderGroup(accessToken, boardId, generatedItems);
 
   return rendered;
 }
