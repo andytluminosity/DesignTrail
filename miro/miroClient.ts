@@ -957,6 +957,12 @@ type DrawTreeArgs = {
   title?: string;
 };
 
+// Upload the screenshot to Miro by streaming the local PNG bytes directly. This
+// is preferred over handing Miro a public URL to fetch because Miro's backend
+// fetcher can't always validate the TLS chain of tunneled dev hosts (e.g.
+// newer Let's Encrypt roots on *.ngrok-free.dev), and because it avoids a wasted
+// failed round-trip per image. The public URL is only used as a fallback when
+// the file isn't on disk.
 async function createScreenshotImage(params: {
   accessToken: string;
   boardId: string;
@@ -965,20 +971,9 @@ async function createScreenshotImage(params: {
   position: MiroPosition;
   width: number;
 }): Promise<MiroItemResponse> {
-  try {
-    return await createMiroImage({
-      accessToken: params.accessToken,
-      boardId: params.boardId,
-      url: params.url,
-      position: params.position,
-      width: params.width,
-    });
-  } catch (urlError: unknown) {
-    const filePath = path.join(DESIGNTRAIL_ROOT, params.screenshotPath);
-    console.warn(
-      `Miro URL image upload failed for ${params.screenshotPath}; retrying local file upload:`,
-      getErrorMessage(urlError)
-    );
+  const filePath = path.join(DESIGNTRAIL_ROOT, params.screenshotPath);
+
+  if (existsSync(filePath)) {
     return await createMiroImageFromFile({
       accessToken: params.accessToken,
       boardId: params.boardId,
@@ -987,6 +982,17 @@ async function createScreenshotImage(params: {
       width: params.width,
     });
   }
+
+  console.warn(
+    `Local screenshot missing for ${params.screenshotPath}; falling back to URL upload from ${params.url}.`
+  );
+  return await createMiroImage({
+    accessToken: params.accessToken,
+    boardId: params.boardId,
+    url: params.url,
+    position: params.position,
+    width: params.width,
+  });
 }
 
 /**
