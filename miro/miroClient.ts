@@ -677,6 +677,63 @@ async function uploadAnnotationNotes(params: {
   );
 }
 
+async function uploadManualAnnotationNote(params: {
+  accessToken: string;
+  boardId: string;
+  imageItemId: string;
+  imageCenter: MiroPosition;
+  imageH: number;
+  nodeId: string;
+  content: string;
+}): Promise<void> {
+  const layout = computeStickyLayout(params.imageCenter, IMAGE_W, params.imageH, [
+    { index: 1, x: 1, y: 0.5 },
+  ]);
+  const item = layout[0];
+  if (!item) {
+    console.error(`Manual annotation note skipped for ${params.nodeId}: no layout slot.`);
+    return;
+  }
+
+  let note: MiroItemResponse;
+  try {
+    note = await createMiroStickyNote({
+      accessToken: params.accessToken,
+      boardId: params.boardId,
+      content: params.content,
+      position: item.position,
+      width: STICKY_W,
+    });
+    console.log(
+      `Manual annotation note created for ${params.nodeId}: ${note.id} at (${Math.round(
+        item.position.x
+      )}, ${Math.round(item.position.y)}).`
+    );
+  } catch (error: unknown) {
+    console.error(
+      `Failed to create manual annotation note for ${params.nodeId}:`,
+      getErrorMessage(error)
+    );
+    return;
+  }
+
+  try {
+    await createConnector({
+      accessToken: params.accessToken,
+      boardId: params.boardId,
+      startItemId: note.id,
+      endItemId: params.imageItemId,
+      endPosition: item.anchor,
+    });
+    console.log(`Manual annotation connector created for ${params.nodeId}: ${note.id}.`);
+  } catch (error: unknown) {
+    console.error(
+      `Manual annotation note ${note.id} was created, but connector failed for ${params.nodeId}:`,
+      getErrorMessage(error)
+    );
+  }
+}
+
 function groupNodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]> {
   const map = new Map<string, IterationNode[]>();
   for (const node of nodes) {
@@ -712,7 +769,6 @@ type PreparedNode = {
   imageH: number;
   blocks: AnnotationBlock[];
   manualAnnotation: string;
-  manualBlocks: AnnotationBlock[];
   manualPlacements: AnnotationPlacement[];
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
@@ -787,9 +843,6 @@ export async function renderBoardFromGraph(
       const aiAnnotation = manualAnnotation
         ? ""
         : getAnnotationContent(nodeAnnotations, "ai", node.annotation);
-      const manualBlocks: AnnotationBlock[] = manualAnnotation
-        ? [{ index: 1, label: manualAnnotation, text: manualAnnotation }]
-        : [];
       const manualPlacements: AnnotationPlacement[] = manualAnnotation
         ? [{ index: 1, x: 1, y: 0.5 }]
         : [];
@@ -806,7 +859,6 @@ export async function renderBoardFromGraph(
         imageH,
         blocks,
         manualAnnotation,
-        manualBlocks,
         manualPlacements,
         placements,
         footprint,
@@ -955,14 +1007,14 @@ export async function renderBoardFromGraph(
 
       if (p.manualAnnotation) {
         noteWork.push(
-          uploadAnnotationNotes({
+          uploadManualAnnotationNote({
             accessToken,
             boardId,
             imageItemId,
             imageCenter,
             imageH: p.imageH,
-            blocks: p.manualBlocks,
-            placements: p.manualPlacements,
+            nodeId: p.node.id,
+            content: p.manualAnnotation,
           })
         );
       }
