@@ -21,6 +21,7 @@ export type AnnotationVisual = "text" | "sticky";
 export type AnnotationVisualChoice = {
   index: number;
   visual: AnnotationVisual;
+  labelText?: string;
 };
 
 // Normalized location of an annotation's target element on the screenshot,
@@ -146,7 +147,7 @@ Each annotation describes something about a UI screenshot. Decide whether each a
 - "sticky": a review/comment note. Use this for opinions, rationale, concerns, questions, recommendations, tradeoffs, TODOs, or anything that reads like feedback from a reviewer.
 
 Return STRICT JSON in exactly this shape, with one entry per annotation index given to you:
-{ "annotations": [ { "index": <number>, "visual": "text" | "sticky" } ] }
+{ "annotations": [ { "index": <number>, "visual": "text" | "sticky", "labelText": "<short label when visual is text>" } ] }
 
 Rules:
 - Output ONLY the JSON object. No prose, no markdown.
@@ -154,6 +155,9 @@ Rules:
 - Use only "text" or "sticky" for visual.
 - Prefer "text" for concise element labels and factual change descriptions.
 - Prefer "sticky" for longer explanations, subjective judgments, risks, open questions, or action items.
+- When visual is "text", write labelText as a label, not a sentence or paragraph: 2-5 words, under 40 characters, no trailing period.
+- labelText should name the changed element/state directly, e.g. "CTA moved up", "New filter pill", or "Denser card spacing".
+- When visual is "sticky", omit labelText or leave it empty.
 - If unsure, choose "sticky" because ambiguous review content should remain comment-like.`;
 
 function clamp01(value: number): number {
@@ -163,6 +167,16 @@ function clamp01(value: number): number {
 
 function isAnnotationVisual(value: unknown): value is AnnotationVisual {
   return value === "text" || value === "sticky";
+}
+
+function normalizeLabelText(value: unknown, fallback: string): string {
+  const raw =
+    typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback.trim();
+  const firstLine = raw.split("\n")[0]?.trim() ?? "";
+  const withoutTrailingPunctuation = firstLine.replace(/[.!?]+$/g, "");
+  const words = withoutTrailingPunctuation.split(/\s+/).filter(Boolean).slice(0, 5);
+  const shortened = words.join(" ");
+  return shortened.length > 40 ? `${shortened.slice(0, 37).trimEnd()}...` : shortened;
 }
 
 /**
@@ -200,21 +214,36 @@ export async function classifyAnnotationVisuals(
     if (!content) return null;
 
     const parsed = JSON.parse(content) as {
-      annotations?: Array<{ index?: unknown; visual?: unknown }>;
+      annotations?: Array<{ index?: unknown; visual?: unknown; labelText?: unknown }>;
     };
     if (!Array.isArray(parsed.annotations)) return null;
 
-    const visualByIndex = new Map<number, AnnotationVisual>();
+    const choiceByIndex = new Map<number, AnnotationVisualChoice>();
     for (const raw of parsed.annotations) {
       const index = Number(raw.index);
       if (!Number.isFinite(index) || !isAnnotationVisual(raw.visual)) continue;
-      visualByIndex.set(index, raw.visual);
+      choiceByIndex.set(index, {
+        index,
+        visual: raw.visual,
+        labelText:
+          raw.visual === "text"
+            ? normalizeLabelText(raw.labelText, "")
+            : undefined,
+      });
     }
 
-    return blocks.map((block) => ({
-      index: block.index,
-      visual: visualByIndex.get(block.index) ?? "sticky",
-    }));
+    return blocks.map((block) => {
+      const choice = choiceByIndex.get(block.index);
+      const visual = choice?.visual ?? "sticky";
+      return {
+        index: block.index,
+        visual,
+        labelText:
+          visual === "text"
+            ? normalizeLabelText(choice?.labelText, block.label)
+            : undefined,
+      };
+    });
   } catch {
     return null;
   }

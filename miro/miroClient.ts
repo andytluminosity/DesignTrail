@@ -292,6 +292,7 @@ type RenderBoardOptions = {
 
 type RenderableAnnotationBlock = AnnotationBlock & {
   visual: AnnotationVisual;
+  labelText: string;
 };
 
 function getStoredMiroAccessToken(): string | null {
@@ -780,7 +781,7 @@ async function uploadAnnotationMarks(params: {
             ? await createMiroText({
                 accessToken: params.accessToken,
                 boardId: params.boardId,
-                content: block.text,
+                content: block.labelText,
                 position: item.position,
                 width: STICKY_W,
               })
@@ -1244,13 +1245,17 @@ export async function renderBoardFromGraph(
       const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
       const visualChoices =
         blocks.length > 0 ? await classifyAnnotationVisuals(blocks) : null;
-      const visualByIndex = new Map(
-        (visualChoices ?? []).map((choice) => [choice.index, choice.visual] as const)
+      const visualChoiceByIndex = new Map(
+        (visualChoices ?? []).map((choice) => [choice.index, choice] as const)
       );
-      const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => ({
-        ...block,
-        visual: visualByIndex.get(block.index) ?? "sticky",
-      }));
+      const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => {
+        const visualChoice = visualChoiceByIndex.get(block.index);
+        return {
+          ...block,
+          visual: visualChoice?.visual ?? "sticky",
+          labelText: visualChoice?.labelText || block.label,
+        };
+      });
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
       const footprint = computeClusterFootprint(imageH, [
