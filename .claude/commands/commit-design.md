@@ -15,12 +15,12 @@ Create a Git commit and let DesignTrail capture the resulting design snapshot.
 
 ## Workflow
 
-1. Before any other questions, call `AskUserQuestions` with one single-select question:
+1. Before any other questions, call `AskUserQuestions` with one single-select question so the user can choose with the up/down arrows:
 
 - prompt: `Should DesignTrail render the Miro board for this commit?`
 - options:
+  - `Yes, render Miro`
   - `No, store locally only`
-  - `Yes, render Miro after capture`
 
 2. Inspect the working tree and staged changes before committing:
 
@@ -43,7 +43,7 @@ DESIGNTRAIL_SYNC_MIRO=false \
 git commit -m "<commit message>"
 ```
 
-5. If the user chose `Yes, render Miro after capture`, run `git commit` with DesignTrail Miro rendering enabled and allow the post-commit hook to ask for per-screenshot annotation choices during the capture:
+5. If the user chose `Yes, render Miro`, run `git commit` with DesignTrail Miro rendering enabled and allow the post-commit hook to ask for per-screenshot annotation choices during the capture:
 
 ```bash
 DESIGNTRAIL_SOURCE=claude \

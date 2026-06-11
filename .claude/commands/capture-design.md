@@ -15,12 +15,12 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 ## Workflow
 
-1. Before any other questions, call `AskUserQuestions` with one single-select question:
+1. Before any other questions, call `AskUserQuestions` with one single-select question so the user can choose with the up/down arrows:
 
    - prompt: `Should DesignTrail render the Miro board for this snapshot?`
    - options:
+     - `Yes, render Miro`
      - `No, store locally only`
-     - `Yes, render Miro after capture`
 
 2. Resolve the absolute path of the current repository. Use the current working directory unless the user provides a different repo path.
 
@@ -37,7 +37,7 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
   }'
 ```
 
-4. If the user chose `Yes, render Miro after capture`, capture the latest commit with the default AI annotation mode and render Miro once:
+4. If the user chose `Yes, render Miro`, capture the latest commit with the default AI annotation mode and render Miro once:
 
 ```bash
 curl -sS -X POST "http://localhost:3002/snapshot" \
