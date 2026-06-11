@@ -8,10 +8,10 @@ import type { ScreenshotJob } from "../../tracker/screenshot.js";
 import { analyzeCommit } from "../../tracker/llm.js";
 import { annotateScreenshots } from "../../tracker/annotate.js";
 import { DesignGraph } from "../../tracker/graph.js";
-import { deriveContainmentParents } from "../../tracker/layout.js";
+import { contains, deriveContainmentParents, geometryByBranch } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
-import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
+import { MAIN_BRANCH } from "../../tracker/branch.js";
 import { renderBoardFromGraph, type RenderedBoardNode } from "../../miro/miroClient.js";
 import type {
   AnnotationChoice,
@@ -86,17 +86,6 @@ function fallbackTarget(branchId: string): ScreenshotTarget {
   return { mode: "selector", value: `[class~="${branchId}"]` };
 }
 
-/**
- * A named component IS a container, so it must be screenshotted as that
- * container, never the whole page. main keeps its legitimate full-page capture.
- */
-function containerTarget(branchId: string, target: ScreenshotTarget): ScreenshotTarget {
-  if (branchId !== MAIN_BRANCH && target.mode === "full") {
-    return fallbackTarget(branchId);
-  }
-  return target;
-}
-
 // Resolve DesignTrail root so the workflow works no matter which repo invokes it.
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -114,6 +103,16 @@ async function pruneEmptyDirs(dir: string): Promise<void> {
       if (remaining.length === 0) await fse.remove(child);
     }
   }
+}
+
+/**
+ * The clean (unboxed) sidecar for a full-page `main` capture. The DOM climb
+ * writes `main.png` (with the change-highlight box) and a `main-original.png`
+ * copy without it; the sidecar must follow `main.png` whenever it moves or is
+ * removed so the commit-overview tree can still find it by name convention.
+ */
+function originalSidecarPath(pngPath: string): string {
+  return pngPath.replace(/\.png$/i, "-original.png");
 }
 
 /**
@@ -137,6 +136,11 @@ async function materializeFolderTree(
     const to = path.join(DESIGNTRAIL_ROOT, move.desiredPath);
     if (move.currentPath && (await fse.pathExists(from))) {
       await fse.move(from, to, { overwrite: true });
+      // Keep the clean main sidecar adjacent to its boxed counterpart.
+      const sidecarFrom = originalSidecarPath(from);
+      if (await fse.pathExists(sidecarFrom)) {
+        await fse.move(sidecarFrom, originalSidecarPath(to), { overwrite: true });
+      }
     }
     applied.push({ nodeId: move.nodeId, desiredPath: move.desiredPath });
   }
@@ -473,88 +477,99 @@ export async function createDesignSnapshot(
       existingBranches: graph.getBranches(),
     });
 
-    // Persist the commit, branches, and component nodes atomically. Screenshots
-    // (async IO) happen afterwards, outside the transaction.
+    // Build one capture job per detected change. Container identity (which
+    // screenshots group together) is now derived from the LIVE DOM at capture
+    // time — a stable, instance-unique container key — NOT from the LLM. So we
+    // do NOT create component branches/nodes here; that happens after capture,
+    // keyed by the real DOM container. `main` is ensured up front so cascading
+    // updates can always reach the root.
+    type JobSpec = {
+      summary: string;
+      type: IterationNode["type"];
+      navPath: string;
+      target: ScreenshotTarget;
+    };
+    const jobSpecById = new Map<string, JobSpec>();
+
     graph.transaction(() => {
       graph.upsertCommit(commit);
-
-      // Ensure the root exists so cascading updates can always reach it; it is
-      // captured full-page.
       graph.ensureBranch(MAIN_BRANCH, null, null, "/", { mode: "full" });
+    });
 
-      const addNodeAndJob = (
-        branchId: string,
-        summary: string,
-        type: IterationNode["type"],
-        target: ScreenshotTarget,
-        navPath: string
-      ): { parentId: string | null; screenshotPath: string } => {
+    components.forEach((change, index) => {
+      const navPath = change.path ?? "/";
+      const isFull = change.screenshotTarget.mode === "full";
+      const jobId = `c${index}`;
+      // A full/global change has no isolable container, so it lands on `main` and
+      // keeps the conventional main.png name (so the clean-sidecar logic applies).
+      // A located change writes to a neutral path; its real branch (folder) is
+      // assigned after the DOM key is known, and the folder mirror renames it.
+      const fileName = isFull ? `${MAIN_BRANCH}.png` : `__${jobId}.png`;
+      const screenshotPath = path.join("captures", repoName, commit.hash, fileName);
+      const outputPath = path.join(DESIGNTRAIL_ROOT, screenshotPath);
+      jobSpecById.set(jobId, {
+        summary: change.summary,
+        type: change.type,
+        navPath,
+        target: change.screenshotTarget,
+      });
+      jobs.push({ jobId, outputPath, target: change.screenshotTarget, navPath });
+    });
+
+    const { results, ancestors, ancestry } = await takeScreenshots(jobs, CAPTURE_URL);
+    screenshots = results;
+
+    // Create/reuse each captured component's branch from its DOM container key.
+    // Grouping is deterministic and DOM-driven: two sibling cards that share a
+    // class get distinct keys (so distinct branches), and the SAME container
+    // reuses its branch across commits because the key is deterministic.
+    graph.transaction(() => {
+      for (const result of results) {
+        const spec = result.jobId ? jobSpecById.get(result.jobId) : undefined;
+        if (!spec) continue;
+        const branchId = result.branchId ?? MAIN_BRANCH;
+        const navPath = result.navPath ?? spec.navPath;
+
+        if (branchId !== MAIN_BRANCH) {
+          if (!graph.branchExists(branchId)) {
+            // Provisional parent = main; real nesting is fixed below from the DOM
+            // containment chain.
+            const forkNodeId = graph.getBranchTip(MAIN_BRANCH);
+            graph.ensureBranch(branchId, MAIN_BRANCH, forkNodeId, navPath, spec.target);
+          } else {
+            graph.setBranchCapture(branchId, navPath, spec.target);
+          }
+        }
+
         const parentId = graph.getBranchTip(branchId);
-        const screenshotPath = path.join(
-          "captures",
-          repoName,
-          commit.hash,
-          `${branchId}.png`
-        );
+        const nodeId = `${commit.hash}:${branchId}`;
+        const screenshotPath = path.relative(DESIGNTRAIL_ROOT, result.outputPath);
 
         graph.addNode({
-          id: `${commit.hash}:${branchId}`,
+          id: nodeId,
           commitHash: commit.hash,
           branchId,
           parentId,
-          summary,
-          type,
+          summary: spec.summary,
+          type: spec.type,
           screenshotPath,
           timestamp: commit.timestamp,
         });
 
-        const outputPath = path.join(DESIGNTRAIL_ROOT, screenshotPath);
-        nodeByOutput.set(outputPath, `${commit.hash}:${branchId}`);
-        jobs.push({ outputPath, target, navPath });
-
-        return { parentId, screenshotPath };
-      };
-
-      for (const change of components) {
-        const branchId = resolveBranch(change.component);
-        const navPath = change.path ?? "/";
-        const target = containerTarget(branchId, change.screenshotTarget);
-
-        if (!graph.branchExists(branchId)) {
-          const parentBranchId =
-            branchId === MAIN_BRANCH
-              ? null
-              : resolveParentBranch(change.parentBranch, graph.getBranchNames());
-          const forkNodeId = parentBranchId ? graph.getBranchTip(parentBranchId) : null;
-          graph.ensureBranch(branchId, parentBranchId, forkNodeId, navPath, target);
-        } else {
-          graph.setBranchCapture(branchId, navPath, target);
-        }
-
-        const { parentId, screenshotPath } = addNodeAndJob(
-          branchId,
-          change.summary,
-          change.type,
-          target,
-          navPath
-        );
-
+        nodeByOutput.set(result.outputPath, nodeId);
         const branchRecord = graph.getBranch(branchId);
         entries.push({
-          nodeId: `${commit.hash}:${branchId}`,
+          nodeId,
           branchId,
           parentBranchId: branchRecord?.parentBranchId ?? null,
           parentId,
-          type: change.type,
-          summary: change.summary,
+          type: spec.type,
+          summary: spec.summary,
           annotation: null,
           screenshotPath,
         });
       }
     });
-
-    const { results, ancestors, ancestry } = await takeScreenshots(jobs, CAPTURE_URL);
-    screenshots = results;
 
     // Climb-the-DOM ancestor capture: takeScreenshots walked the live container
     // chain above each located component up to the page root, capturing every
@@ -567,9 +582,13 @@ export async function createDesignSnapshot(
         const { branchId, outputPath, navPath } = ancestor;
 
         if (branchId !== MAIN_BRANCH && !graph.branchExists(branchId)) {
-          // Provisional parent = main; real nesting is fixed below from geometry.
+          // Provisional parent = main; real nesting is fixed below from the DOM
+          // containment chain. Re-capture target = the container's own (valid
+          // CSS) selector from the DOM-key walk, falling back to a class guess.
           const forkNodeId = graph.getBranchTip(MAIN_BRANCH);
-          const target = fallbackTarget(branchId);
+          const target: ScreenshotTarget = ancestor.selector
+            ? { mode: "selector", value: ancestor.selector }
+            : fallbackTarget(branchId);
           graph.ensureBranch(branchId, MAIN_BRANCH, forkNodeId, navPath, target);
         }
 
@@ -671,7 +690,11 @@ export async function createDesignSnapshot(
               (nodeById.has(id)
                 ? path.join(DESIGNTRAIL_ROOT, nodeById.get(id)!.screenshotPath)
                 : undefined);
-            if (abs) await fse.remove(abs);
+            if (abs) {
+              await fse.remove(abs);
+              // Drop the clean main sidecar too, so no orphan is left behind.
+              await fse.remove(originalSidecarPath(abs));
+            }
           })
         );
 
@@ -722,7 +745,20 @@ export async function createDesignSnapshot(
     const derived = new Map<string, string | null>(
       deriveContainmentParents(branches, nodes)
     );
-    for (const [child, parent] of ancestry) derived.set(child, parent);
+    // The DOM climb is authoritative for nesting, but only apply an ancestry edge
+    // when geometry actually confirms the climbed parent encloses the child (or
+    // the parent is `main`, the universal root, or geometry is unknown so we
+    // can't disprove it). This guards against an overflow/clipped ancestor whose
+    // measured box is smaller than its child being forced in as the parent,
+    // keeping the invariant that a child is always a smaller, contained box.
+    const branchGeometry = geometryByBranch(branches, nodes);
+    for (const [child, parent] of ancestry) {
+      const childGeom = branchGeometry.get(child);
+      const parentGeom = branchGeometry.get(parent);
+      if (parent === MAIN_BRANCH || !childGeom || !parentGeom || contains(parentGeom, childGeom)) {
+        derived.set(child, parent);
+      }
+    }
 
     // Nodes export in chronological (rowid) order, so each branch's list is
     // oldest-first and the fork node can be picked by timestamp.

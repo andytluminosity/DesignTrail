@@ -10,10 +10,18 @@ import type {
   ScreenshotTarget,
   UiElement,
 } from "./types.js";
-import { deriveDomBranchId, MAIN_BRANCH } from "./branch.js";
+import { MAIN_BRANCH } from "./branch.js";
+import { computeContainerIdentity, keyToBranchId } from "./domKey.js";
+import { area, contains } from "./layout.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
+
+// Minimum relative growth an identifiable ancestor must add over the last
+// captured level (and how close to the full page counts as "the whole page")
+// before it earns its own branch. Anything within this band of the level below
+// it, or of the page rect, is a transparent wrapper that `main` already covers.
+const WRAPPER_MARGIN = 0.04;
 
 /**
  * Extracts a compact map of real, visible elements on the currently loaded page
@@ -21,6 +29,9 @@ const MAX_ROUTES = 10;
  * guessing class names from the diff).
  */
 async function extractElements(page: Page, limit: number): Promise<UiElement[]> {
+  // Keep this browser callback free of named inner functions. tsx/esbuild can
+  // inject a `__name` helper for inner functions, but Playwright's evaluate
+  // world does not define it.
   return await page.evaluate((max) => {
     const out: Array<{
       tag: string;
@@ -32,29 +43,6 @@ async function extractElements(page: Page, limit: number): Promise<UiElement[]> 
       parent?: string;
     }> = [];
     const seen = new Set<string>();
-
-    // Best-effort selector for an element from its id or first class.
-    const selectorFor = (el: Element): string | undefined => {
-      const htmlEl = el as HTMLElement;
-      if (htmlEl.id) return `#${htmlEl.id}`;
-      const cls =
-        typeof htmlEl.className === "string" && htmlEl.className.trim()
-          ? htmlEl.className.trim().split(/\s+/)
-          : [];
-      if (cls.length) return `.${cls[0]}`;
-      return undefined;
-    };
-
-    // Nearest ancestor that has a stable id/class we can target.
-    const nearestIdentifiableAncestor = (el: Element): string | undefined => {
-      let parent = el.parentElement;
-      while (parent && parent !== document.body) {
-        const sel = selectorFor(parent);
-        if (sel) return sel;
-        parent = parent.parentElement;
-      }
-      return undefined;
-    };
 
     const all = Array.from(document.body.querySelectorAll("*"));
     for (const el of all) {
@@ -80,7 +68,25 @@ async function extractElements(page: Page, limit: number): Promise<UiElement[]> 
       // Skip elements with no useful identifier at all.
       if (!id && classes.length === 0 && !role && !testid && !text) continue;
 
-      const parent = nearestIdentifiableAncestor(htmlEl);
+      // Nearest ancestor that has a stable id/class we can target.
+      let parent: string | undefined;
+      let parentEl = htmlEl.parentElement;
+      while (parentEl && parentEl !== document.body) {
+        const parentHtml = parentEl as HTMLElement;
+        if (parentHtml.id) {
+          parent = `#${parentHtml.id}`;
+          break;
+        }
+        const parentClasses =
+          typeof parentHtml.className === "string" && parentHtml.className.trim()
+            ? parentHtml.className.trim().split(/\s+/)
+            : [];
+        if (parentClasses.length) {
+          parent = `.${parentClasses[0]}`;
+          break;
+        }
+        parentEl = parentEl.parentElement;
+      }
 
       // Include text in the key so structurally identical but distinct
       // components (e.g. repeated cards) are not collapsed into one entry.
@@ -102,11 +108,14 @@ async function extractElements(page: Page, limit: number): Promise<UiElement[]> 
 async function discoverRoutes(page: Page, url: string): Promise<string[]> {
   const origin = new URL(url).origin;
   const landing = new URL(url).pathname || "/";
-  const hrefs = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("a[href]")).map(
-      (a) => (a as HTMLAnchorElement).href
-    )
-  );
+  const hrefs = await page.evaluate(() => {
+    const out: string[] = [];
+    const anchors = document.querySelectorAll("a[href]");
+    for (const a of Array.from(anchors)) {
+      out.push((a as HTMLAnchorElement).href);
+    }
+    return out;
+  });
 
   const routes = new Set<string>([landing]);
   for (const href of hrefs) {
@@ -195,19 +204,41 @@ async function parentElementHandle(
   return handle.asElement() as ElementHandle | null;
 }
 
-/** Reads a climbed container's DOM identity (id + first class) for branch derivation. */
-async function readIdentity(
-  el: ElementHandle
-): Promise<{ id?: string; firstClass?: string }> {
-  return await el.evaluate((node) => {
-    const e = node as HTMLElement;
-    const id = e.id || undefined;
-    const firstClass =
-      typeof e.className === "string" && e.className.trim()
-        ? e.className.trim().split(/\s+/)[0]
-        : undefined;
-    return { id, firstClass };
-  });
+const CHANGE_HIGHLIGHT_ID = "__designtrail_change_box__";
+
+/**
+ * Injects a dotted red box over the originally changed (LLM-located) element so
+ * it's visible in the wider ancestor screenshots captured during the DOM climb.
+ * The box is an absolutely-positioned overlay appended to `document.body` and
+ * placed in document coordinates (rect + scroll), so it stays correctly aligned
+ * even as Playwright scrolls elements into view for each capture, and it never
+ * gets clipped by an ancestor's `overflow: hidden`.
+ */
+async function addChangeHighlight(page: Page, located: ElementHandle): Promise<void> {
+  await located.evaluate((node, boxId) => {
+    const existing = document.getElementById(boxId);
+    if (existing) existing.remove();
+    const rect = (node as Element).getBoundingClientRect();
+    const box = document.createElement("div");
+    box.id = boxId;
+    box.style.position = "absolute";
+    box.style.left = `${rect.left + window.scrollX}px`;
+    box.style.top = `${rect.top + window.scrollY}px`;
+    box.style.width = `${rect.width}px`;
+    box.style.height = `${rect.height}px`;
+    box.style.border = "3px dashed red";
+    box.style.boxSizing = "border-box";
+    box.style.pointerEvents = "none";
+    box.style.zIndex = "2147483647";
+    document.body.appendChild(box);
+  }, CHANGE_HIGHLIGHT_ID);
+}
+
+/** Removes the change-highlight overlay if present (no-op otherwise). */
+async function removeChangeHighlight(page: Page): Promise<void> {
+  await page.evaluate((boxId) => {
+    document.getElementById(boxId)?.remove();
+  }, CHANGE_HIGHLIGHT_ID);
 }
 
 /**
@@ -223,7 +254,7 @@ async function readIdentity(
 async function captureLocator(
   page: Page,
   target: ScreenshotTarget
-): Promise<ElementHandle | null> {
+): Promise<{ container: ElementHandle; located: ElementHandle } | null> {
   const locateLoc = resolveLocator(page, target);
   if (!locateLoc) return null;
 
@@ -235,12 +266,12 @@ async function captureLocator(
 
   try {
     const parentElement = await parentElementHandle(page, elementHandle);
-    if (parentElement) return parentElement;
+    if (parentElement) return { container: parentElement, located: elementHandle };
   } catch {
     // Any climb failure falls back to the located element below.
   }
 
-  return elementHandle;
+  return { container: elementHandle, located: elementHandle };
 }
 
 /** Full scrollable document dimensions of the currently loaded page. */
@@ -281,6 +312,9 @@ async function fullPageGeometry(page: Page): Promise<NodeGeometry> {
 }
 
 export type ScreenshotJob = {
+  // Opaque id echoed back on the result so the caller can join a capture to the
+  // source change (its summary/type/target), regardless of the DOM-derived branch.
+  jobId: string;
   outputPath: string;
   target: ScreenshotTarget;
   navPath?: string;
@@ -289,56 +323,113 @@ export type ScreenshotJob = {
 /**
  * Climbs the live DOM ancestor chain above the already-captured container
  * (`fromHandle`), capturing each ancestor up to body/html. Each ancestor's
- * branch id is derived from its DOM identity (id, else first class); anonymous
- * wrappers (no stable id) are skipped for capture but still climbed through, so
- * the chain always reaches the page root. Once body/html is reached, a single
- * full-page capture is taken and tagged for the `main` branch.
+ * branch id is derived from its stable, instance-unique DOM identity (a
+ * shortest anchored DOM path), so siblings sharing a class never collide.
+ * Anonymous wrappers (no id/class/role/name) are skipped for capture but still
+ * climbed through, so the chain always reaches the page root. Once body/html is
+ * reached, a single full-page capture is taken and tagged for the `main` branch.
  *
  * Ancestor PNGs are written alongside the job's own output (same commit dir),
  * named by derived branch id. `seenBranches` dedupes within the climb so a
  * branch is captured at most once.
+ *
+ * A dotted red box is drawn around the originally changed element (`located`)
+ * for every ancestor capture, so it's clear at higher hierarchy levels what
+ * changed. The full-page `main` capture is saved twice: a boxed `main.png` (used
+ * by the full + compressed trees) and a clean `main-original.png` sidecar (used
+ * by the per-commit overview tree, which keeps the unboxed photo).
  */
 async function climbAncestors(
   page: Page,
   fromHandle: ElementHandle,
   outputDir: string,
-  navPath: string
+  navPath: string,
+  located: ElementHandle,
+  selfGeometry?: NodeGeometry
 ): Promise<AncestorCapture[]> {
   const ancestors: AncestorCapture[] = [];
   const seenBranches = new Set<string>();
   let current: ElementHandle | null = fromHandle;
+  // Rect of the last level actually captured (starts at the job's own
+  // container), so each promoted ancestor must add a meaningfully larger,
+  // fully-containing box over it.
+  let lastRect: NodeGeometry | undefined = selfGeometry;
 
-  // Bound the climb defensively in case of an unexpected DOM cycle.
-  for (let depth = 0; depth < 64; depth++) {
-    const parent: ElementHandle | null = await parentElementHandle(page, current);
-    if (!parent) {
-      // Reached body/html: the topmost level is the whole page => main branch.
-      const mainPath = path.join(outputDir, `${MAIN_BRANCH}.png`);
-      await page.screenshot({ path: mainPath, fullPage: true });
-      ancestors.push({
-        branchId: MAIN_BRANCH,
-        outputPath: mainPath,
-        geometry: await fullPageGeometry(page),
-        navPath,
-      });
-      break;
-    }
+  try {
+    // Highlight the changed element so it stands out in the wider ancestor shots.
+    await addChangeHighlight(page, located);
 
-    const branchId = deriveDomBranchId(await readIdentity(parent));
-    if (branchId && !seenBranches.has(branchId)) {
-      seenBranches.add(branchId);
-      const ancestorPath = path.join(outputDir, `${branchId}.png`);
-      try {
-        await parent.screenshot({ path: ancestorPath });
-        const geometry = await readGeometry(parent, page);
-        ancestors.push({ branchId, outputPath: ancestorPath, geometry, navPath });
-        console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
-      } catch {
-        // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+    // Bound the climb defensively in case of an unexpected DOM cycle.
+    for (let depth = 0; depth < 64; depth++) {
+      const parent: ElementHandle | null = await parentElementHandle(page, current);
+      if (!parent) {
+        // Reached body/html: the topmost level is the whole page => main branch.
+        // Capture the boxed full page first (full + compressed trees), then drop
+        // the box and capture a clean sidecar for the per-commit overview tree.
+        const mainPath = path.join(outputDir, `${MAIN_BRANCH}.png`);
+        await page.screenshot({ path: mainPath, fullPage: true });
+        await removeChangeHighlight(page);
+        const mainOriginalPath = path.join(outputDir, `${MAIN_BRANCH}-original.png`);
+        await page.screenshot({ path: mainOriginalPath, fullPage: true });
+        ancestors.push({
+          branchId: MAIN_BRANCH,
+          outputPath: mainPath,
+          geometry: await fullPageGeometry(page),
+          navPath,
+        });
+        break;
       }
-    }
 
-    current = parent;
+      const identity = await computeContainerIdentity(parent, navPath);
+      // Only meaningful, identifiable containers become their own branch; pure
+      // anonymous wrappers are climbed THROUGH (so the chain reaches the root)
+      // but never noded, otherwise the structural fallback would turn every
+      // wrapper div into a container.
+      const branchId = identity.meaningful ? keyToBranchId(identity) : null;
+      if (branchId && !seenBranches.has(branchId)) {
+        const geometry = await readGeometry(parent, page);
+        // Skip "transparent wrapper" ancestors: a meaningful container only earns
+        // its own branch when its rect is a meaningfully larger box that fully
+        // encloses the last captured level AND is not effectively the whole page
+        // (which the unconditional `main` capture below already represents). This
+        // drops near-identical full-page wrappers (e.g. #root / app-shell twins)
+        // and overflow ancestors whose clipped box is smaller than their content,
+        // so a child is never nested under a parent that doesn't truly contain a
+        // larger region of it. We still climb THROUGH such wrappers so the chain
+        // reaches the root. When geometry is unknown we can't judge, so we keep
+        // the ancestor (legacy behavior).
+        const isRedundantWrapper =
+          !!geometry &&
+          !!lastRect &&
+          (!contains(geometry, lastRect) ||
+            area(geometry) <= area(lastRect) * (1 + WRAPPER_MARGIN) ||
+            area(geometry) >= geometry.pageW * geometry.pageH * (1 - WRAPPER_MARGIN));
+        if (!isRedundantWrapper) {
+          seenBranches.add(branchId);
+          const ancestorPath = path.join(outputDir, `${branchId}.png`);
+          try {
+            await parent.screenshot({ path: ancestorPath });
+            ancestors.push({
+              branchId,
+              outputPath: ancestorPath,
+              geometry,
+              navPath,
+              label: identity.label,
+              selector: identity.selector,
+            });
+            if (geometry) lastRect = geometry;
+            console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
+          } catch {
+            // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+          }
+        }
+      }
+
+      current = parent;
+    }
+  } finally {
+    // Always clear the overlay so it can't leak into later jobs on this page.
+    await removeChangeHighlight(page);
   }
 
   return ancestors;
@@ -362,9 +453,8 @@ async function captureOnePage(
   job: ScreenshotJob,
   url: string
 ): Promise<{ self: ScreenshotResult; ancestors: AncestorCapture[]; chain: string[] }> {
-  const { outputPath, target, navPath = "/" } = job;
+  const { jobId, outputPath, target, navPath = "/" } = job;
   const outputDir = path.dirname(outputPath);
-  const selfBranchId = path.basename(outputPath, ".png");
   await fse.ensureDir(outputDir);
 
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
@@ -372,16 +462,40 @@ async function captureOnePage(
 
   if (target.mode !== "full") {
     try {
-      const element = await captureLocator(page, target);
-      if (element) {
-        await element.screenshot({ path: outputPath });
+      const located = await captureLocator(page, target);
+      if (located) {
+        const { container, located: changedElement } = located;
+        // The captured container's stable DOM identity defines this component's
+        // branch — instance-unique, so two sibling cards never collapse together.
+        const identity = await computeContainerIdentity(container, navPath);
+        const selfBranchId = keyToBranchId(identity);
+        await container.screenshot({ path: outputPath });
         // Measure the SAME element we screenshot (the climbed container when one
         // was chosen), so geometry == the captured container's rect.
-        const geometry = await readGeometry(element, page);
+        const geometry = await readGeometry(container, page);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
-        const ancestors = await climbAncestors(page, element, outputDir, navPath);
+        const ancestors = await climbAncestors(
+          page,
+          container,
+          outputDir,
+          navPath,
+          changedElement,
+          geometry
+        );
         const chain = [selfBranchId, ...ancestors.map((a) => a.branchId)];
-        return { self: { outputPath, geometry }, ancestors, chain };
+        return {
+          self: {
+            jobId,
+            outputPath,
+            geometry,
+            branchId: selfBranchId,
+            label: identity.label,
+            selector: identity.selector,
+            navPath,
+          },
+          ancestors,
+          chain,
+        };
       }
     } catch {
       console.warn(
@@ -394,10 +508,15 @@ async function captureOnePage(
   // Only treat a full-page capture as real geometry when the target WAS full
   // (e.g. main). A targeted capture that fell back to full page never actually
   // measured its component, so record no geometry rather than polluting the
-  // spatial tree with a page-sized rect (which would mis-nest the branch).
+  // spatial tree with a page-sized rect (which would mis-nest the branch). A
+  // full/fallback capture has no isolable container, so it belongs to `main`.
   const geometry = target.mode === "full" ? await fullPageGeometry(page) : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
-  return { self: { outputPath, geometry }, ancestors: [], chain: [selfBranchId] };
+  return {
+    self: { jobId, outputPath, geometry, branchId: MAIN_BRANCH, label: MAIN_BRANCH, navPath },
+    ancestors: [],
+    chain: [MAIN_BRANCH],
+  };
 }
 
 // True DOM containment succession discovered while climbing: each branch mapped
@@ -444,12 +563,11 @@ export async function takeScreenshots(
   const results: ScreenshotResult[] = [];
   const ancestors: AncestorCapture[] = [];
   const ancestry: DomAncestry = new Map();
-  // Seed with each job's OWN branch (its output filename is `<branchId>.png`) so
-  // a climbed ancestor that derives the same id never overwrites a level-0
-  // capture's PNG or double-nodes a branch the job already owns.
-  const seenAncestorBranches = new Set<string>(
-    jobs.map((job) => path.basename(job.outputPath, ".png"))
-  );
+  // A climbed ancestor that resolves to a branch a job already captured as its
+  // OWN container must not be re-captured (it would double-node that branch).
+  // The job branch id is now the container's DOM identity, only known after
+  // capture, so we accumulate self branch ids as jobs complete.
+  const seenAncestorBranches = new Set<string>();
   let browser;
   try {
     browser = await chromium.launch();
@@ -463,6 +581,7 @@ export async function takeScreenshots(
           url
         );
         results.push(self);
+        if (self.branchId) seenAncestorBranches.add(self.branchId);
         // Build ancestry from the FULL per-job chain (before cross-job ancestor
         // dedup) so containment edges are never dropped for branches that also
         // appear as their own jobs.
@@ -496,6 +615,9 @@ export async function takeScreenshot(
   url: string,
   navPath: string = "/"
 ): Promise<ScreenshotResult | undefined> {
-  const { results } = await takeScreenshots([{ outputPath, target, navPath }], url);
+  const { results } = await takeScreenshots(
+    [{ jobId: "single", outputPath, target, navPath }],
+    url
+  );
   return results[0];
 }

@@ -111,21 +111,31 @@ export type BranchRecord = {
 };
 
 // Result of capturing one screenshot job: the file it wrote and, when a concrete
-// element was located, that element's on-screen geometry.
+// element was located, that element's on-screen geometry. `branchId`/`label`/
+// `selector` describe the captured container's stable DOM identity (the basis
+// for grouping); `branchId` is "main" when the capture fell back to full page.
 export type ScreenshotResult = {
+  jobId?: string;
   outputPath: string;
   geometry?: NodeGeometry;
+  branchId?: string;
+  label?: string;
+  selector?: string;
+  navPath?: string;
 };
 
 // One container captured while climbing the live DOM ancestor chain above a
-// job's located element. branchId is derived from the container's DOM identity
-// (its id/first class), or "main" for the full-page capture taken once the climb
-// reaches body/html.
+// job's located element. branchId is derived from the container's stable DOM
+// identity (a shortest anchored DOM path), or "main" for the full-page capture
+// taken once the climb reaches body/html. selector is a best-effort valid CSS
+// selector to re-locate the container on demand.
 export type AncestorCapture = {
   branchId: string;
   outputPath: string;
   geometry?: NodeGeometry;
   navPath: string; // route the ancestor was captured on
+  label?: string;
+  selector?: string;
 };
 
 export type PageContext = {

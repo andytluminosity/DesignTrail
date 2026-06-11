@@ -34,6 +34,7 @@ import {
   planSignificancePrune,
   applySignificancePrune,
 } from "../tracker/significancePrune.js";
+import { MAIN_BRANCH } from "../tracker/branch.js";
 
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -227,6 +228,11 @@ type CreateMiroItemBase = {
 
 type CreateMiroImageInput = CreateMiroItemBase & {
   url: string;
+  width?: number;
+};
+
+type CreateMiroImageFromFileInput = CreateMiroItemBase & {
+  filePath: string;
   width?: number;
 };
 
@@ -463,6 +469,30 @@ async function createMiroGroup(
   return { ...(responseBody as Record<string, unknown>), id };
 }
 
+async function postMiroMultipartItem(
+  url: string,
+  accessToken: string,
+  body: Buffer,
+  boundary: string
+): Promise<MiroItemResponse> {
+  const response = await miroFetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    },
+    body: body as unknown as BodyInit,
+  });
+  const responseText = await response.text();
+  const responseBody = parseResponseBody(responseText);
+
+  if (!response.ok) {
+    throw new Error(`Miro API error ${response.status}: ${JSON.stringify(responseBody)}`);
+  }
+
+  return responseBody as MiroItemResponse;
+}
+
 async function getMiroItem(
   accessToken: string,
   boardId: string,
@@ -498,6 +528,16 @@ function pathToUrlPath(value: string): string {
     .split(path.sep)
     .join("/")
     .replace(/^\/+/, "");
+}
+
+/**
+ * The clean (unboxed) sidecar path for a full-page `main` capture. The DOM climb
+ * saves `main.png` with the change highlight box (used by the full + compressed
+ * trees) and a `main-original.png` copy without it (used by the commit-overview
+ * tree). Derived by name convention so it tracks the node's current PNG path.
+ */
+function originalMainSidecarPath(screenshotPath: string): string {
+  return screenshotPath.replace(/\.png$/i, "-original.png");
 }
 
 /** Public URL Miro fetches a saved screenshot from, derived from its repo path. */
@@ -796,6 +836,54 @@ export async function createMiroImage({
       position: resolvedPosition,
       ...(width ? { geometry: { width } } : {}),
     }
+  );
+}
+
+export async function createMiroImageFromFile({
+  accessToken,
+  boardId,
+  filePath,
+  position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset,
+  width,
+}: CreateMiroImageFromFileInput): Promise<MiroItemResponse> {
+  const resolvedPosition = await resolveMiroPosition({
+    accessToken,
+    boardId,
+    position,
+    anchorItemId,
+    anchorOffset,
+  });
+
+  const imageBytes = readFileSync(filePath);
+  const boundary = `----DesignTrail${Date.now().toString(36)}${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  const fileName = path.basename(filePath).replace(/"/g, "");
+  const data = JSON.stringify({
+    position: resolvedPosition,
+    ...(width ? { geometry: { width } } : {}),
+  });
+  const body = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="data"\r\n` +
+        `Content-Type: application/json\r\n\r\n` +
+        `${data}\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="resource"; filename="${fileName}"\r\n` +
+        `Content-Type: image/png\r\n\r\n`
+    ),
+    imageBytes,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+
+  return postMiroMultipartItem(
+    `https://api.miro.com/v2/boards/${boardId}/images`,
+    accessToken,
+    body,
+    boundary
   );
 }
 
@@ -1166,6 +1254,10 @@ type PreparedNode = {
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
+  // Local PNG to upload instead of `node.screenshotPath`. Used by the commit
+  // overview tree to upload the clean `main-original.png` sidecar (no red box)
+  // even though the node still points at the boxed `main.png`.
+  screenshotPathOverride?: string;
 };
 
 type DrawTreeArgs = {
@@ -1187,6 +1279,44 @@ type DrawTreeArgs = {
   // Optional banner note placed above the tree.
   title?: string;
 };
+
+// Upload the screenshot to Miro by streaming the local PNG bytes directly. This
+// is preferred over handing Miro a public URL to fetch because Miro's backend
+// fetcher can't always validate the TLS chain of tunneled dev hosts (e.g.
+// newer Let's Encrypt roots on *.ngrok-free.dev), and because it avoids a wasted
+// failed round-trip per image. The public URL is only used as a fallback when
+// the file isn't on disk.
+async function createScreenshotImage(params: {
+  accessToken: string;
+  boardId: string;
+  url: string;
+  screenshotPath: string;
+  position: MiroPosition;
+  width: number;
+}): Promise<MiroItemResponse> {
+  const filePath = path.join(DESIGNTRAIL_ROOT, params.screenshotPath);
+
+  if (existsSync(filePath)) {
+    return await createMiroImageFromFile({
+      accessToken: params.accessToken,
+      boardId: params.boardId,
+      filePath,
+      position: params.position,
+      width: params.width,
+    });
+  }
+
+  console.warn(
+    `Local screenshot missing for ${params.screenshotPath}; falling back to URL upload from ${params.url}.`
+  );
+  return await createMiroImage({
+    accessToken: params.accessToken,
+    boardId: params.boardId,
+    url: params.url,
+    position: params.position,
+    width: params.width,
+  });
+}
 
 /**
  * Lays out and draws ONE tree from the given prepared nodes: every screenshot
@@ -1301,10 +1431,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
 
       let imageItemId: string;
       try {
-        const imageItem = await createMiroImage({
+        const imageItem = await createScreenshotImage({
           accessToken,
           boardId,
           url: p.url,
+          screenshotPath: p.screenshotPathOverride ?? p.node.screenshotPath,
           position: imageCenter,
           width: IMAGE_W,
         });
@@ -1451,9 +1582,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
 
 /**
  * Clears the previous DesignTrail-generated group and re-renders the ENTIRE
- * design-evolution graph as TWO spatial component trees side by side: a
+ * design-evolution graph as THREE spatial trees side by side: a
  * significance-pruned tree first (where screenshots that are only a minor change
- * from their parent have been hidden), then the full-history tree to its right.
+ * from their parent have been hidden), then the full-history tree to its right,
+ * then a per-commit overview tree (the full-page `main` capture for each commit,
+ * one screenshot per commit, as the overall view of what that commit changed).
  * Children re-anchor upward in the pruned tree and leaves are preserved. Each
  * node draws its screenshot, header note, and per-element annotation notes; tree
  * connectors show per-branch chronology and branch forks. Positions come from
@@ -1608,10 +1741,47 @@ export async function renderBoardFromGraph(
     title: "Full history",
   });
 
-  const rendered = [...pruned.rendered, ...full.rendered];
+  // Tree 3: the per-commit overview. Each commit's full-page `main` capture is
+  // the overall view of what that commit changed, so feeding only the main
+  // branch's nodes to the same layout yields a single chronological row (one
+  // screenshot per commit), placed to the right of the full-history tree.
+  const mainBranches = branches.filter((b) => b.id === MAIN_BRANCH);
+  const mainNodes = nodes.filter((n) => n.branchId === MAIN_BRANCH);
+  // The commit-overview tree shows the original, unboxed full page: swap each
+  // main node's image to its clean `main-original.png` sidecar when present
+  // (falling back to the boxed `main.png` used by the other two trees).
+  const mainPrepared = prepared
+    .filter((p) => p.node.branchId === MAIN_BRANCH)
+    .map((p) => {
+      const sidecarRel = originalMainSidecarPath(p.node.screenshotPath);
+      const sidecarAbs = path.join(DESIGNTRAIL_ROOT, sidecarRel);
+      if (!existsSync(sidecarAbs)) return p;
+      return {
+        ...p,
+        screenshotPathOverride: sidecarRel,
+        url: publicScreenshotUrl(sidecarRel, options.publicBaseUrl),
+      };
+    });
+
+  const commitOverview = await drawTree({
+    accessToken,
+    boardId,
+    branches: mainBranches,
+    nodes: mainNodes,
+    prepared: mainPrepared,
+    commitsByHash,
+    annotationsByNode,
+    generatedItems,
+    offsetX: full.maxRight + TREE_GAP,
+    keyPrefix: "commit:",
+    title: "Commit overview (one per commit)",
+  });
+
+  const rendered = [...pruned.rendered, ...full.rendered, ...commitOverview.rendered];
   console.log(
-    `Miro board re-rendered: significant-changes (${pruned.rendered.length}) and ` +
-      `full history (${full.rendered.length}) trees.`
+    `Miro board re-rendered: significant-changes (${pruned.rendered.length}), ` +
+      `full history (${full.rendered.length}), and ` +
+      `commit overview (${commitOverview.rendered.length}) trees.`
   );
   await persistDesignTrailRenderGroup(accessToken, boardId, generatedItems);
 
