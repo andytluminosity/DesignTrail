@@ -240,9 +240,10 @@ await createDesignSnapshot({
 
 Set `syncMiro: false` to capture and persist locally without creating/updating
 Miro items. Commit integrations should ask whether to render Miro before capture starts:
-local-only runs can use `defaultAnnotationMode: "skip"` and `syncMiro: false`, while render
-runs should pass the desired annotation choices during the same capture so the board is drawn
-once at the end.
+local-only runs can use `defaultAnnotationMode: "skip"` and `syncMiro: false`. Render runs
+should first capture with `defaultAnnotationMode: "skip"` and `syncMiro: false`, ask
+per-screenshot annotation choices from the returned entries, then apply those choices through
+the snapshot annotation update API with `syncMiro: true` so the board is drawn once at the end.
 
 ## LLM output contract
 

@@ -4,9 +4,9 @@ When the user asks Claude to create a Git commit, use the DesignTrail commit flo
 
 1. Run the `/commit-design` command flow.
 2. Before any other prompt, ask a clear yes/no single-select question for whether DesignTrail should render Miro for this commit.
-3. If the user chooses local-only, run the commit with DesignTrail capture enabled, annotation prompts skipped, and `DESIGNTRAIL_SYNC_MIRO=false` so data is stored in SQLite without rendering Miro.
-4. If the user chooses Miro rendering, let the post-commit hook ask for screenshot annotation choices during capture and render Miro once at the end.
-5. Do not call `/snapshot/annotations` after the commit unless the user explicitly asks for an after-the-fact annotation repair or backfill.
+3. Always run the commit hook with annotation prompts skipped, `DESIGNTRAIL_DEFAULT_ANNOTATION_MODE=skip`, and `DESIGNTRAIL_SYNC_MIRO=false` so the commit captures screenshots and stores data in SQLite without rendering Miro.
+4. If the user chooses local-only, stop after the hook completes and summarize the local capture.
+5. If the user chooses Miro rendering, use Cursor `AskUserQuestions` to ask per-screenshot annotation choices from the hook output, then apply those choices through `/snapshot/annotations` with `syncMiro: true` so Miro renders exactly once.
 6. Only fall back to a normal `git commit` if the user explicitly asks to bypass DesignTrail.
 
 DesignTrail uses two annotation layers:

@@ -11,7 +11,7 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 - The app being captured is running at `CAPTURE_URL` (usually `http://localhost:3000`).
 - The DesignTrail service is running at `http://localhost:3002`.
-- Miro board rendering is optional and happens during the single snapshot request when selected.
+- Miro board rendering is optional. When selected, capture first without rendering, ask per-screenshot annotation choices in Cursor, then render once.
 
 ## Workflow
 
@@ -24,7 +24,7 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 2. Resolve the absolute path of the current repository. Use the current working directory unless the user provides a different repo path.
 
-3. If the user chose `No, store locally only`, capture the latest commit without annotations or Miro rendering:
+3. Capture the latest commit without annotations or Miro rendering. This is required for both Miro choices so Cursor can ask per-screenshot annotation questions before any render happens:
 
 ```bash
 curl -sS -X POST "http://localhost:3002/snapshot" \
@@ -37,23 +37,43 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
   }'
 ```
 
-4. If the user chose `Yes, render Miro`, capture the latest commit with the default AI annotation mode and render Miro once:
+4. If the user chose `No, store locally only`, stop after the capture response and summarize the local capture.
+
+5. If the user chose `Yes, render Miro`, for each returned entry, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
+
+   - prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
+   - options:
+     - `Skip annotations`
+     - `Manually add annotation`
+     - `AI generated annotations`
+     - `Manual and AI generated annotations`
+
+6. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
+
+7. Apply the per-screenshot choices and render Miro once:
 
 ```bash
-curl -sS -X POST "http://localhost:3002/snapshot" \
+curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
   -H "Content-Type: application/json" \
   -d '{
     "repoPath": "<absolute-repo-path>",
-    "source": "claude",
+    "commitHash": "<commit-hash>",
+    "annotationChoices": [
+      {
+        "nodeId": "<entry-node-id>",
+        "mode": "skip|manual|ai|manual_and_ai",
+        "annotation": "<manual annotation when present>"
+      }
+    ],
     "syncMiro": true
   }'
 ```
 
-Do not call `POST /snapshot/annotations` as part of this command. That endpoint is only for explicit after-the-fact annotation repair or backfill.
+This `POST /snapshot/annotations` call is the only Miro render in the capture flow. Do not call it if the user chose local-only, and do not call `POST /snapshot` with `syncMiro: true` when asking annotation choices.
 
-5. If the response is not successful, show the returned error and stop.
+8. If any response is not successful, show the returned error and stop.
 
-6. If the response is successful, summarize:
+9. If the flow is successful, summarize:
    - Repository name and commit hash.
    - Commit message.
    - Screenshot count.

@@ -1,5 +1,5 @@
 ---
-allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd)
+allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd), Bash(curl:*)
 description: Commit changes through DesignTrail with annotation options
 ---
 
@@ -33,7 +33,7 @@ git log --oneline -5
 
 3. Stage only the files relevant to the user-requested commit.
 
-4. If the user chose `No, store locally only`, run `git commit` with DesignTrail capture enabled, annotation prompts disabled, and Miro rendering disabled:
+4. Run `git commit` with DesignTrail capture enabled, hook annotation prompts disabled, and Miro rendering disabled. This is required for both Miro choices so Cursor can ask per-screenshot annotation questions before any render happens:
 
 ```bash
 DESIGNTRAIL_SOURCE=claude \
@@ -43,19 +43,41 @@ DESIGNTRAIL_SYNC_MIRO=false \
 git commit -m "<commit message>"
 ```
 
-5. If the user chose `Yes, render Miro`, run `git commit` with DesignTrail Miro rendering enabled and allow the post-commit hook to ask for per-screenshot annotation choices during the capture:
+5. If the user chose `No, store locally only`, stop after the hook completes and summarize the local capture.
+
+6. If the user chose `Yes, render Miro`, read the DesignTrail hook output. For each returned screenshot/component, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
+
+- prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
+- options:
+  - `Skip annotations`
+  - `Manually add annotation`
+  - `AI generated annotations`
+  - `Manual and AI generated annotations`
+
+7. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
+
+8. Apply the per-screenshot choices and render Miro once:
 
 ```bash
-DESIGNTRAIL_SOURCE=claude \
-DESIGNTRAIL_SKIP_PROMPT=0 \
-DESIGNTRAIL_DEFAULT_ANNOTATION_MODE=ai \
-DESIGNTRAIL_SYNC_MIRO=true \
-git commit -m "<commit message>"
+curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repoPath": "<absolute-repo-path>",
+    "commitHash": "<commit-hash>",
+    "annotationChoices": [
+      {
+        "nodeId": "<entry-node-id>",
+        "mode": "skip|manual|ai|manual_and_ai",
+        "annotation": "<manual annotation when present>"
+      }
+    ],
+    "syncMiro": true
+  }'
 ```
 
-Do not call `POST /snapshot/annotations` after this commit. The hook has already applied annotation choices and, when requested, rendered the board once.
+This `POST /snapshot/annotations` call is the only Miro render in the commit flow. Do not call it if the user chose local-only, and do not run the commit hook with `DESIGNTRAIL_SYNC_MIRO=true`.
 
-6. After the hook completes, summarize:
+9. After the hook and optional annotation update complete, summarize:
 
 - Commit hash and message.
 - Each screenshot/component's annotation mode.

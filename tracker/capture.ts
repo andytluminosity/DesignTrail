@@ -1,5 +1,4 @@
 import path from "path";
-import { createReadStream, createWriteStream } from "fs";
 import readline from "readline/promises";
 import {
   createDesignSnapshot,
@@ -159,26 +158,18 @@ async function promptForAnnotationChoices(
 ): Promise<AnnotationChoice[]> {
   if (targets.length === 0) return [];
 
-  let input: NodeJS.ReadableStream = process.stdin;
-  let output: NodeJS.WritableStream = process.stdout;
-  let ttyInput: ReturnType<typeof createReadStream> | undefined;
-  let ttyOutput: ReturnType<typeof createWriteStream> | undefined;
-
-  try {
-    ttyInput = createReadStream("/dev/tty");
-    ttyOutput = createWriteStream("/dev/tty");
-    input = ttyInput;
-    output = ttyOutput;
-  } catch {
-    if (!process.stdin.isTTY) {
-      console.warn(
-        `No interactive terminal available; using ${MODE_LABELS[defaultMode]} for all screenshots.`
-      );
-      return defaultChoices(targets, defaultMode);
-    }
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.warn(
+      `No interactive terminal available; using ${MODE_LABELS[defaultMode]} for all screenshots.`
+    );
+    return defaultChoices(targets, defaultMode);
   }
 
-  const rl = readline.createInterface({ input, output });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const output = process.stdout;
   try {
     const choices: AnnotationChoice[] = [];
     for (let i = 0; i < targets.length; i += 1) {
@@ -211,8 +202,6 @@ async function promptForAnnotationChoices(
     return choices;
   } finally {
     rl.close();
-    ttyInput?.destroy();
-    ttyOutput?.destroy();
   }
 }
 
