@@ -29,8 +29,20 @@ import {
   type MiroRelativePosition,
   type NodeBox,
 } from "./treeLayout.js";
+import {
+  planSignificancePrune,
+  applySignificancePrune,
+} from "../tracker/significancePrune.js";
 
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Horizontal gap between the full-history tree and the significance-pruned tree
+// drawn beside it. Much larger than the in-tree H_GAP so the two never touch.
+const TREE_GAP = 4000;
+// Vertical clearance above a tree where its title note sits.
+const TREE_TITLE_OFFSET = 500;
+// Extra space between a tree's outermost cluster/title and its gray frame.
+const TREE_FRAME_PADDING = 350;
 
 try {
   process.loadEnvFile(path.join(DESIGNTRAIL_ROOT, ".env"));
@@ -219,6 +231,15 @@ type CreateMiroStickyNoteInput = CreateMiroItemBase & {
   content: string;
   width?: number;
   color?: AnnotationColor;
+};
+
+type CreateMiroShapeInput = CreateMiroItemBase & {
+  shape: "rectangle";
+  width: number;
+  height: number;
+  fillColor?: string;
+  borderColor?: string;
+  borderWidth?: string;
 };
 
 type MiroConnectorShape = "straight" | "elbowed" | "curved";
@@ -543,6 +564,43 @@ export async function createMiroStickyNote({
   );
 }
 
+async function createMiroShape({
+  accessToken,
+  boardId,
+  shape,
+  position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset,
+  width,
+  height,
+  fillColor = "#f2f2f2",
+  borderColor = "#808080",
+  borderWidth = "2",
+}: CreateMiroShapeInput): Promise<MiroItemResponse> {
+  const resolvedPosition = await resolveMiroPosition({
+    accessToken,
+    boardId,
+    position,
+    anchorItemId,
+    anchorOffset,
+  });
+
+  return postMiroItem(
+    `https://api.miro.com/v2/boards/${boardId}/shapes`,
+    accessToken,
+    {
+      data: { shape },
+      position: resolvedPosition,
+      geometry: { width, height },
+      style: {
+        fillColor,
+        borderColor,
+        borderWidth,
+      },
+    }
+  );
+}
+
 export async function createConnector({
   accessToken,
   boardId,
@@ -792,141 +850,54 @@ type PreparedNode = {
   url: string;
 };
 
+type DrawTreeArgs = {
+  accessToken: string;
+  boardId: string;
+  // Branch/node graph THIS tree is laid out from (the pruned tree passes
+  // re-anchored copies). Connectors are drawn only between prepared nodes.
+  branches: BranchRecord[];
+  nodes: IterationNode[];
+  prepared: PreparedNode[];
+  commitsByHash: Map<string, CommitData>;
+  annotationsByNode: Map<string, AnnotationRecord[]>;
+  // Board-units this tree is shifted to the right, so two trees sit side by side.
+  offsetX: number;
+  // Namespaces image-item lookups so the SAME node id can be drawn in both trees
+  // without their connectors crossing wires.
+  keyPrefix: string;
+  // Optional banner note placed above the tree.
+  title?: string;
+};
+
 /**
- * Wipes the board and re-renders the ENTIRE design-evolution graph as a spatial
- * component tree: every iteration node's screenshot, its header note, and its
- * per-element annotation notes (with connectors), plus tree connectors showing
- * per-branch chronology and branch forks. Positions come from planTreeLayout so
- * screenshots assemble into a non-overlapping tree. Called fresh on every commit
- * so the board always reflects the full, current graph.
+ * Lays out and draws ONE tree from the given prepared nodes: every screenshot
+ * cluster (image + header note + annotation notes), the per-branch chronological
+ * chain, and the branch-fork edges. Positions come from planTreeLayout, shifted
+ * by `offsetX` so multiple trees can share one board without overlapping. Returns
+ * the nodes it rendered plus the tree's right edge (in board units) so a caller
+ * can place the next tree beyond it.
  */
-export async function renderBoardFromGraph(
-  branches: BranchRecord[],
-  nodes: IterationNode[],
-  commitsByHash: Map<string, CommitData>,
-  annotationsOrOptions: AnnotationRecord[] | RenderBoardOptions = [],
-  optionsArg: RenderBoardOptions = {}
-): Promise<RenderedBoardNode[]> {
-  const annotationRecords = Array.isArray(annotationsOrOptions)
-    ? annotationsOrOptions
-    : [];
-  const options = Array.isArray(annotationsOrOptions) ? optionsArg : annotationsOrOptions;
-  const annotationsByNode = groupAnnotationsByNode(annotationRecords);
-  const accessToken = getStoredMiroAccessToken();
-  const boardId = process.env.MIRO_BOARD_ID;
+async function drawTree(args: DrawTreeArgs): Promise<{
+  rendered: RenderedBoardNode[];
+  maxRight: number;
+}> {
+  const {
+    accessToken,
+    boardId,
+    branches,
+    nodes,
+    prepared,
+    commitsByHash,
+    annotationsByNode,
+    offsetX,
+    keyPrefix,
+    title,
+  } = args;
 
-  if (!accessToken) {
-    console.error("No stored Miro access token found. Complete OAuth first; skipping Miro render.");
-    return [];
-  }
+  const rendered: RenderedBoardNode[] = [];
+  if (prepared.length === 0) return { rendered, maxRight: offsetX };
 
-  if (!boardId) {
-    console.error("MIRO_BOARD_ID is missing. Skipping Miro render.");
-    return [];
-  }
-
-  // Keep only nodes whose screenshot file actually exists on disk.
-  const renderable = nodes.filter(
-    (node) =>
-      node.screenshotPath &&
-      existsSync(path.join(DESIGNTRAIL_ROOT, node.screenshotPath))
-  );
-
-  // Precompute, per node: image height, annotation blocks, vision-placed
-  // annotation positions, the cluster footprint, and the public image URL.
-  const prepared: PreparedNode[] = await mapWithConcurrency(
-    renderable,
-    PRECOMPUTE_CONCURRENCY,
-    async (node) => {
-      const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
-      const dims = await readPngDimensions(absPng);
-      const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const commit = commitsByHash.get(node.commitHash);
-      const nodeAnnotations = annotationsByNode.get(node.id);
-      const manualAnnotation = getAnnotationContent(
-        nodeAnnotations,
-        "user",
-        commit?.annotation
-      );
-      const manualAnnotationColor = manualAnnotation
-        ? getAnnotationColor(nodeAnnotations, "user")
-        : undefined;
-      const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
-      const aiAnnotationColor = aiAnnotation
-        ? getAnnotationColor(nodeAnnotations, "ai")
-        : undefined;
-      const manualPlacements: AnnotationPlacement[] = manualAnnotation
-        ? [{ index: 1, x: 1, y: 0.5 }]
-        : [];
-      const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
-      const placements =
-        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
-      const footprint = computeClusterFootprint(
-        imageH,
-        [...manualPlacements, ...placements]
-      );
-      return {
-        node,
-        aiAnnotation,
-        aiAnnotationColor,
-        imageH,
-        blocks,
-        manualAnnotation,
-        manualAnnotationColor,
-        manualPlacements,
-        placements,
-        footprint,
-        url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
-      };
-    }
-  );
-
-  // The stored graph is already pruned at save time (duplicate screenshots
-  // collapsed, node-less branches promoted away), so every prepared node is
-  // drawn exactly once and connectors reference nodes directly.
-  const preparedToDraw: PreparedNode[] = prepared;
-
-  const drawnCommitHashes = new Set(preparedToDraw.map((p) => p.node.commitHash));
-  const standaloneManualCommits = [...commitsByHash.values()]
-    .map((commit) => ({
-      hash: commit.hash,
-      timestamp: commit.timestamp,
-      annotation: (commit.annotation ?? "").trim(),
-    }))
-    .filter((commit) => commit.annotation && !drawnCommitHashes.has(commit.hash))
-    .sort((a, b) => a.timestamp - b.timestamp);
-
-  if (preparedToDraw.length === 0 && standaloneManualCommits.length === 0) {
-    console.error("No renderable screenshots found for this repo; skipping Miro render.");
-    return [];
-  }
-
-  // Wipe the whole board so the re-render starts from a clean slate.
-  await clearBoard(accessToken, boardId);
-
-  if (preparedToDraw.length === 0) {
-    await Promise.all(
-      standaloneManualCommits.map((commit, index) =>
-        createMiroStickyNote({
-          accessToken,
-          boardId,
-          content: commit.annotation,
-          position: {
-            x: 0,
-            y: index * (STICKY_H + NOTE_MARGIN),
-          },
-          width: STICKY_W,
-          color: "blue",
-        }).catch((error: unknown) =>
-          console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
-        )
-      )
-    );
-    console.log(`Miro board re-rendered: 0 screenshot(s), ${standaloneManualCommits.length} standalone annotation note(s).`);
-    return [];
-  }
-
-  const boxes: NodeBox[] = preparedToDraw.map((p) => ({
+  const boxes: NodeBox[] = prepared.map((p) => ({
     id: p.node.id,
     width: p.footprint.width,
     height: p.footprint.height,
@@ -935,19 +906,70 @@ export async function renderBoardFromGraph(
   const plan = await planTreeLayout(branches, nodes, boxes);
   const layout = plan.positions;
 
+  // Bounds in pre-offset coordinates, for frame/title placement and the right edge.
+  let minX = Infinity;
+  let minY = Infinity;
+  let rightEdge = -Infinity;
+  let bottomEdge = -Infinity;
+  for (const p of prepared) {
+    const box = layout.get(p.node.id);
+    if (!box) continue;
+    minX = Math.min(minX, box.x);
+    minY = Math.min(minY, box.y);
+    rightEdge = Math.max(rightEdge, box.x + p.footprint.width);
+    bottomEdge = Math.max(bottomEdge, box.y + p.footprint.height);
+  }
+  if (!Number.isFinite(rightEdge)) return { rendered, maxRight: offsetX };
+
+  // Image item ids keyed by `keyPrefix + node.id` so two trees never collide.
   const imageIdByNode = new Map<string, string>();
-  const rendered: RenderedBoardNode[] = [];
+
+  const titleY = minY - TREE_TITLE_OFFSET;
+  const frameLeft = offsetX + minX - TREE_FRAME_PADDING;
+  const frameRight = offsetX + rightEdge + TREE_FRAME_PADDING;
+  const frameTop =
+    Math.min(minY, title ? titleY - STICKY_H / 2 : minY) - TREE_FRAME_PADDING;
+  const frameBottom = bottomEdge + TREE_FRAME_PADDING;
+
+  await createMiroShape({
+    accessToken,
+    boardId,
+    shape: "rectangle",
+    position: {
+      x: (frameLeft + frameRight) / 2,
+      y: (frameTop + frameBottom) / 2,
+    },
+    width: frameRight - frameLeft,
+    height: frameBottom - frameTop,
+    fillColor: "#f2f2f2",
+    borderColor: "#808080",
+    borderWidth: "2",
+  }).catch((error: unknown) =>
+    console.error("Failed to place tree frame:", getErrorMessage(error))
+  );
+
+  if (title) {
+    await createMiroStickyNote({
+      accessToken,
+      boardId,
+      content: title,
+      position: { x: offsetX + (minX + rightEdge) / 2, y: titleY },
+      width: IMAGE_W,
+    }).catch((error: unknown) =>
+      console.error("Failed to place tree title note:", getErrorMessage(error))
+    );
+  }
 
   // Insert phase: draw every screenshot in parallel. Each node creates its image
   // first (annotation connectors need the image id), then fires its header and
   // annotation notes together. The shared limiter caps total concurrency.
   await Promise.all(
-    preparedToDraw.map(async (p) => {
+    prepared.map(async (p) => {
       const box = layout.get(p.node.id);
       if (!box) return;
 
       const imageCenter: MiroPosition = {
-        x: box.x + p.footprint.imageCenterOffset.x,
+        x: offsetX + box.x + p.footprint.imageCenterOffset.x,
         y: box.y + p.footprint.imageCenterOffset.y,
       };
 
@@ -961,7 +983,7 @@ export async function renderBoardFromGraph(
           width: IMAGE_W,
         });
         imageItemId = imageItem.id;
-        imageIdByNode.set(p.node.id, imageItem.id);
+        imageIdByNode.set(keyPrefix + p.node.id, imageItem.id);
         rendered.push({ nodeId: p.node.id, miroImageId: imageItem.id });
       } catch (error: unknown) {
         console.error(
@@ -1047,44 +1069,13 @@ export async function renderBoardFromGraph(
     })
   );
 
-  if (standaloneManualCommits.length > 0) {
-    const layoutBoxes = preparedToDraw
-      .map((p) => {
-        const box = layout.get(p.node.id);
-        return box ? { position: box, footprint: p.footprint } : null;
-      })
-      .filter((box): box is NonNullable<typeof box> => box !== null);
-    const right = Math.max(
-      ...layoutBoxes.map((box) => box.position.x + box.footprint.width)
-    );
-    const top = Math.min(...layoutBoxes.map((box) => box.position.y));
-
-    await Promise.all(
-      standaloneManualCommits.map((commit, index) =>
-        createMiroStickyNote({
-          accessToken,
-          boardId,
-          content: commit.annotation,
-          position: {
-            x: right + NOTE_MARGIN + STICKY_W / 2,
-            y: top + index * (STICKY_H + NOTE_MARGIN),
-          },
-          width: STICKY_W,
-          color: "blue",
-        }).catch((error: unknown) =>
-          console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
-        )
-      )
-    );
-  }
-
   // Tree connectors: a red chronological chain between consecutive screenshots
   // within each branch, then a (default-colored) fork edge from each branch's
   // fork point to that branch's first screenshot. Duplicate edges are dropped so
   // each image points to a given target at most once. Built after all images
   // exist, then drawn in parallel.
   const resolveImageId = (nodeId: string): string | undefined =>
-    imageIdByNode.get(nodeId);
+    imageIdByNode.get(keyPrefix + nodeId);
 
   const drawnConnectors = new Set<string>();
   const connectorWork: Promise<void>[] = [];
@@ -1102,24 +1093,172 @@ export async function renderBoardFromGraph(
     connectorWork.push(safeConnector(accessToken, boardId, startId, endId, style));
   };
 
-  const nodesByBranch = groupNodesByBranch(renderable);
-
+  // Chronology runs between consecutive DRAWN nodes of each branch. Prepared
+  // preserves export (chronological) order, so the pruned tree naturally links
+  // surviving screenshots straight through the dropped ones.
+  const nodesByBranch = groupNodesByBranch(prepared.map((p) => p.node));
   for (const branchNodes of nodesByBranch.values()) {
     for (let i = 1; i < branchNodes.length; i += 1) {
       queueConnector(branchNodes[i - 1].id, branchNodes[i].id, CHRONOLOGY_CONNECTOR_STYLE);
     }
   }
 
-  // Fork edges come from the layout tree's stored fork points, which the
-  // save-time prune already re-anchored, so each branch connects to where it
-  // actually hangs.
+  // Fork edges come from this tree's layout (re-anchored fork points), so each
+  // branch connects to where it actually hangs in this tree.
   for (const edge of plan.forkEdges) {
     queueConnector(edge.from, edge.to);
   }
 
   await Promise.all(connectorWork);
 
-  console.log(`Miro board re-rendered: ${rendered.length} screenshot(s) in a component tree.`);
+  return { rendered, maxRight: frameRight };
+}
+
+/**
+ * Wipes the board and re-renders the ENTIRE design-evolution graph as TWO spatial
+ * component trees side by side: a significance-pruned tree first (where screenshots
+ * that are only a minor change from their parent have been hidden), then the
+ * full-history tree to its right. Children re-anchor upward in the pruned tree and
+ * leaves are preserved. Each node draws its screenshot, header note, and
+ * per-element annotation notes; tree connectors show per-branch chronology and
+ * branch forks. Positions come from planTreeLayout so each tree is non-overlapping.
+ * Called fresh on every render so the board always reflects the full, current graph.
+ */
+export async function renderBoardFromGraph(
+  branches: BranchRecord[],
+  nodes: IterationNode[],
+  commitsByHash: Map<string, CommitData>,
+  annotationsOrOptions: AnnotationRecord[] | RenderBoardOptions = [],
+  optionsArg: RenderBoardOptions = {}
+): Promise<RenderedBoardNode[]> {
+  const annotationRecords = Array.isArray(annotationsOrOptions)
+    ? annotationsOrOptions
+    : [];
+  const options = Array.isArray(annotationsOrOptions) ? optionsArg : annotationsOrOptions;
+  const annotationsByNode = groupAnnotationsByNode(annotationRecords);
+  const accessToken = getStoredMiroAccessToken();
+  const boardId = process.env.MIRO_BOARD_ID;
+
+  if (!accessToken) {
+    console.error("No stored Miro access token found. Complete OAuth first; skipping Miro render.");
+    return [];
+  }
+
+  if (!boardId) {
+    console.error("MIRO_BOARD_ID is missing. Skipping Miro render.");
+    return [];
+  }
+
+  // Keep only nodes whose screenshot file actually exists on disk.
+  const renderable = nodes.filter(
+    (node) =>
+      node.screenshotPath &&
+      existsSync(path.join(DESIGNTRAIL_ROOT, node.screenshotPath))
+  );
+
+  // Precompute, per node: image height, annotation blocks, vision-placed
+  // annotation positions, the cluster footprint, and the public image URL. Done
+  // once and reused by BOTH trees (the pruned tree draws a subset of these).
+  const prepared: PreparedNode[] = await mapWithConcurrency(
+    renderable,
+    PRECOMPUTE_CONCURRENCY,
+    async (node) => {
+      const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
+      const dims = await readPngDimensions(absPng);
+      const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
+      const commit = commitsByHash.get(node.commitHash);
+      const nodeAnnotations = annotationsByNode.get(node.id);
+      const manualAnnotation = getAnnotationContent(
+        nodeAnnotations,
+        "user",
+        commit?.annotation
+      );
+      const manualAnnotationColor = manualAnnotation
+        ? getAnnotationColor(nodeAnnotations, "user")
+        : undefined;
+      const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+      const aiAnnotationColor = aiAnnotation
+        ? getAnnotationColor(nodeAnnotations, "ai")
+        : undefined;
+      const manualPlacements: AnnotationPlacement[] = manualAnnotation
+        ? [{ index: 1, x: 1, y: 0.5 }]
+        : [];
+      const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
+      const placements =
+        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
+      const footprint = computeClusterFootprint(imageH, [
+        ...manualPlacements,
+        ...placements,
+      ]);
+      return {
+        node,
+        aiAnnotation,
+        aiAnnotationColor,
+        imageH,
+        blocks,
+        manualAnnotation,
+        manualAnnotationColor,
+        manualPlacements,
+        placements,
+        footprint,
+        url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
+      };
+    }
+  );
+
+  if (prepared.length === 0) {
+    console.error("No renderable screenshots found for this repo; skipping Miro render.");
+    return [];
+  }
+
+  // Wipe the whole board so the re-render starts from a clean slate.
+  await clearBoard(accessToken, boardId);
+
+  // Tree 1: the significance-pruned view. Compute the prune plan (one vision call
+  // per hierarchy level band), apply it to IN-MEMORY graph copies (the DB is
+  // never touched), and draw the surviving nodes first.
+  const prunePlan = await planSignificancePrune(branches, nodes, DESIGNTRAIL_ROOT);
+  const { branches: prunedBranches, nodes: prunedNodes } = applySignificancePrune(
+    branches,
+    nodes,
+    prunePlan
+  );
+  const deletedIds = new Set(prunePlan.deletedNodeIds);
+  const prunedPrepared = prepared.filter((p) => !deletedIds.has(p.node.id));
+
+  const pruned = await drawTree({
+    accessToken,
+    boardId,
+    branches: prunedBranches,
+    nodes: prunedNodes,
+    prepared: prunedPrepared,
+    commitsByHash,
+    annotationsByNode,
+    offsetX: 0,
+    keyPrefix: "pruned:",
+    title: "Significant changes only",
+  });
+
+  // Tree 2: the full design-evolution history exactly as stored, placed to the
+  // right of the compressed tree.
+  const full = await drawTree({
+    accessToken,
+    boardId,
+    branches,
+    nodes,
+    prepared,
+    commitsByHash,
+    annotationsByNode,
+    offsetX: pruned.maxRight + TREE_GAP,
+    keyPrefix: "",
+    title: "Full history",
+  });
+
+  const rendered = [...pruned.rendered, ...full.rendered];
+  console.log(
+    `Miro board re-rendered: significant-changes (${pruned.rendered.length}) and ` +
+      `full history (${full.rendered.length}) trees.`
+  );
 
   return rendered;
 }
