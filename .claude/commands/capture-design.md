@@ -39,7 +39,7 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
 
 4. If the user chose `No, store locally only`, stop after the capture response and summarize the local capture.
 
-5. If the user chose `Yes, render Miro`, for each returned entry, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
+5. If the user chose `Yes, render Miro`, for each returned entry, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id. Use `AskUserQuestions` only for these single-select mode choices:
 
    - prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
    - options:
@@ -48,7 +48,12 @@ curl -sS -X POST "http://localhost:3002/snapshot" \
      - `AI generated annotations`
      - `Manual and AI generated annotations`
 
-6. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
+6. For every entry whose selected mode includes manual annotation, collect the manual annotation as a normal chat reply, not through `AskUserQuestions`.
+
+   - Do not use an `Other` choice, custom answer field, or any question form for the annotation text.
+   - Send a normal message like: `Enter your manual annotation for <branchId> (<summary>):`
+   - Wait for the user's reply and use the full reply text as that entry's `annotation`.
+   - If the user sends an empty reply or explicitly says to skip, omit only that manual note and continue. Do not abort the whole flow because a manual annotation was skipped.
 
 7. Apply the per-screenshot choices and render Miro once:
 
