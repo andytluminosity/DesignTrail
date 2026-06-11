@@ -239,9 +239,10 @@ await createDesignSnapshot({
 ```
 
 Set `syncMiro: false` to capture and persist locally without creating/updating
-Miro items. If an integration needs to ask the user after screenshots are known, capture first
-with `defaultAnnotationMode: "skip"` and `syncMiro: false`, then apply choices through the
-snapshot annotation update API before rendering Miro.
+Miro items. Commit integrations should ask whether to render Miro before capture starts:
+local-only runs can use `defaultAnnotationMode: "skip"` and `syncMiro: false`, while render
+runs should pass the desired annotation choices during the same capture so the board is drawn
+once at the end.
 
 ## LLM output contract
 
@@ -301,7 +302,7 @@ system never crashes a commit.
 | `CAPTURE_PUBLIC_URL` / `PUBLIC_CAPTURE_URL` | `CAPTURE_URL` | Public base URL Miro uses to fetch saved screenshots. |
 | `DESIGNTRAIL_ANNOTATION_CHOICES` | (optional) | JSON array of per-node annotation choices for non-interactive hook runs. |
 | `DESIGNTRAIL_DEFAULT_ANNOTATION_MODE` | `ai` | Default mode for screenshots without an explicit choice (`skip`, `manual`, `ai`, `manual_and_ai`). |
-| `DESIGNTRAIL_SYNC_MIRO` | `true` | Set to `false` to capture without rendering Miro until choices are applied. |
+| `DESIGNTRAIL_SYNC_MIRO` | `true` | Set to `false` to capture into SQLite without rendering Miro. |
 
 Read from `.env` in the DesignTrail root, regardless of which repo triggered the hook.
 

@@ -3,14 +3,11 @@
 When the user asks Claude to create a Git commit, use the DesignTrail commit flow instead of running `git commit` directly.
 
 1. Run the `/commit-design` command flow.
-2. Let the post-commit hook capture screenshots with annotations and Miro rendering deferred.
-3. Ask the user which annotation mode to use for each returned screenshot/component:
-   - Skip annotations
-   - Manually add annotation
-   - AI generated annotations
-   - Manual and AI generated annotations
-4. Apply the selected per-screenshot choices through DesignTrail so annotations attach to the correct node before Miro renders.
-5. Only fall back to a normal `git commit` if the user explicitly asks to bypass DesignTrail.
+2. Before any other prompt, ask whether DesignTrail should render Miro for this commit.
+3. If the user chooses local-only, run the commit with DesignTrail capture enabled, annotation prompts skipped, and `DESIGNTRAIL_SYNC_MIRO=false` so data is stored in SQLite without rendering Miro.
+4. If the user chooses Miro rendering, let the post-commit hook ask for screenshot annotation choices during capture and render Miro once at the end.
+5. Do not call `/snapshot/annotations` after the commit unless the user explicitly asks for an after-the-fact annotation repair or backfill.
+6. Only fall back to a normal `git commit` if the user explicitly asks to bypass DesignTrail.
 
 DesignTrail uses two annotation layers:
 

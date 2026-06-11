@@ -1,5 +1,5 @@
 ---
-allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd), Bash(curl:*)
+allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd)
 description: Commit changes through DesignTrail with annotation options
 ---
 
@@ -15,7 +15,14 @@ Create a Git commit and let DesignTrail capture the resulting design snapshot.
 
 ## Workflow
 
-1. Inspect the working tree and staged changes before committing:
+1. Before any other questions, call `AskUserQuestions` with one single-select question:
+
+- prompt: `Should DesignTrail render the Miro board for this commit?`
+- options:
+  - `No, store locally only`
+  - `Yes, render Miro after capture`
+
+2. Inspect the working tree and staged changes before committing:
 
 ```bash
 git status --short
@@ -24,9 +31,9 @@ git diff --staged
 git log --oneline -5
 ```
 
-2. Stage only the files relevant to the user-requested commit.
+3. Stage only the files relevant to the user-requested commit.
 
-3. Run `git commit` with DesignTrail capture enabled but annotation/Miro rendering deferred:
+4. If the user chose `No, store locally only`, run `git commit` with DesignTrail capture enabled, annotation prompts disabled, and Miro rendering disabled:
 
 ```bash
 DESIGNTRAIL_SOURCE=claude \
@@ -36,41 +43,23 @@ DESIGNTRAIL_SYNC_MIRO=false \
 git commit -m "<commit message>"
 ```
 
-4. Read the DesignTrail hook output. For each returned screenshot/component, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
-
-- prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
-- options:
-  - `Skip annotations`
-  - `Manually add annotation`
-  - `AI generated annotations`
-  - `Manual and AI generated annotations`
-
-5. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
-
-6. Apply the per-screenshot choices and render Miro:
+5. If the user chose `Yes, render Miro after capture`, run `git commit` with DesignTrail Miro rendering enabled and allow the post-commit hook to ask for per-screenshot annotation choices during the capture:
 
 ```bash
-curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "repoPath": "<absolute-repo-path>",
-    "commitHash": "<commit-hash>",
-    "annotationChoices": [
-      {
-        "nodeId": "<entry-node-id>",
-        "mode": "skip|manual|ai|manual_and_ai",
-        "annotation": "<manual annotation when present>"
-      }
-    ],
-    "syncMiro": true
-  }'
+DESIGNTRAIL_SOURCE=claude \
+DESIGNTRAIL_SKIP_PROMPT=0 \
+DESIGNTRAIL_DEFAULT_ANNOTATION_MODE=ai \
+DESIGNTRAIL_SYNC_MIRO=true \
+git commit -m "<commit message>"
 ```
 
-7. After the annotation update completes, summarize:
+Do not call `POST /snapshot/annotations` after this commit. The hook has already applied annotation choices and, when requested, rendered the board once.
+
+6. After the hook completes, summarize:
 
 - Commit hash and message.
 - Each screenshot/component's annotation mode.
-- Whether the post-commit hook reported a successful capture and whether Miro synced.
+- Whether the post-commit hook reported a successful capture and whether Miro rendered.
 
 ## Safety
 
