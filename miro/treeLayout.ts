@@ -57,8 +57,8 @@ export type LayoutResult = Map<string, MiroPosition>;
  * margin nearest its element. Notes are bucketed by the closest edge, then
  * spaced apart along that edge so they don't overlap, while staying aligned to
  * the element they describe. Each item also carries the relative point on the
- * image (e.g. "42%") a connector should point at. Shared by the renderer (to
- * draw notes) and by computeClusterFootprint (to size the cluster).
+ * image (e.g. "42%") a connector should point at. Used by the renderer to draw
+ * the annotation notes inside each node box's reserved annotation border.
  */
 export function computeStickyLayout(
   imageCenter: MiroPosition,
@@ -142,53 +142,23 @@ export function computeStickyLayout(
 }
 
 /**
- * Computes the full on-board bounding box of one screenshot cluster: the image,
- * its diagonally-offset header note, and every per-element annotation note.
- * Coordinates are computed with the image centered at the origin, then collapsed
- * to width/height plus the image-center offset from the box's top-left corner.
+ * Sizes one screenshot's node box as a UNIFORM annotation-padded container:
+ * the image plus a full border wide/tall enough for a band of sticky notes on
+ * every side (worst case: the entire border populated with annotations). This is
+ * independent of where annotations actually land, so every node box is regular
+ * and the tree lays out cleanly. The reserved border also accommodates the
+ * diagonally-offset header note in the top-left corner. The image is centered in
+ * the box, so the box center coincides with the image center and aligning boxes
+ * on a level aligns the screenshots. `imageH` still comes from the PNG aspect
+ * ratio, so box heights vary per node while widths are constant.
  */
-export function computeClusterFootprint(
-  imageH: number,
-  placements: AnnotationPlacement[]
-): ClusterFootprint {
-  const center: MiroPosition = { x: 0, y: 0 };
-  const layout = computeStickyLayout(center, IMAGE_W, imageH, placements);
-
-  type Rect = { x: number; y: number; w: number; h: number };
-  const rects: Rect[] = [];
-
-  // Image, centered at the origin.
-  rects.push({ x: -IMAGE_W / 2, y: -imageH / 2, w: IMAGE_W, h: imageH });
-
-  // Header note: placed diagonally off the image's top-left corner.
-  const left = -IMAGE_W / 2;
-  const top = -imageH / 2;
-  rects.push({
-    x: left - NOTE_MARGIN - STICKY_W,
-    y: top - NOTE_MARGIN - STICKY_H,
-    w: STICKY_W,
-    h: STICKY_H,
-  });
-
-  // Per-element annotation notes.
-  for (const item of layout) {
-    rects.push({
-      x: item.position.x - STICKY_W / 2,
-      y: item.position.y - STICKY_H / 2,
-      w: STICKY_W,
-      h: STICKY_H,
-    });
-  }
-
-  const minX = Math.min(...rects.map((r) => r.x));
-  const minY = Math.min(...rects.map((r) => r.y));
-  const maxX = Math.max(...rects.map((r) => r.x + r.w));
-  const maxY = Math.max(...rects.map((r) => r.y + r.h));
-
+export function computeClusterFootprint(imageH: number): ClusterFootprint {
+  const padX = NOTE_MARGIN + STICKY_W;
+  const padY = NOTE_MARGIN + STICKY_H;
   return {
-    width: maxX - minX,
-    height: maxY - minY,
-    imageCenterOffset: { x: -minX, y: -minY },
+    width: IMAGE_W + 2 * padX,
+    height: imageH + 2 * padY,
+    imageCenterOffset: { x: padX + IMAGE_W / 2, y: padY + imageH / 2 },
     imageH,
   };
 }
@@ -236,13 +206,21 @@ function buildBranchTree(
     }
   }
 
+  // Child branches are ordered by creation time (then id) so the tree is
+  // deterministic and reads left-to-right in the order components forked.
+  const byCreatedThenId = (a: BranchRecord, b: BranchRecord): number =>
+    a.createdAt - b.createdAt || a.id.localeCompare(b.id);
+
   const build = (branch: BranchRecord): BranchLayout => {
+    // A branch's drawable screenshots form one chronological row on a single
+    // level (export order = chronological). Collapsed/unrenderable nodes have no
+    // box and are dropped; child branches still attach below regardless.
     const boxes = (nodesByBranch.get(branch.id) ?? [])
       .map((node) => boxById.get(node.id))
       .filter((box): box is NodeBox => box !== undefined);
     const kids = (childrenOf.get(branch.id) ?? [])
       .slice()
-      .sort((a, b) => a.id.localeCompare(b.id))
+      .sort(byCreatedThenId)
       .map(build);
     return { branchId: branch.id, boxes, children: kids };
   };
@@ -250,7 +228,7 @@ function buildBranchTree(
   const sortRoots = (a: BranchRecord, b: BranchRecord): number => {
     if (a.id === "main") return -1;
     if (b.id === "main") return 1;
-    return a.id.localeCompare(b.id);
+    return byCreatedThenId(a, b);
   };
 
   return roots.sort(sortRoots).map(build);

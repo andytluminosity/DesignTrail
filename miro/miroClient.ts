@@ -737,7 +737,7 @@ export async function renderBoardFromGraph(
       const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
-      const footprint = computeClusterFootprint(imageH, placements);
+      const footprint = computeClusterFootprint(imageH);
       return {
         node,
         imageH,

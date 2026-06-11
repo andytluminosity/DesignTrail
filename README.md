@@ -309,7 +309,7 @@ tracker/
   types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
 miro/
   miroClient.ts   clearBoard + renderBoardFromGraph: wipe the board and redraw the whole component tree
-  treeLayout.ts   computeClusterFootprint + planTreeLayout (LLM positions, validated, deterministic fallback)
+  treeLayout.ts   computeClusterFootprint (uniform annotation-padded box) + planTreeLayout (deterministic tidy tree)
   annotationPlacement.ts  Splits annotations into blocks + vision-places each on its screenshot
 src/core/
   snapshotService.ts  Reusable createDesignSnapshot(...) workflow entry point
@@ -360,17 +360,22 @@ append:
    content on the configured `MIRO_BOARD_ID`, so use a board dedicated to
    DesignTrail.) The wipe fully completes before any inserts begin.
 2. **Footprint.** For each iteration node with a screenshot, the image is sized at
-   a fixed width (height from the PNG's real aspect ratio) and its per-element
-   annotations are vision-placed ([miro/annotationPlacement.ts](miro/annotationPlacement.ts)).
-   `computeClusterFootprint` then measures the full bounding box of the cluster
-   (image + header note + every annotation note).
-3. **Layout.** `planTreeLayout` ([miro/treeLayout.ts](miro/treeLayout.ts)) assigns
-   each cluster a non-overlapping position so the screenshots assemble into the
-   component tree (branches nested under their parent, each branch's iterations in a
-   chronological row). An **LLM proposes the positions**; the proposal is accepted
-   only if it is complete, tree-shaped, and overlap-free (no screenshot or sticky
-   note overlapping anything), otherwise a deterministic tidy-tree layout is used so
-   the result is always clean.
+   a fixed width (height from the PNG's real aspect ratio). `computeClusterFootprint`
+   gives every node a **uniform annotation-padded box**: the image plus a border
+   wide/tall enough for a band of sticky notes on all four sides (worst case: the
+   whole border populated with annotations), independent of where annotations
+   actually land. The image is centered in the box, so box widths are constant and
+   only heights vary with aspect ratio. The per-element annotations are still
+   vision-placed ([miro/annotationPlacement.ts](miro/annotationPlacement.ts)) and
+   drawn inside that reserved border at draw time.
+3. **Layout.** `planTreeLayout` ([miro/treeLayout.ts](miro/treeLayout.ts)) lays the
+   boxes out as a deterministic, classic top-down tree. Tree depth comes from
+   component/branch nesting: a branch's screenshots form one chronological row on a
+   single level, and child branches sit on the level below, centered under their
+   parent. Each level is one horizontal band, so every screenshot on a level has its
+   image center aligned. Horizontal spacing is driven by each subtree's bounding
+   rectangle (`subtreeWidth = max(rowWidth, total child-subtree width + gaps)`), so
+   sibling subtrees never overlap and leaves end up evenly spaced.
 4. **Draw.** Each screenshot is placed with its header note and per-element
    annotation notes (each connected to the element it describes), then tree
    connectors are drawn: a chronological chain within each branch and a fork edge
