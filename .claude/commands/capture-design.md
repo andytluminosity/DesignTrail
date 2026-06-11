@@ -79,13 +79,15 @@ curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
 
 This `POST /snapshot/annotations` call is the only Miro render in the capture flow. Do not call it if the user chose local-only, and do not call `POST /snapshot` with `syncMiro: true` when asking annotation choices.
 
+The endpoint may return HTTP `202` with a `miroRenderJob` object instead of waiting for Miro to finish. Treat that as a successful queued render, not a failure. Do not re-run `POST /snapshot/annotations` if `miroRenderJob.status` is `running` or `miroRenderJob.alreadyRunning` is `true`; use `curl -sS "http://localhost:3002<statusUrl>"` to check the job status once if you need to report progress.
+
 8. If any response is not successful, show the returned error and stop.
 
 9. If the flow is successful, summarize:
    - Repository name and commit hash.
    - Commit message.
    - Screenshot count.
-   - Whether Miro rendered.
+   - Whether Miro rendered, queued, or was already running.
    - Each returned entry's `nodeId`, `branchId`, `type`, `summary`, `screenshotPath`, and annotation mode when present.
 
 ## Response Handling

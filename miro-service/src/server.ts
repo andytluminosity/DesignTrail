@@ -1,12 +1,14 @@
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
+import { randomUUID } from "crypto";
 import { writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
   applyDesignSnapshotAnnotations,
   createDesignSnapshot,
+  renderDesignSnapshotBoard,
 } from "../../src/core/snapshotService.js";
 import type { AnnotationChoice, AnnotationMode } from "../../tracker/types.js";
 
@@ -50,6 +52,76 @@ type ApplyAnnotationsRequestBody = {
   annotationChoices?: unknown;
   syncMiro?: unknown;
 };
+
+type MiroRenderJobStatus = "running" | "completed" | "failed";
+
+type MiroRenderJob = {
+  id: string;
+  repoPath: string;
+  commitHash?: string;
+  status: MiroRenderJobStatus;
+  startedAt: number;
+  finishedAt?: number;
+  renderedNodeCount?: number;
+  error?: string;
+};
+
+const miroRenderJobs = new Map<string, MiroRenderJob>();
+let activeMiroRenderJob: MiroRenderJob | null = null;
+
+function publicMiroRenderJob(job: MiroRenderJob): MiroRenderJob {
+  return { ...job };
+}
+
+function rememberMiroRenderJob(job: MiroRenderJob): void {
+  miroRenderJobs.set(job.id, job);
+  if (miroRenderJobs.size <= 25) return;
+
+  const oldestCompleted = [...miroRenderJobs.values()]
+    .filter((candidate) => candidate.status !== "running")
+    .sort((a, b) => a.startedAt - b.startedAt)[0];
+  if (oldestCompleted) miroRenderJobs.delete(oldestCompleted.id);
+}
+
+function startMiroRenderJob(params: {
+  repoPath: string;
+  commitHash?: string;
+}): { job: MiroRenderJob; alreadyRunning: boolean } {
+  if (activeMiroRenderJob?.status === "running") {
+    return { job: publicMiroRenderJob(activeMiroRenderJob), alreadyRunning: true };
+  }
+
+  const job: MiroRenderJob = {
+    id: randomUUID(),
+    repoPath: path.resolve(params.repoPath),
+    commitHash: params.commitHash,
+    status: "running",
+    startedAt: Date.now(),
+  };
+  activeMiroRenderJob = job;
+  rememberMiroRenderJob(job);
+
+  void renderDesignSnapshotBoard({ repoPath: job.repoPath })
+    .then((nodes) => {
+      job.status = "completed";
+      job.finishedAt = Date.now();
+      job.renderedNodeCount = nodes.length;
+      console.log(
+        `Miro render job ${job.id} completed with ${nodes.length} rendered node(s).`
+      );
+    })
+    .catch((error) => {
+      job.status = "failed";
+      job.finishedAt = Date.now();
+      job.error = error instanceof Error ? error.message : String(error);
+      console.error(`Miro render job ${job.id} failed:`, job.error);
+    })
+    .finally(() => {
+      if (activeMiroRenderJob?.id === job.id) activeMiroRenderJob = null;
+    });
+
+  return { job: publicMiroRenderJob(job), alreadyRunning: false };
+}
 
 function normalizeOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -227,17 +299,26 @@ app.post("/snapshot", async (req, res) => {
   }
 
   try {
+    const resolvedRepoPath = path.resolve(repoPath.trim());
+    const shouldRenderMiro = syncMiro !== false;
     const result = await createDesignSnapshot({
-      repoPath,
+      repoPath: resolvedRepoPath,
       annotation: normalizedAnnotation,
       annotationChoices: normalizedChoices,
       defaultAnnotationMode: normalizedDefaultMode,
       generateAiAnnotations,
       source: normalizedSource ?? "claude",
-      syncMiro,
+      syncMiro: false,
     });
+    const miroRender =
+      shouldRenderMiro
+        ? startMiroRenderJob({
+            repoPath: result.repoPath,
+            commitHash: result.commit.hash,
+          })
+        : null;
 
-    return res.json({
+    return res.status(miroRender ? 202 : 200).json({
       success: true,
       commit: {
         hash: result.commit.hash,
@@ -249,7 +330,16 @@ app.post("/snapshot", async (req, res) => {
       repoPath: result.repoPath,
       entries: result.entries,
       screenshotCount: result.screenshots.length,
-      miroSynced: result.miroNodes.length > 0,
+      miroSynced: false,
+      ...(miroRender
+        ? {
+            miroRenderJob: {
+              ...miroRender.job,
+              alreadyRunning: miroRender.alreadyRunning,
+              statusUrl: `/miro/render-jobs/${miroRender.job.id}`,
+            },
+          }
+        : {}),
     });
   } catch (error) {
     console.error("Snapshot creation failed:", error);
@@ -294,14 +384,23 @@ app.post("/snapshot/annotations", async (req, res) => {
   }
 
   try {
+    const resolvedRepoPath = path.resolve(repoPath.trim());
     const result = await applyDesignSnapshotAnnotations({
-      repoPath,
+      repoPath: resolvedRepoPath,
       commitHash: normalizedCommitHash,
       annotationChoices: normalizedChoices,
-      syncMiro,
+      syncMiro: false,
     });
+    const shouldRenderMiro = syncMiro !== false;
+    const miroRender =
+      shouldRenderMiro
+        ? startMiroRenderJob({
+            repoPath: result.repoPath,
+            commitHash: result.commit.hash,
+          })
+        : null;
 
-    return res.json({
+    return res.status(miroRender ? 202 : 200).json({
       success: true,
       commit: {
         hash: result.commit.hash,
@@ -313,7 +412,16 @@ app.post("/snapshot/annotations", async (req, res) => {
       repoPath: result.repoPath,
       entries: result.entries,
       screenshotCount: result.screenshots.length,
-      miroSynced: result.miroNodes.length > 0,
+      miroSynced: false,
+      ...(miroRender
+        ? {
+            miroRenderJob: {
+              ...miroRender.job,
+              alreadyRunning: miroRender.alreadyRunning,
+              statusUrl: `/miro/render-jobs/${miroRender.job.id}`,
+            },
+          }
+        : {}),
     });
   } catch (error) {
     console.error("Snapshot annotation update failed:", error);
@@ -323,6 +431,21 @@ app.post("/snapshot/annotations", async (req, res) => {
         error instanceof Error ? error.message : "Snapshot annotation update failed",
     });
   }
+});
+
+app.get("/miro/render-jobs/:jobId", (req, res) => {
+  const job = miroRenderJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: `No Miro render job found for ${req.params.jobId}`,
+    });
+  }
+
+  return res.json({
+    success: true,
+    job: publicMiroRenderJob(job),
+  });
 });
 
 app.post("/test-node", async (req, res) => {

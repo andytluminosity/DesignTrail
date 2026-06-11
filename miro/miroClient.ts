@@ -9,7 +9,6 @@ import type {
   IterationNode,
 } from "../tracker/types.js";
 import {
-  classifyAnnotationVisuals,
   parseAnnotationBlocks,
   placeAnnotations,
   readPngDimensions,
@@ -1243,21 +1242,24 @@ export async function renderBoardFromGraph(
         ? [{ index: 1, x: 1, y: 0.5 }]
         : [];
       const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
-      const visualChoices =
-        blocks.length > 0 ? await classifyAnnotationVisuals(blocks) : null;
-      const visualChoiceByIndex = new Map(
-        (visualChoices ?? []).map((choice) => [choice.index, choice] as const)
+      const markPlans =
+        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
+      const markPlanByIndex = new Map(
+        markPlans.map((plan) => [plan.index, plan] as const)
       );
       const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => {
-        const visualChoice = visualChoiceByIndex.get(block.index);
+        const markPlan = markPlanByIndex.get(block.index);
         return {
           ...block,
-          visual: visualChoice?.visual ?? "sticky",
-          labelText: visualChoice?.labelText || block.label,
+          visual: markPlan?.visual ?? "sticky",
+          labelText: markPlan?.labelText || block.label,
         };
       });
-      const placements =
-        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
+      const placements: AnnotationPlacement[] = markPlans.map(({ index, x, y }) => ({
+        index,
+        x,
+        y,
+      }));
       const footprint = computeClusterFootprint(imageH, [
         ...manualPlacements,
         ...placements,

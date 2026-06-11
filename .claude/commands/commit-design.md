@@ -85,11 +85,13 @@ curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
 
 This `POST /snapshot/annotations` call is the only Miro render in the commit flow. Do not call it if the user chose local-only, and do not run the commit hook with `DESIGNTRAIL_SYNC_MIRO=true`.
 
+The endpoint may return HTTP `202` with a `miroRenderJob` object instead of waiting for Miro to finish. Treat that as a successful queued render, not a failure. Do not re-run `POST /snapshot/annotations` if `miroRenderJob.status` is `running` or `miroRenderJob.alreadyRunning` is `true`; use `curl -sS "http://localhost:3002<statusUrl>"` to check the job status once if you need to report progress.
+
 9. After the hook and optional annotation update complete, summarize:
 
 - Commit hash and message.
 - Each screenshot/component's annotation mode.
-- Whether the post-commit hook reported a successful capture and whether Miro rendered.
+- Whether the post-commit hook reported a successful capture and whether Miro rendered, queued, or was already running.
 
 ## Safety
 

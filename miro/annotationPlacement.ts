@@ -18,18 +18,17 @@ export type AnnotationBlock = {
 
 export type AnnotationVisual = "text" | "sticky";
 
-export type AnnotationVisualChoice = {
-  index: number;
-  visual: AnnotationVisual;
-  labelText?: string;
-};
-
 // Normalized location of an annotation's target element on the screenshot,
 // where x/y are in [0, 1] relative to the image's top-left corner.
 export type AnnotationPlacement = {
   index: number;
   x: number;
   y: number;
+};
+
+export type AnnotationMarkPlan = AnnotationPlacement & {
+  visual: AnnotationVisual;
+  labelText?: string;
 };
 
 export type ImageDimensions = {
@@ -127,32 +126,24 @@ async function toDataUrl(absPath: string): Promise<string | null> {
   }
 }
 
-const PLACEMENT_SYSTEM_PROMPT = `You are a UI annotation tool. You are given a UI screenshot and a numbered list of annotations, each describing one element/section of that screenshot.
+const ANNOTATION_MARK_SYSTEM_PROMPT = `You are planning design annotations for a Miro design review board.
 
-For EACH annotation, return the normalized location of the element it describes, where x and y are floats in [0, 1] relative to the screenshot's top-left corner (x grows right, y grows down). Use the CENTER of the element the annotation is about.
+You are given a UI screenshot and a numbered list of annotations, each describing one element/section of that screenshot.
+
+For EACH annotation:
+1. Locate the element it describes on the screenshot. Return normalized x/y floats in [0, 1] relative to the screenshot's top-left corner (x grows right, y grows down). Use the CENTER of the element the annotation is about.
+2. Decide whether it should render as:
+   - "text": a direct label or factual callout attached to a UI element. Use this for short, descriptive observations such as what changed, what an element is, or where something moved.
+   - "sticky": a review/comment note. Use this for opinions, rationale, concerns, questions, recommendations, tradeoffs, TODOs, or anything that reads like feedback from a reviewer.
 
 Return STRICT JSON in exactly this shape, with one entry per annotation index given to you:
-{ "placements": [ { "index": <number>, "x": <number 0..1>, "y": <number 0..1> } ] }
+{ "annotations": [ { "index": <number>, "x": <number 0..1>, "y": <number 0..1>, "visual": "text" | "sticky", "labelText": "<short label when visual is text>" } ] }
 
 Rules:
 - Output ONLY the JSON object. No prose, no markdown.
 - Include every index you were given exactly once.
-- If you cannot locate an element, estimate the most plausible position; never omit an index.`;
-
-const VISUAL_CLASSIFICATION_SYSTEM_PROMPT = `You are classifying design annotations for a Miro design review board.
-
-Each annotation describes something about a UI screenshot. Decide whether each annotation should render as:
-
-- "text": a direct label or factual callout attached to a UI element. Use this for short, descriptive observations such as what changed, what an element is, or where something moved.
-- "sticky": a review/comment note. Use this for opinions, rationale, concerns, questions, recommendations, tradeoffs, TODOs, or anything that reads like feedback from a reviewer.
-
-Return STRICT JSON in exactly this shape, with one entry per annotation index given to you:
-{ "annotations": [ { "index": <number>, "visual": "text" | "sticky", "labelText": "<short label when visual is text>" } ] }
-
-Rules:
-- Output ONLY the JSON object. No prose, no markdown.
-- Include every annotation index exactly once.
 - Use only "text" or "sticky" for visual.
+- If you cannot locate an element, estimate the most plausible position; never omit an index.
 - Prefer "text" for concise element labels and factual change descriptions.
 - Prefer "sticky" for longer explanations, subjective judgments, risks, open questions, or action items.
 - When visual is "text", write labelText as a label, not a sentence or paragraph: 2-5 words, under 40 characters, no trailing period.
@@ -180,17 +171,21 @@ function normalizeLabelText(value: unknown, fallback: string): string {
 }
 
 /**
- * Asks the model whether each generated annotation is an element label/callout
- * (`text`) or review/comment content (`sticky`). Returns null on model failures;
- * callers should default AI annotations to sticky notes in that case.
+ * Asks one vision model call to both locate each annotation block on the
+ * screenshot and choose whether it should render as label text or a sticky note.
+ * Returns null on failures so callers can fall back to a single combined note.
  */
-export async function classifyAnnotationVisuals(
+export async function placeAnnotations(
+  absPngPath: string,
   blocks: AnnotationBlock[]
-): Promise<AnnotationVisualChoice[] | null> {
+): Promise<AnnotationMarkPlan[] | null> {
   if (blocks.length === 0) return null;
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
+
+  const dataUrl = await toDataUrl(absPngPath);
+  if (!dataUrl) return null;
 
   const blockList = blocks
     .map((block) => `[${block.index}] ${block.text}`)
@@ -202,88 +197,13 @@ export async function classifyAnnotationVisuals(
       model: VISION_MODEL,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: VISUAL_CLASSIFICATION_SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: `Classify these ${blocks.length} annotation(s):\n${blockList}`,
-        },
-      ],
-    });
-
-    const content = completion.choices[0]?.message?.content?.trim();
-    if (!content) return null;
-
-    const parsed = JSON.parse(content) as {
-      annotations?: Array<{ index?: unknown; visual?: unknown; labelText?: unknown }>;
-    };
-    if (!Array.isArray(parsed.annotations)) return null;
-
-    const choiceByIndex = new Map<number, AnnotationVisualChoice>();
-    for (const raw of parsed.annotations) {
-      const index = Number(raw.index);
-      if (!Number.isFinite(index) || !isAnnotationVisual(raw.visual)) continue;
-      choiceByIndex.set(index, {
-        index,
-        visual: raw.visual,
-        labelText:
-          raw.visual === "text"
-            ? normalizeLabelText(raw.labelText, "")
-            : undefined,
-      });
-    }
-
-    return blocks.map((block) => {
-      const choice = choiceByIndex.get(block.index);
-      const visual = choice?.visual ?? "sticky";
-      return {
-        index: block.index,
-        visual,
-        labelText:
-          visual === "text"
-            ? normalizeLabelText(choice?.labelText, block.label)
-            : undefined,
-      };
-    });
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Asks a vision model to locate each annotation block on the screenshot,
- * returning a normalized (x, y) per block. Returns null on any failure (missing
- * API key, unreadable image, network/parse error) so callers can fall back to a
- * single combined note instead of breaking the upload.
- */
-export async function placeAnnotations(
-  absPngPath: string,
-  blocks: AnnotationBlock[]
-): Promise<AnnotationPlacement[] | null> {
-  if (blocks.length === 0) return null;
-
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-
-  const dataUrl = await toDataUrl(absPngPath);
-  if (!dataUrl) return null;
-
-  const blockList = blocks
-    .map((block) => `[${block.index}] ${block.label}`)
-    .join("\n");
-
-  try {
-    const client = new OpenAI({ apiKey });
-    const completion = await client.chat.completions.create({
-      model: VISION_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: PLACEMENT_SYSTEM_PROMPT },
+        { role: "system", content: ANNOTATION_MARK_SYSTEM_PROMPT },
         {
           role: "user",
           content: [
             {
               type: "text",
-              text: `Locate these ${blocks.length} annotation(s) on the screenshot:\n${blockList}`,
+              text: `Plan these ${blocks.length} annotation mark(s) on the screenshot:\n${blockList}`,
             },
             { type: "image_url", image_url: { url: dataUrl } },
           ],
@@ -295,26 +215,49 @@ export async function placeAnnotations(
     if (!content) return null;
 
     const parsed = JSON.parse(content) as {
-      placements?: Array<{ index?: unknown; x?: unknown; y?: unknown }>;
+      annotations?: Array<{
+        index?: unknown;
+        x?: unknown;
+        y?: unknown;
+        visual?: unknown;
+        labelText?: unknown;
+      }>;
     };
-    if (!Array.isArray(parsed.placements)) return null;
+    if (!Array.isArray(parsed.annotations)) return null;
 
-    const byIndex = new Map<number, AnnotationPlacement>();
-    for (const raw of parsed.placements) {
+    const byIndex = new Map<number, AnnotationMarkPlan>();
+    for (const raw of parsed.annotations) {
       const index = Number(raw.index);
       const x = Number(raw.x);
       const y = Number(raw.y);
       if (!Number.isFinite(index)) continue;
-      byIndex.set(index, { index, x: clamp01(x), y: clamp01(y) });
+      const visual = isAnnotationVisual(raw.visual) ? raw.visual : "sticky";
+      byIndex.set(index, {
+        index,
+        x: clamp01(x),
+        y: clamp01(y),
+        visual,
+        labelText:
+          visual === "text" ? normalizeLabelText(raw.labelText, "") : undefined,
+      });
     }
 
-    // Guarantee one placement per block; fill any gaps with a safe center
-    // estimate so the caller always gets a complete set.
-    const placements = blocks.map(
-      (block) =>
-        byIndex.get(block.index) ?? { index: block.index, x: 0.5, y: 0.5 }
-    );
-    return placements;
+    // Guarantee one mark plan per block; fill any gaps with a safe center
+    // estimate and sticky-note default.
+    return blocks.map((block) => {
+      const plan = byIndex.get(block.index);
+      const visual = plan?.visual ?? "sticky";
+      return {
+        index: block.index,
+        x: plan?.x ?? 0.5,
+        y: plan?.y ?? 0.5,
+        visual,
+        labelText:
+          visual === "text"
+            ? normalizeLabelText(plan?.labelText, block.label)
+            : undefined,
+      };
+    });
   } catch {
     return null;
   }

@@ -72,6 +72,10 @@ export type ApplyDesignSnapshotAnnotationsOptions = {
   syncMiro?: boolean;
 };
 
+export type RenderDesignSnapshotBoardOptions = {
+  repoPath?: string;
+};
+
 /**
  * How to re-screenshot an ancestor branch whose stored target is missing
  * (legacy branches created before per-branch target persistence). main -> full
@@ -893,4 +897,38 @@ export async function applyDesignSnapshotAnnotations(
     })),
     miroNodes,
   };
+}
+
+export async function renderDesignSnapshotBoard(
+  options: RenderDesignSnapshotBoardOptions = {}
+): Promise<RenderedBoardNode[]> {
+  const repoPath = path.resolve(options.repoPath ?? process.cwd());
+  const repoName = await getRepoName(repoPath);
+  const graph = await DesignGraph.load(repoName);
+
+  let boardExport: {
+    branches: BranchRecord[];
+    nodes: IterationNode[];
+    commits: Map<string, CommitData>;
+    annotations: AnnotationRecord[];
+  };
+
+  try {
+    const graphSnapshot = graph.exportGraph();
+    boardExport = {
+      branches: graphSnapshot.branches,
+      nodes: graphSnapshot.nodes,
+      commits: graph.getCommits(),
+      annotations: graphSnapshot.annotations,
+    };
+  } finally {
+    graph.close();
+  }
+
+  return renderBoardFromGraph(
+    boardExport.branches,
+    boardExport.nodes,
+    boardExport.commits,
+    boardExport.annotations
+  );
 }
