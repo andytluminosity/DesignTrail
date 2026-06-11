@@ -150,8 +150,7 @@ export function computeStickyLayout(
  */
 export function computeClusterFootprint(
   imageH: number,
-  placements: AnnotationPlacement[] = [],
-  includeManualAnnotation = false
+  placements: AnnotationPlacement[] = []
 ): ClusterFootprint {
   const center: MiroPosition = { x: 0, y: 0 };
   const layout = computeStickyLayout(center, IMAGE_W, imageH, placements);
@@ -171,17 +170,6 @@ export function computeClusterFootprint(
     w: STICKY_W,
     h: STICKY_H,
   });
-
-  // Manual/user annotation note: placed diagonally off the image's top-right
-  // corner so it is visually distinct from generated per-element annotations.
-  if (includeManualAnnotation) {
-    rects.push({
-      x: IMAGE_W / 2 + NOTE_MARGIN,
-      y: top - NOTE_MARGIN - STICKY_H,
-      w: STICKY_W,
-      h: STICKY_H,
-    });
-  }
 
   // Per-element annotation notes.
   for (const item of layout) {

@@ -712,6 +712,8 @@ type PreparedNode = {
   imageH: number;
   blocks: AnnotationBlock[];
   manualAnnotation: string;
+  manualBlocks: AnnotationBlock[];
+  manualPlacements: AnnotationPlacement[];
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
@@ -785,13 +787,18 @@ export async function renderBoardFromGraph(
       const aiAnnotation = manualAnnotation
         ? ""
         : getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+      const manualBlocks: AnnotationBlock[] = manualAnnotation
+        ? [{ index: 1, label: manualAnnotation, text: manualAnnotation }]
+        : [];
+      const manualPlacements: AnnotationPlacement[] = manualAnnotation
+        ? [{ index: 1, x: 1, y: 0.5 }]
+        : [];
       const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
       const footprint = computeClusterFootprint(
         imageH,
-        placements,
-        Boolean(manualAnnotation)
+        [...manualPlacements, ...placements]
       );
       return {
         node,
@@ -799,6 +806,8 @@ export async function renderBoardFromGraph(
         imageH,
         blocks,
         manualAnnotation,
+        manualBlocks,
+        manualPlacements,
         placements,
         footprint,
         url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
@@ -946,18 +955,15 @@ export async function renderBoardFromGraph(
 
       if (p.manualAnnotation) {
         noteWork.push(
-          createMiroStickyNote({
+          uploadAnnotationNotes({
             accessToken,
             boardId,
-            content: p.manualAnnotation,
-            position: {
-              x: imageCenter.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
-              y: top - NOTE_MARGIN - STICKY_H / 2,
-            },
-            width: STICKY_W,
-          }).catch((error: unknown) =>
-            console.error("Failed to place manual annotation note:", getErrorMessage(error))
-          )
+            imageItemId,
+            imageCenter,
+            imageH: p.imageH,
+            blocks: p.manualBlocks,
+            placements: p.manualPlacements,
+          })
         );
       }
 
