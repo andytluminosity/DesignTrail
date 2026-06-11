@@ -973,14 +973,13 @@ async function drawTree(args: DrawTreeArgs): Promise<{
 
 /**
  * Wipes the board and re-renders the ENTIRE design-evolution graph as TWO spatial
- * component trees side by side: the full-history tree (every iteration node), and
- * a significance-pruned tree drawn to its right where screenshots that are only a
- * minor change from their parent have been hidden (children re-anchored upward,
- * leaves preserved). Each node draws its screenshot, header note, and per-element
- * annotation notes; tree connectors show per-branch chronology and branch forks.
- * Positions come from planTreeLayout so each tree is non-overlapping, and the
- * pruned tree is offset past the first so the two never touch. Called fresh on
- * every render so the board always reflects the full, current graph.
+ * component trees side by side: a significance-pruned tree first (where screenshots
+ * that are only a minor change from their parent have been hidden), then the
+ * full-history tree to its right. Children re-anchor upward in the pruned tree and
+ * leaves are preserved. Each node draws its screenshot, header note, and
+ * per-element annotation notes; tree connectors show per-branch chronology and
+ * branch forks. Positions come from planTreeLayout so each tree is non-overlapping.
+ * Called fresh on every render so the board always reflects the full, current graph.
  */
 export async function renderBoardFromGraph(
   branches: BranchRecord[],
@@ -1042,22 +1041,9 @@ export async function renderBoardFromGraph(
   // Wipe the whole board so the re-render starts from a clean slate.
   await clearBoard(accessToken, boardId);
 
-  // Tree 1: the full design-evolution history exactly as stored.
-  const full = await drawTree({
-    accessToken,
-    boardId,
-    branches,
-    nodes,
-    prepared,
-    commitsByHash,
-    offsetX: 0,
-    keyPrefix: "",
-    title: "Full history",
-  });
-
-  // Tree 2: the significance-pruned view. Compute the prune plan (one vision call
+  // Tree 1: the significance-pruned view. Compute the prune plan (one vision call
   // per hierarchy level band), apply it to IN-MEMORY graph copies (the DB is
-  // never touched), and draw the surviving nodes to the right of the first tree.
+  // never touched), and draw the surviving nodes first.
   const prunePlan = await planSignificancePrune(branches, nodes, DESIGNTRAIL_ROOT);
   const { branches: prunedBranches, nodes: prunedNodes } = applySignificancePrune(
     branches,
@@ -1074,15 +1060,29 @@ export async function renderBoardFromGraph(
     nodes: prunedNodes,
     prepared: prunedPrepared,
     commitsByHash,
-    offsetX: full.maxRight + TREE_GAP,
+    offsetX: 0,
     keyPrefix: "pruned:",
     title: "Significant changes only",
   });
 
-  const rendered = [...full.rendered, ...pruned.rendered];
+  // Tree 2: the full design-evolution history exactly as stored, placed to the
+  // right of the compressed tree.
+  const full = await drawTree({
+    accessToken,
+    boardId,
+    branches,
+    nodes,
+    prepared,
+    commitsByHash,
+    offsetX: pruned.maxRight + TREE_GAP,
+    keyPrefix: "",
+    title: "Full history",
+  });
+
+  const rendered = [...pruned.rendered, ...full.rendered];
   console.log(
-    `Miro board re-rendered: full history (${full.rendered.length}) and ` +
-      `significant-changes (${pruned.rendered.length}) trees.`
+    `Miro board re-rendered: significant-changes (${pruned.rendered.length}) and ` +
+      `full history (${full.rendered.length}) trees.`
   );
 
   return rendered;
