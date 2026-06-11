@@ -270,24 +270,6 @@ function buildBranchTree(
   return roots.sort(sortRoots).map(build);
 }
 
-/**
- * Removes branches that have no drawable boxes (their screenshots were collapsed
- * as byte-identical duplicates, or are otherwise undrawable) by PROMOTING their
- * children up to take the empty branch's place: each promoted child re-anchors to
- * the node the empty branch itself forked from, so the chain stays attached at the
- * right level instead of leaving a gap. Applied bottom-up so chains of empty
- * branches collapse cleanly.
- */
-function promoteCollapsedBranches(branches: BranchLayout[]): BranchLayout[] {
-  return branches.flatMap((branch) => {
-    const children = promoteCollapsedBranches(branch.children);
-    if (branch.boxes.length === 0) {
-      return children.map((child) => ({ ...child, forkNodeId: branch.forkNodeId }));
-    }
-    return [{ ...branch, children }];
-  });
-}
-
 function stripHeight(branch: BranchLayout): number {
   return branch.boxes.reduce((max, box) => Math.max(max, box.height), 0);
 }
@@ -508,6 +490,9 @@ export async function planTreeLayout(
 ): Promise<TreePlan> {
   const boxById = new Map(boxes.map((box) => [box.id, box]));
   const nodesByBranch = groupNodesByBranch(nodes);
-  const roots = promoteCollapsedBranches(buildBranchTree(branches, nodesByBranch, boxById));
+  // The stored graph is already pruned at save time, so the branch tree is drawn
+  // as-is; the inline empty-branch guards below remain only as defensive handling
+  // for a branch whose screenshot files are missing on disk at render time.
+  const roots = buildBranchTree(branches, nodesByBranch, boxById);
   return { positions: tidyTreeLayout(roots), forkEdges: collectForkEdges(roots) };
 }

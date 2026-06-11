@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   annotation      TEXT,
   type            TEXT,
   screenshot_path TEXT,
+  screenshot_hash TEXT,
   timestamp       INTEGER NOT NULL,
   geom_x          REAL,
   geom_y          REAL,
@@ -85,6 +86,7 @@ type NodeRow = {
   annotation: string | null;
   type: string;
   screenshot_path: string;
+  screenshot_hash: string | null;
   timestamp: number;
   geom_x: number | null;
   geom_y: number | null;
@@ -233,12 +235,14 @@ export class DesignGraph {
     if (!nodeCols.includes("annotation")) {
       db.exec(`ALTER TABLE nodes ADD COLUMN annotation TEXT`);
     }
-
     const annotationCols = (db.prepare(`PRAGMA table_info(annotations)`).all() as {
       name: string;
     }[]).map((c) => c.name);
     if (!annotationCols.includes("color")) {
       db.exec(`ALTER TABLE annotations ADD COLUMN color TEXT`);
+    }
+    if (!nodeCols.includes("screenshot_hash")) {
+      db.exec(`ALTER TABLE nodes ADD COLUMN screenshot_hash TEXT`);
     }
   }
 
@@ -442,6 +446,44 @@ export class DesignGraph {
   deleteNode(id: string): void {
     this.db.prepare(`DELETE FROM annotations WHERE node_id = ?`).run(id);
     this.db.prepare(`DELETE FROM nodes WHERE id = ?`).run(id);
+  }
+
+  /**
+   * Removes a branch (e.g. one left node-less after duplicate collapse, whose
+   * children were promoted up to take its place). `main` is the root and is
+   * never removed.
+   */
+  deleteBranch(id: string): void {
+    if (id === MAIN_BRANCH) return;
+    this.db.prepare(`DELETE FROM branches WHERE id = ?`).run(id);
+  }
+
+  /** Stores the SHA-256 hash of a node's screenshot bytes for duplicate collapse. */
+  setNodeScreenshotHash(nodeId: string, hash: string): void {
+    this.db
+      .prepare(`UPDATE nodes SET screenshot_hash = @hash WHERE id = @id`)
+      .run({ id: nodeId, hash });
+  }
+
+  /** Every node's stored screenshot hash keyed by node id (null when unhashed). */
+  getNodeHashes(): Map<string, string | null> {
+    const rows = this.db
+      .prepare(`SELECT id, screenshot_hash FROM nodes`)
+      .all() as { id: string; screenshot_hash: string | null }[];
+    const map = new Map<string, string | null>();
+    for (const row of rows) map.set(row.id, row.screenshot_hash ?? null);
+    return map;
+  }
+
+  /**
+   * Repoints a node's parent (previous node on its branch). Used when a duplicate
+   * parent capture is collapsed away so the child re-anchors to the surviving
+   * node holding that screenshot.
+   */
+  setNodeParent(nodeId: string, parentId: string | null): void {
+    this.db
+      .prepare(`UPDATE nodes SET parent_id = @parentId WHERE id = @id`)
+      .run({ id: nodeId, parentId });
   }
 
   /** Stores the design annotation generated for a node's captured screenshot. */
