@@ -152,7 +152,8 @@ export async function createDesignSnapshot(
   options?: CreateDesignSnapshotOptions
 ): Promise<DesignSnapshotResult> {
   const repoPath = path.resolve(options?.repoPath ?? process.cwd());
-  const generateAiAnnotations = options?.generateAiAnnotations ?? true;
+  const manualAnnotation = normalizeOptional(options?.annotation);
+  const generateAiAnnotations = options?.generateAiAnnotations ?? !manualAnnotation;
   const { hash, message } = await getLatestCommit(repoPath);
   const diff = await getDiff(hash, repoPath);
   const repoName = await getRepoName(repoPath);
@@ -164,7 +165,7 @@ export async function createDesignSnapshot(
     timestamp: Date.now(),
     repoName,
     source: normalizeOptional(options?.source),
-    annotation: normalizeOptional(options?.annotation),
+    annotation: manualAnnotation,
   };
 
   const graph = await DesignGraph.load(repoName);

@@ -15,22 +15,15 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 ## Workflow
 
-1. Use the `AskUserQuestions` tool to ask exactly one single-select multiple-choice question. This first annotation-mode question must be rendered through the tool UI, not as a plain chat question or numbered text list:
-   - Skip annotations
-   - Manually add annotation
-   - AI generated annotations
-   - Manual and AI generated annotations
-
-Do not ask the user to type the option number or option label for this first question.
-
-2. If the user chose `Manually add annotation` or `Manual and AI generated annotations`, stop and ask this exact follow-up in normal chat:
-
-`Please type the manual DesignTrail annotation for this capture. I will wait for your reply before calling the snapshot API.`
-
-Do not use `AskUserQuestions` for this text entry. Do not run `curl` or any shell command until the user replies with the annotation text. Use the user's reply exactly as the request `annotation`.
-
-If the user chose `Skip annotations` or `AI generated annotations`, do not ask for manual annotation text.
-
+1. Call `AskUserQuestions` with exactly one single-select question:
+   - id: `annotationMode`
+   - prompt: `How should DesignTrail annotate this capture?`
+   - options:
+     - `Skip annotations`
+     - `Manually add annotation`
+     - `AI generated annotations`
+     - `Manual and AI generated annotations`
+2. If the user chose a manual annotation mode, ask for a short annotation describing the design intent behind the latest change.
 3. Resolve the absolute path of the current repository. Use the current working directory unless the user provides a different repo path.
 4. Send a POST request to `http://localhost:3002/snapshot`:
 

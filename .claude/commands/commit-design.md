@@ -24,26 +24,17 @@ git diff --staged
 git log --oneline -5
 ```
 
-2. Use the `AskUserQuestions` tool to ask exactly one single-select multiple-choice question. This first annotation-mode question must be rendered through the tool UI, not as a plain chat question or numbered text list.
+2. Call `AskUserQuestions` with exactly one single-select question:
 
-Question: `How should DesignTrail annotate this commit?`
+- id: `annotationMode`
+- prompt: `How should DesignTrail annotate this commit?`
+- options:
+  - `Skip annotations`
+  - `Manually add annotation`
+  - `AI generated annotations`
+  - `Manual and AI generated annotations`
 
-Options:
-
-- `Skip annotations`
-- `Manually add annotation`
-- `AI generated annotations`
-- `Manual and AI generated annotations`
-
-Do not ask the user to type the option number or option label for this first question.
-
-3. If the user chose `Manually add annotation` or `Manual and AI generated annotations`, stop and ask this exact follow-up in normal chat:
-
-`Please type the manual DesignTrail annotation for this commit. I will wait for your reply before staging or committing.`
-
-Do not use `AskUserQuestions` for this text entry. Do not run `git add`, `git commit`, or any other shell command until the user replies with the annotation text. Use the user's reply exactly as `DESIGNTRAIL_ANNOTATION`.
-
-If the user chose `Skip annotations` or `AI generated annotations`, do not ask for manual annotation text.
+3. If the user chose `Manually add annotation` or `Manual and AI generated annotations`, ask for a short manual annotation describing the design intent behind the change.
 
 4. Stage only the files relevant to the user-requested commit.
 

@@ -143,23 +143,65 @@ export function computeStickyLayout(
 }
 
 /**
- * Sizes one screenshot's node box as a UNIFORM annotation-padded container:
- * the image plus a full border wide/tall enough for a band of sticky notes on
- * every side (worst case: the entire border populated with annotations). This is
- * independent of where annotations actually land, so every node box is regular
- * and the tree lays out cleanly. The reserved border also accommodates the
- * diagonally-offset header note in the top-left corner. The image is centered in
- * the box, so the box center coincides with the image center and aligning boxes
- * on a level aligns the screenshots. `imageH` still comes from the PNG aspect
- * ratio, so box heights vary per node while widths are constant.
+ * Sizes one screenshot's node box from the actual things drawn around it: image,
+ * header sticky note, optional manual annotation note, and any generated
+ * per-element annotation notes. `imageCenterOffset` tells the renderer where the
+ * image center lands inside the returned bounding box.
  */
-export function computeClusterFootprint(imageH: number): ClusterFootprint {
-  const padX = NOTE_MARGIN + STICKY_W;
-  const padY = NOTE_MARGIN + STICKY_H;
+export function computeClusterFootprint(
+  imageH: number,
+  placements: AnnotationPlacement[] = [],
+  includeManualAnnotation = false
+): ClusterFootprint {
+  const center: MiroPosition = { x: 0, y: 0 };
+  const layout = computeStickyLayout(center, IMAGE_W, imageH, placements);
+
+  type Rect = { x: number; y: number; w: number; h: number };
+  const rects: Rect[] = [];
+
+  // Image, centered at the origin.
+  rects.push({ x: -IMAGE_W / 2, y: -imageH / 2, w: IMAGE_W, h: imageH });
+
+  // Header note: placed diagonally off the image's top-left corner.
+  const left = -IMAGE_W / 2;
+  const top = -imageH / 2;
+  rects.push({
+    x: left - NOTE_MARGIN - STICKY_W,
+    y: top - NOTE_MARGIN - STICKY_H,
+    w: STICKY_W,
+    h: STICKY_H,
+  });
+
+  // Manual/user annotation note: placed diagonally off the image's top-right
+  // corner so it is visually distinct from generated per-element annotations.
+  if (includeManualAnnotation) {
+    rects.push({
+      x: IMAGE_W / 2 + NOTE_MARGIN,
+      y: top - NOTE_MARGIN - STICKY_H,
+      w: STICKY_W,
+      h: STICKY_H,
+    });
+  }
+
+  // Per-element annotation notes.
+  for (const item of layout) {
+    rects.push({
+      x: item.position.x - STICKY_W / 2,
+      y: item.position.y - STICKY_H / 2,
+      w: STICKY_W,
+      h: STICKY_H,
+    });
+  }
+
+  const minX = Math.min(...rects.map((r) => r.x));
+  const minY = Math.min(...rects.map((r) => r.y));
+  const maxX = Math.max(...rects.map((r) => r.x + r.w));
+  const maxY = Math.max(...rects.map((r) => r.y + r.h));
+
   return {
-    width: IMAGE_W + 2 * padX,
-    height: imageH + 2 * padY,
-    imageCenterOffset: { x: padX + IMAGE_W / 2, y: padY + imageH / 2 },
+    width: maxX - minX,
+    height: maxY - minY,
+    imageCenterOffset: { x: -minX, y: -minY },
     imageH,
   };
 }

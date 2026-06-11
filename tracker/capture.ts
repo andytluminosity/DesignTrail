@@ -92,7 +92,7 @@ async function main(): Promise<void> {
   const annotation =
     envOptionalString("DESIGNTRAIL_ANNOTATION") ??
     (skipPrompt ? undefined : await promptForAnnotation());
-  const generateAiAnnotations = envBoolean("DESIGNTRAIL_AI_ANNOTATIONS", true);
+  const generateAiAnnotations = envBoolean("DESIGNTRAIL_AI_ANNOTATIONS", !annotation);
   const source = envOptionalString("DESIGNTRAIL_SOURCE") ?? "cli";
   const result = await createDesignSnapshot({
     repoPath,

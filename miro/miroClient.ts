@@ -576,8 +576,8 @@ export async function createConnector({
 
 /**
  * Builds a screenshot's HEADER sticky-note content: a per-component label
- * (short hash + branch, type, summary) plus the commit-level metadata (message,
- * source, commit annotation) for the commit this node belongs to.
+ * (short hash + branch, type, summary) plus commit-level metadata. Manual commit
+ * annotations render as their own designated sticky note, not hidden here.
  */
 function buildStickyContent(
   node: IterationNode,
@@ -591,7 +591,6 @@ function buildStickyContent(
   if (commit) {
     if (commit.message) lines.push(commit.message);
     if (commit.source) lines.push(`source: ${commit.source}`);
-    if (commit.annotation) lines.push(commit.annotation);
   }
   return lines.join("\n");
 }
@@ -676,8 +675,10 @@ const CHRONOLOGY_CONNECTOR_STYLE: MiroConnectorStyle = { strokeColor: "#ff0000" 
 // One screenshot node with everything precomputed for layout and drawing.
 type PreparedNode = {
   node: IterationNode;
+  aiAnnotation: string;
   imageH: number;
   blocks: AnnotationBlock[];
+  manualAnnotation: string;
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
@@ -733,15 +734,24 @@ export async function renderBoardFromGraph(
         hashFileBytes(absPng),
       ]);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const annotation = (node.annotation ?? "").trim();
-      const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
+      const manualAnnotation = (commitsByHash.get(node.commitHash)?.annotation ?? "").trim();
+      // A manual annotation is the user's chosen note for this commit, so it owns
+      // the annotation surface and suppresses generated AI sticky notes.
+      const aiAnnotation = manualAnnotation ? "" : (node.annotation ?? "").trim();
+      const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
-      const footprint = computeClusterFootprint(imageH);
+      const footprint = computeClusterFootprint(
+        imageH,
+        placements,
+        Boolean(manualAnnotation)
+      );
       return {
         node,
+        aiAnnotation,
         imageH,
         blocks,
+        manualAnnotation,
         placements,
         footprint,
         url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
@@ -749,11 +759,6 @@ export async function renderBoardFromGraph(
       };
     }
   );
-
-  if (prepared.length === 0) {
-    console.error("No renderable screenshots found for this repo; skipping Miro render.");
-    return [];
-  }
 
   // Collapse byte-identical screenshots so each unique image renders exactly
   // once. The first node (in chronological export order) holding a given image
@@ -784,8 +789,44 @@ export async function renderBoardFromGraph(
     console.log(`Collapsed ${collapsed} duplicate screenshot(s) into ${preparedToDraw.length} unique image(s).`);
   }
 
+  const drawnCommitHashes = new Set(preparedToDraw.map((p) => p.node.commitHash));
+  const standaloneManualCommits = [...commitsByHash.values()]
+    .map((commit) => ({
+      hash: commit.hash,
+      timestamp: commit.timestamp,
+      annotation: (commit.annotation ?? "").trim(),
+    }))
+    .filter((commit) => commit.annotation && !drawnCommitHashes.has(commit.hash))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  if (preparedToDraw.length === 0 && standaloneManualCommits.length === 0) {
+    console.error("No renderable screenshots found for this repo; skipping Miro render.");
+    return [];
+  }
+
   // Wipe the whole board so the re-render starts from a clean slate.
   await clearBoard(accessToken, boardId);
+
+  if (preparedToDraw.length === 0) {
+    await Promise.all(
+      standaloneManualCommits.map((commit, index) =>
+        createMiroStickyNote({
+          accessToken,
+          boardId,
+          content: commit.annotation,
+          position: {
+            x: 0,
+            y: index * (STICKY_H + NOTE_MARGIN),
+          },
+          width: STICKY_W,
+        }).catch((error: unknown) =>
+          console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
+        )
+      )
+    );
+    console.log(`Miro board re-rendered: 0 screenshot(s), ${standaloneManualCommits.length} standalone annotation note(s).`);
+    return [];
+  }
 
   const boxes: NodeBox[] = preparedToDraw.map((p) => ({
     id: p.node.id,
@@ -852,6 +893,23 @@ export async function renderBoardFromGraph(
         ),
       ];
 
+      if (p.manualAnnotation) {
+        noteWork.push(
+          createMiroStickyNote({
+            accessToken,
+            boardId,
+            content: p.manualAnnotation,
+            position: {
+              x: imageCenter.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
+              y: top - NOTE_MARGIN - STICKY_H / 2,
+            },
+            width: STICKY_W,
+          }).catch((error: unknown) =>
+            console.error("Failed to place manual annotation note:", getErrorMessage(error))
+          )
+        );
+      }
+
       // Per-element annotation notes around the image; on a missing placement we
       // fall back to a single combined note beside the image.
       if (p.placements.length > 0 && p.blocks.length > 0) {
@@ -866,12 +924,12 @@ export async function renderBoardFromGraph(
             placements: p.placements,
           })
         );
-      } else if ((p.node.annotation ?? "").trim()) {
+      } else if (p.aiAnnotation) {
         noteWork.push(
           createMiroStickyNote({
             accessToken,
             boardId,
-            content: (p.node.annotation ?? "").trim(),
+            content: p.aiAnnotation,
             position: {
               x: imageCenter.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
               y: imageCenter.y,
@@ -886,6 +944,36 @@ export async function renderBoardFromGraph(
       await Promise.all(noteWork);
     })
   );
+
+  if (standaloneManualCommits.length > 0) {
+    const layoutBoxes = preparedToDraw
+      .map((p) => {
+        const box = layout.get(p.node.id);
+        return box ? { position: box, footprint: p.footprint } : null;
+      })
+      .filter((box): box is NonNullable<typeof box> => box !== null);
+    const right = Math.max(
+      ...layoutBoxes.map((box) => box.position.x + box.footprint.width)
+    );
+    const top = Math.min(...layoutBoxes.map((box) => box.position.y));
+
+    await Promise.all(
+      standaloneManualCommits.map((commit, index) =>
+        createMiroStickyNote({
+          accessToken,
+          boardId,
+          content: commit.annotation,
+          position: {
+            x: right + NOTE_MARGIN + STICKY_W / 2,
+            y: top + index * (STICKY_H + NOTE_MARGIN),
+          },
+          width: STICKY_W,
+        }).catch((error: unknown) =>
+          console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
+        )
+      )
+    );
+  }
 
   // Tree connectors: a red chronological chain between consecutive screenshots
   // within each branch, then a (default-colored) fork edge from each branch's
