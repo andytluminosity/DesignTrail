@@ -793,7 +793,8 @@ export async function renderBoardFromGraph(
     height: p.footprint.height,
     imageCenterOffset: p.footprint.imageCenterOffset,
   }));
-  const layout = await planTreeLayout(branches, nodes, boxes);
+  const plan = await planTreeLayout(branches, nodes, boxes);
+  const layout = plan.positions;
 
   const imageIdByNode = new Map<string, string>();
   const rendered: RenderedBoardNode[] = [];
@@ -920,11 +921,11 @@ export async function renderBoardFromGraph(
     }
   }
 
-  for (const branch of branches) {
-    if (!branch.forkNodeId) continue;
-    const first = nodesByBranch.get(branch.id)?.[0];
-    if (!first) continue;
-    queueConnector(branch.forkNodeId, first.id);
+  // Fork edges come from the promoted layout tree, so a branch whose parent node
+  // was collapsed connects to where it actually hangs (re-anchored) instead of to
+  // the collapsed image's hash-duplicate survivor.
+  for (const edge of plan.forkEdges) {
+    queueConnector(edge.from, edge.to);
   }
 
   await Promise.all(connectorWork);

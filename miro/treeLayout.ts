@@ -15,9 +15,10 @@ export const NOTE_MARGIN = 90;
 export const NOTE_GAP = 28;
 
 // Spacing used by the layered tidy-tree layout: horizontal gap between sibling
-// clusters/subtrees and vertical gap between adjacent level bands.
-const H_GAP = 140;
-const V_GAP = 180;
+// clusters/subtrees and vertical gap between adjacent level bands. Generous so
+// the tree reads clearly with the uniform annotation-padded node boxes.
+const H_GAP = 320;
+const V_GAP = 360;
 
 export type MiroPosition = { x: number; y: number };
 export type MiroRelativePosition = { x: string; y: string };
@@ -164,9 +165,14 @@ export function computeClusterFootprint(imageH: number): ClusterFootprint {
 }
 
 // The branch tree shape the layout works over: each branch with its
-// chronological screenshot boxes and its child branches.
+// chronological screenshot boxes, the parent-branch node it forks from, and its
+// child branches.
 type BranchLayout = {
   branchId: string;
+  // Id of the node in the PARENT branch this branch forks from (its visual
+  // anchor). null when unknown/legacy; such branches anchor to the parent's
+  // first node.
+  forkNodeId: string | null;
   boxes: NodeBox[];
   children: BranchLayout[];
 };
@@ -222,7 +228,7 @@ function buildBranchTree(
       .slice()
       .sort(byCreatedThenId)
       .map(build);
-    return { branchId: branch.id, boxes, children: kids };
+    return { branchId: branch.id, forkNodeId: branch.forkNodeId, boxes, children: kids };
   };
 
   const sortRoots = (a: BranchRecord, b: BranchRecord): number => {
@@ -234,24 +240,73 @@ function buildBranchTree(
   return roots.sort(sortRoots).map(build);
 }
 
-function stripWidth(branch: BranchLayout): number {
-  if (branch.boxes.length === 0) return 0;
-  const total = branch.boxes.reduce((sum, box) => sum + box.width, 0);
-  return total + (branch.boxes.length - 1) * H_GAP;
+/**
+ * Removes branches that have no drawable boxes (their screenshots were collapsed
+ * as byte-identical duplicates, or are otherwise undrawable) by PROMOTING their
+ * children up to take the empty branch's place: each promoted child re-anchors to
+ * the node the empty branch itself forked from, so the chain stays attached at the
+ * right level instead of leaving a gap. Applied bottom-up so chains of empty
+ * branches collapse cleanly.
+ */
+function promoteCollapsedBranches(branches: BranchLayout[]): BranchLayout[] {
+  return branches.flatMap((branch) => {
+    const children = promoteCollapsedBranches(branch.children);
+    if (branch.boxes.length === 0) {
+      return children.map((child) => ({ ...child, forkNodeId: branch.forkNodeId }));
+    }
+    return [{ ...branch, children }];
+  });
 }
 
 function stripHeight(branch: BranchLayout): number {
   return branch.boxes.reduce((max, box) => Math.max(max, box.height), 0);
 }
 
-function childrenWidth(branch: BranchLayout): number {
-  if (branch.children.length === 0) return 0;
-  const total = branch.children.reduce((sum, child) => sum + subtreeWidth(child), 0);
-  return total + (branch.children.length - 1) * H_GAP;
+/**
+ * Buckets a branch's child branches by the index of the parent-branch node they
+ * fork from (their visual anchor). A child whose fork node is unknown or not
+ * among the drawable row anchors to the branch's first node (index 0). Children
+ * keep their incoming (createdAt, id) order within each bucket.
+ */
+function groupChildrenByAnchorIndex(branch: BranchLayout): Map<number, BranchLayout[]> {
+  const indexById = new Map(branch.boxes.map((box, i) => [box.id, i] as const));
+  const groups = new Map<number, BranchLayout[]>();
+  for (const child of branch.children) {
+    const idx =
+      child.forkNodeId != null && indexById.has(child.forkNodeId)
+        ? (indexById.get(child.forkNodeId) as number)
+        : 0;
+    const list = groups.get(idx) ?? [];
+    list.push(child);
+    groups.set(idx, list);
+  }
+  return groups;
 }
 
+/** Combined width of a set of sibling child subtrees laid out side by side. */
+function groupWidth(children: BranchLayout[]): number {
+  if (children.length === 0) return 0;
+  const total = children.reduce((sum, child) => sum + subtreeWidth(child), 0);
+  return total + (children.length - 1) * H_GAP;
+}
+
+/**
+ * Width of a branch's whole subtree (the "overall container" enclosing every
+ * descendant). Each row node gets a slot wide enough for both the node box and
+ * the child group that forks from it (its children sit centered under it), and
+ * the slots pack left-to-right with H_GAP between them. A branch with no drawable
+ * boxes still reserves room for its child subtrees so descendants are not lost.
+ */
 function subtreeWidth(branch: BranchLayout): number {
-  return Math.max(stripWidth(branch), childrenWidth(branch));
+  if (branch.boxes.length === 0) {
+    return groupWidth(branch.children);
+  }
+  const groups = groupChildrenByAnchorIndex(branch);
+  let total = 0;
+  branch.boxes.forEach((box, i) => {
+    total += Math.max(box.width, groupWidth(groups.get(i) ?? []));
+  });
+  return total + (branch.boxes.length - 1) * H_GAP;
 }
 
 // Floor for a level band whose branches are all empty, so a level never
@@ -302,12 +357,13 @@ function computeLevelBands(roots: BranchLayout[]): {
 }
 
 /**
- * Places a branch subtree: the branch's own screenshots form a horizontal row
- * (chronological, left-to-right) centered within the subtree's width, with each
- * box vertically centered inside its depth's global level band. Child branches
- * are laid out below, left-to-right. Subtree widths are computed bottom-up so
- * sibling subtrees never collide, and the Y comes from the shared level bands so
- * every branch at the same depth lines up on one horizontal band.
+ * Places a branch subtree. The branch's screenshots form a horizontal row on its
+ * depth's level band; each node gets a slot sized for both the node box and the
+ * child group forking from it, and that child group is centered directly under
+ * the node it forks from, so fork edges run straight down like a classic tree.
+ * Child branches land on the next band down. Slots pack left-to-right so sibling
+ * subtrees never overlap, and the Y comes from the shared level bands so every
+ * branch at the same depth lines up on one horizontal band.
  */
 function placeSubtree(
   branch: BranchLayout,
@@ -317,22 +373,39 @@ function placeSubtree(
   levelHeight: number[],
   out: LayoutResult
 ): void {
-  const totalWidth = subtreeWidth(branch);
-  const ownWidth = stripWidth(branch);
   const bandCenter = levelTop[depth] + levelHeight[depth] / 2;
 
-  let x = originX + (totalWidth - ownWidth) / 2;
-  for (const box of branch.boxes) {
-    out.set(box.id, { x, y: bandCenter - box.height / 2 });
-    x += box.width + H_GAP;
+  // A branch with no drawable boxes contributes no row; its children still flow
+  // onto the next band, packed left-to-right from the subtree origin.
+  if (branch.boxes.length === 0) {
+    let childX = originX;
+    for (const child of branch.children) {
+      placeSubtree(child, childX, depth + 1, levelTop, levelHeight, out);
+      childX += subtreeWidth(child) + H_GAP;
+    }
+    return;
   }
 
-  const kidsWidth = childrenWidth(branch);
-  let childX = originX + (totalWidth - kidsWidth) / 2;
-  for (const child of branch.children) {
-    placeSubtree(child, childX, depth + 1, levelTop, levelHeight, out);
-    childX += subtreeWidth(child) + H_GAP;
-  }
+  const groups = groupChildrenByAnchorIndex(branch);
+  let cursor = originX;
+  branch.boxes.forEach((box, i) => {
+    const group = groups.get(i) ?? [];
+    const gWidth = groupWidth(group);
+    const slot = Math.max(box.width, gWidth);
+    const slotCenter = cursor + slot / 2;
+
+    // Node box centered in its slot, vertically centered on the level band.
+    out.set(box.id, { x: slotCenter - box.width / 2, y: bandCenter - box.height / 2 });
+
+    // Children that fork from this node are centered directly under it.
+    let childX = slotCenter - gWidth / 2;
+    for (const child of group) {
+      placeSubtree(child, childX, depth + 1, levelTop, levelHeight, out);
+      childX += subtreeWidth(child) + H_GAP;
+    }
+
+    cursor += slot + H_GAP;
+  });
 }
 
 /**
@@ -354,20 +427,57 @@ export function tidyTreeLayout(roots: BranchLayout[]): LayoutResult {
   return out;
 }
 
+// One fork edge of the drawn tree: a connector from the parent node a branch
+// hangs under (`from`) to that branch's first drawn node (`to`).
+export type ForkEdge = { from: string; to: string };
+
+// Full layout plan: where each node's box sits, plus the fork edges of the
+// promoted tree (so connectors match the drawn structure even when collapsed
+// branches re-anchor their children).
+export type TreePlan = {
+  positions: LayoutResult;
+  forkEdges: ForkEdge[];
+};
+
+/**
+ * Derives the fork edges of the promoted tree: for every branch, an edge from
+ * the node it forks from (its re-anchored `forkNodeId`, or the parent branch's
+ * first node when unknown) to that branch's first drawn node. Built from the
+ * promoted tree so a collapsed branch's children connect to where they actually
+ * hang, not to the collapsed image's hash-duplicate survivor.
+ */
+function collectForkEdges(roots: BranchLayout[]): ForkEdge[] {
+  const edges: ForkEdge[] = [];
+  const walk = (branch: BranchLayout): void => {
+    const parentFirst = branch.boxes[0]?.id;
+    for (const child of branch.children) {
+      const childFirst = child.boxes[0]?.id;
+      if (childFirst) {
+        const from = child.forkNodeId ?? parentFirst;
+        if (from) edges.push({ from, to: childFirst });
+      }
+      walk(child);
+    }
+  };
+  for (const root of roots) walk(root);
+  return edges;
+}
+
 /**
  * Plans where every screenshot cluster sits on the board so they assemble into a
  * non-overlapping, strictly layered component tree: branches are bucketed into
  * global level bands by depth (parents above children) and packed left-to-right
  * so nothing overlaps. The layout is fully deterministic so the board always
  * reads as a clean top-down tree with fork edges crossing exactly one level.
+ * Also returns the promoted tree's fork edges so connectors match the layout.
  */
 export async function planTreeLayout(
   branches: BranchRecord[],
   nodes: IterationNode[],
   boxes: NodeBox[]
-): Promise<LayoutResult> {
+): Promise<TreePlan> {
   const boxById = new Map(boxes.map((box) => [box.id, box]));
   const nodesByBranch = groupNodesByBranch(nodes);
-  const roots = buildBranchTree(branches, nodesByBranch, boxById);
-  return tidyTreeLayout(roots);
+  const roots = promoteCollapsedBranches(buildBranchTree(branches, nodesByBranch, boxById));
+  return { positions: tidyTreeLayout(roots), forkEdges: collectForkEdges(roots) };
 }
