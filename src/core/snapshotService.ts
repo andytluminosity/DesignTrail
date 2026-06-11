@@ -86,6 +86,16 @@ async function pruneEmptyDirs(dir: string): Promise<void> {
 }
 
 /**
+ * The clean (unboxed) sidecar for a full-page `main` capture. The DOM climb
+ * writes `main.png` (with the change-highlight box) and a `main-original.png`
+ * copy without it; the sidecar must follow `main.png` whenever it moves or is
+ * removed so the commit-overview tree can still find it by name convention.
+ */
+function originalSidecarPath(pngPath: string): string {
+  return pngPath.replace(/\.png$/i, "-original.png");
+}
+
+/**
  * Mirrors the finalized branch tree onto disk and repoints node screenshot paths
  * so SQLite remains the source of truth for the current PNG location.
  */
@@ -106,6 +116,11 @@ async function materializeFolderTree(
     const to = path.join(DESIGNTRAIL_ROOT, move.desiredPath);
     if (move.currentPath && (await fse.pathExists(from))) {
       await fse.move(from, to, { overwrite: true });
+      // Keep the clean main sidecar adjacent to its boxed counterpart.
+      const sidecarFrom = originalSidecarPath(from);
+      if (await fse.pathExists(sidecarFrom)) {
+        await fse.move(sidecarFrom, originalSidecarPath(to), { overwrite: true });
+      }
     }
     applied.push({ nodeId: move.nodeId, desiredPath: move.desiredPath });
   }
@@ -381,7 +396,11 @@ export async function createDesignSnapshot(
               (nodeById.has(id)
                 ? path.join(DESIGNTRAIL_ROOT, nodeById.get(id)!.screenshotPath)
                 : undefined);
-            if (abs) await fse.remove(abs);
+            if (abs) {
+              await fse.remove(abs);
+              // Drop the clean main sidecar too, so no orphan is left behind.
+              await fse.remove(originalSidecarPath(abs));
+            }
           })
         );
 

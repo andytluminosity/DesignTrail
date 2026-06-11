@@ -210,6 +210,43 @@ async function readIdentity(
   });
 }
 
+const CHANGE_HIGHLIGHT_ID = "__designtrail_change_box__";
+
+/**
+ * Injects a dotted red box over the originally changed (LLM-located) element so
+ * it's visible in the wider ancestor screenshots captured during the DOM climb.
+ * The box is an absolutely-positioned overlay appended to `document.body` and
+ * placed in document coordinates (rect + scroll), so it stays correctly aligned
+ * even as Playwright scrolls elements into view for each capture, and it never
+ * gets clipped by an ancestor's `overflow: hidden`.
+ */
+async function addChangeHighlight(page: Page, located: ElementHandle): Promise<void> {
+  await located.evaluate((node, boxId) => {
+    const existing = document.getElementById(boxId);
+    if (existing) existing.remove();
+    const rect = (node as Element).getBoundingClientRect();
+    const box = document.createElement("div");
+    box.id = boxId;
+    box.style.position = "absolute";
+    box.style.left = `${rect.left + window.scrollX}px`;
+    box.style.top = `${rect.top + window.scrollY}px`;
+    box.style.width = `${rect.width}px`;
+    box.style.height = `${rect.height}px`;
+    box.style.border = "3px dashed red";
+    box.style.boxSizing = "border-box";
+    box.style.pointerEvents = "none";
+    box.style.zIndex = "2147483647";
+    document.body.appendChild(box);
+  }, CHANGE_HIGHLIGHT_ID);
+}
+
+/** Removes the change-highlight overlay if present (no-op otherwise). */
+async function removeChangeHighlight(page: Page): Promise<void> {
+  await page.evaluate((boxId) => {
+    document.getElementById(boxId)?.remove();
+  }, CHANGE_HIGHLIGHT_ID);
+}
+
 /**
  * Resolves the element to screenshot. The LLM locates the changed element via
  * `mode`/`value`, then we climb exactly one DOM level to its immediate parent —
@@ -223,7 +260,7 @@ async function readIdentity(
 async function captureLocator(
   page: Page,
   target: ScreenshotTarget
-): Promise<ElementHandle | null> {
+): Promise<{ container: ElementHandle; located: ElementHandle } | null> {
   const locateLoc = resolveLocator(page, target);
   if (!locateLoc) return null;
 
@@ -235,12 +272,12 @@ async function captureLocator(
 
   try {
     const parentElement = await parentElementHandle(page, elementHandle);
-    if (parentElement) return parentElement;
+    if (parentElement) return { container: parentElement, located: elementHandle };
   } catch {
     // Any climb failure falls back to the located element below.
   }
 
-  return elementHandle;
+  return { container: elementHandle, located: elementHandle };
 }
 
 /** Full scrollable document dimensions of the currently loaded page. */
@@ -297,48 +334,68 @@ export type ScreenshotJob = {
  * Ancestor PNGs are written alongside the job's own output (same commit dir),
  * named by derived branch id. `seenBranches` dedupes within the climb so a
  * branch is captured at most once.
+ *
+ * A dotted red box is drawn around the originally changed element (`located`)
+ * for every ancestor capture, so it's clear at higher hierarchy levels what
+ * changed. The full-page `main` capture is saved twice: a boxed `main.png` (used
+ * by the full + compressed trees) and a clean `main-original.png` sidecar (used
+ * by the per-commit overview tree, which keeps the unboxed photo).
  */
 async function climbAncestors(
   page: Page,
   fromHandle: ElementHandle,
   outputDir: string,
-  navPath: string
+  navPath: string,
+  located: ElementHandle
 ): Promise<AncestorCapture[]> {
   const ancestors: AncestorCapture[] = [];
   const seenBranches = new Set<string>();
   let current: ElementHandle | null = fromHandle;
 
-  // Bound the climb defensively in case of an unexpected DOM cycle.
-  for (let depth = 0; depth < 64; depth++) {
-    const parent: ElementHandle | null = await parentElementHandle(page, current);
-    if (!parent) {
-      // Reached body/html: the topmost level is the whole page => main branch.
-      const mainPath = path.join(outputDir, `${MAIN_BRANCH}.png`);
-      await page.screenshot({ path: mainPath, fullPage: true });
-      ancestors.push({
-        branchId: MAIN_BRANCH,
-        outputPath: mainPath,
-        geometry: await fullPageGeometry(page),
-        navPath,
-      });
-      break;
-    }
+  try {
+    // Highlight the changed element so it stands out in the wider ancestor shots.
+    await addChangeHighlight(page, located);
 
-    const branchId = deriveDomBranchId(await readIdentity(parent));
-    if (branchId && !seenBranches.has(branchId)) {
-      seenBranches.add(branchId);
-      const ancestorPath = path.join(outputDir, `${branchId}.png`);
-      try {
-        await parent.screenshot({ path: ancestorPath });
-        const geometry = await readGeometry(parent, page);
-        ancestors.push({ branchId, outputPath: ancestorPath, geometry, navPath });
-        console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
-      } catch {
-        // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+    // Bound the climb defensively in case of an unexpected DOM cycle.
+    for (let depth = 0; depth < 64; depth++) {
+      const parent: ElementHandle | null = await parentElementHandle(page, current);
+      if (!parent) {
+        // Reached body/html: the topmost level is the whole page => main branch.
+        // Capture the boxed full page first (full + compressed trees), then drop
+        // the box and capture a clean sidecar for the per-commit overview tree.
+        const mainPath = path.join(outputDir, `${MAIN_BRANCH}.png`);
+        await page.screenshot({ path: mainPath, fullPage: true });
+        await removeChangeHighlight(page);
+        const mainOriginalPath = path.join(outputDir, `${MAIN_BRANCH}-original.png`);
+        await page.screenshot({ path: mainOriginalPath, fullPage: true });
+        ancestors.push({
+          branchId: MAIN_BRANCH,
+          outputPath: mainPath,
+          geometry: await fullPageGeometry(page),
+          navPath,
+        });
+        break;
       }
-    }
 
-    current = parent;
+      const branchId = deriveDomBranchId(await readIdentity(parent));
+      if (branchId && !seenBranches.has(branchId)) {
+        seenBranches.add(branchId);
+        const ancestorPath = path.join(outputDir, `${branchId}.png`);
+        try {
+          await parent.screenshot({ path: ancestorPath });
+          const geometry = await readGeometry(parent, page);
+          ancestors.push({ branchId, outputPath: ancestorPath, geometry, navPath });
+          console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
+        } catch {
+          // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
+        }
+      }
+
+      current = parent;
+    }
+  } finally {
+    // Always clear the overlay so it can't leak into later jobs on this page.
+    await removeChangeHighlight(page);
   }
 
   return ancestors;
@@ -372,14 +429,21 @@ async function captureOnePage(
 
   if (target.mode !== "full") {
     try {
-      const element = await captureLocator(page, target);
-      if (element) {
-        await element.screenshot({ path: outputPath });
+      const located = await captureLocator(page, target);
+      if (located) {
+        const { container, located: changedElement } = located;
+        await container.screenshot({ path: outputPath });
         // Measure the SAME element we screenshot (the climbed container when one
         // was chosen), so geometry == the captured container's rect.
-        const geometry = await readGeometry(element, page);
+        const geometry = await readGeometry(container, page);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
-        const ancestors = await climbAncestors(page, element, outputDir, navPath);
+        const ancestors = await climbAncestors(
+          page,
+          container,
+          outputDir,
+          navPath,
+          changedElement
+        );
         const chain = [selfBranchId, ...ancestors.map((a) => a.branchId)];
         return { self: { outputPath, geometry }, ancestors, chain };
       }
