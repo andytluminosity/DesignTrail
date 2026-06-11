@@ -1,6 +1,4 @@
 import { existsSync, readFileSync } from "fs";
-import { readFile } from "fs/promises";
-import { createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { BranchRecord, CommitData, IterationNode } from "../tracker/types.js";
@@ -335,15 +333,6 @@ async function getMiroItem(
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/** SHA-256 hex of a file's bytes, or null if it can't be read. */
-async function hashFileBytes(absPath: string): Promise<string | null> {
-  try {
-    return createHash("sha256").update(await readFile(absPath)).digest("hex");
-  } catch {
-    return null;
-  }
 }
 
 function normalizeUrlBase(url: string): string {
@@ -681,10 +670,6 @@ type PreparedNode = {
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
-  // SHA-256 of the screenshot bytes, used to collapse byte-identical captures so
-  // each unique image renders exactly once. null when the file can't be hashed,
-  // in which case the node is treated as unique.
-  hash: string | null;
 };
 
 /**
@@ -728,10 +713,7 @@ export async function renderBoardFromGraph(
     PRECOMPUTE_CONCURRENCY,
     async (node) => {
       const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
-      const [dims, hash] = await Promise.all([
-        readPngDimensions(absPng),
-        hashFileBytes(absPng),
-      ]);
+      const dims = await readPngDimensions(absPng);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
       const annotation = (node.annotation ?? "").trim();
       const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
@@ -745,7 +727,6 @@ export async function renderBoardFromGraph(
         placements,
         footprint,
         url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
-        hash,
       };
     }
   );
@@ -755,34 +736,10 @@ export async function renderBoardFromGraph(
     return [];
   }
 
-  // Collapse byte-identical screenshots so each unique image renders exactly
-  // once. The first node (in chronological export order) holding a given image
-  // hash is the canonical survivor; every later duplicate maps to it. Nodes that
-  // can't be hashed are treated as unique. Only survivors are laid out and drawn;
-  // connectors re-point through `canonicalNodeId` so the tree stays connected
-  // through the surviving image instead of pointing at a dropped duplicate.
-  const canonicalNodeId = new Map<string, string>();
-  const survivorByHash = new Map<string, string>();
-  const preparedToDraw: PreparedNode[] = [];
-  for (const p of prepared) {
-    if (p.hash) {
-      const survivor = survivorByHash.get(p.hash);
-      if (survivor) {
-        canonicalNodeId.set(p.node.id, survivor);
-        continue;
-      }
-      survivorByHash.set(p.hash, p.node.id);
-    }
-    canonicalNodeId.set(p.node.id, p.node.id);
-    preparedToDraw.push(p);
-  }
-  const resolveCanonical = (nodeId: string): string =>
-    canonicalNodeId.get(nodeId) ?? nodeId;
-
-  const collapsed = prepared.length - preparedToDraw.length;
-  if (collapsed > 0) {
-    console.log(`Collapsed ${collapsed} duplicate screenshot(s) into ${preparedToDraw.length} unique image(s).`);
-  }
+  // The stored graph is already pruned at save time (duplicate screenshots
+  // collapsed, node-less branches promoted away), so every prepared node is
+  // drawn exactly once and connectors reference nodes directly.
+  const preparedToDraw = prepared;
 
   // Wipe the whole board so the re-render starts from a clean slate.
   await clearBoard(accessToken, boardId);
@@ -889,13 +846,11 @@ export async function renderBoardFromGraph(
 
   // Tree connectors: a red chronological chain between consecutive screenshots
   // within each branch, then a (default-colored) fork edge from each branch's
-  // fork point to that branch's first screenshot. Endpoints are resolved through
-  // the canonical map so an edge that referenced a collapsed duplicate now lands
-  // on its surviving image. Self-edges (both ends collapsed to the same image)
-  // and duplicate edges are dropped so each surviving image points to a given
-  // target at most once. Built after all images exist, then drawn in parallel.
+  // fork point to that branch's first screenshot. Duplicate edges are dropped so
+  // each image points to a given target at most once. Built after all images
+  // exist, then drawn in parallel.
   const resolveImageId = (nodeId: string): string | undefined =>
-    imageIdByNode.get(resolveCanonical(nodeId));
+    imageIdByNode.get(nodeId);
 
   const drawnConnectors = new Set<string>();
   const connectorWork: Promise<void>[] = [];
@@ -921,9 +876,9 @@ export async function renderBoardFromGraph(
     }
   }
 
-  // Fork edges come from the promoted layout tree, so a branch whose parent node
-  // was collapsed connects to where it actually hangs (re-anchored) instead of to
-  // the collapsed image's hash-duplicate survivor.
+  // Fork edges come from the layout tree's stored fork points, which the
+  // save-time prune already re-anchored, so each branch connects to where it
+  // actually hangs.
   for (const edge of plan.forkEdges) {
     queueConnector(edge.from, edge.to);
   }

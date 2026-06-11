@@ -10,6 +10,7 @@ import { annotateScreenshots } from "../../tracker/annotate.js";
 import { DesignGraph } from "../../tracker/graph.js";
 import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
+import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
 import type { RenderedBoardNode } from "../../miro/miroClient.js";
 import type {
@@ -314,41 +315,87 @@ export async function createDesignSnapshot(
       }
     });
 
-    // Drop captures that are byte-identical to the previous node on the SAME
-    // branch. An unchanged capture records no new visual information and would
-    // otherwise litter the branch with duplicate PNGs under different names —
-    // most commonly a cascading `main` re-capture triggered by a change that is
-    // only visible on another route. Comparing against the parent node (the
-    // branch tip before this commit) keeps the per-branch history meaningful.
-    const removedOutputs = new Set<string>();
-    const removedNodeIds = new Set<string>();
-    for (const { outputPath } of screenshots) {
-      const nodeId = nodeByOutput.get(outputPath);
-      if (!nodeId) continue;
-      const node = graph.getNode(nodeId);
-      if (!node?.parentId) continue;
-      const parent = graph.getNode(node.parentId);
-      if (!parent) continue;
-
-      const [newHash, parentHash] = await Promise.all([
-        hashFile(outputPath),
-        hashFile(path.join(DESIGNTRAIL_ROOT, parent.screenshotPath)),
-      ]);
-      if (newHash && parentHash && newHash === parentHash) {
-        removedOutputs.add(outputPath);
-        removedNodeIds.add(nodeId);
+    // Hash every newly captured screenshot and persist it on its node, so the
+    // whole-graph duplicate collapse below can run off stored hashes (steady
+    // state only re-reads this commit's new files).
+    const newHashes = await Promise.all(
+      [...nodeByOutput.entries()].map(async ([outputPath, nodeId]) => ({
+        nodeId,
+        hash: await hashFile(outputPath),
+      }))
+    );
+    graph.transaction(() => {
+      for (const { nodeId, hash } of newHashes) {
+        if (hash) graph.setNodeScreenshotHash(nodeId, hash);
       }
-    }
+    });
 
-    if (removedNodeIds.size > 0) {
-      graph.transaction(() => {
-        for (const id of removedNodeIds) graph.deleteNode(id);
-      });
-      await Promise.all([...removedOutputs].map((p) => fse.remove(p)));
-      screenshots = screenshots.filter((s) => !removedOutputs.has(s.outputPath));
-      entries = entries.filter(
-        (e) => !removedNodeIds.has(`${commit.hash}:${e.branchId}`)
-      );
+    // Phase 1: collapse byte-identical screenshots across the WHOLE graph so each
+    // unique image survives exactly once — the destructive db equivalent of the
+    // renderer's canonical-survivor map. Replaces the old per-branch-vs-parent
+    // dedup (a strict subset). Runs before annotation/geometry so removed
+    // captures aren't annotated. Re-points any parentId / forkNodeId that
+    // referenced a dropped duplicate onto the surviving node.
+    {
+      const { branches: allBranches, nodes: allNodes } = graph.exportGraph();
+      const storedHashes = graph.getNodeHashes();
+      const hashByNodeId = new Map<string, string | null>();
+      const backfill: { nodeId: string; hash: string }[] = [];
+      for (const node of allNodes) {
+        let hash = storedHashes.get(node.id) ?? null;
+        if (hash == null) {
+          // Legacy node without a stored hash: hash its file once and backfill.
+          hash = await hashFile(path.join(DESIGNTRAIL_ROOT, node.screenshotPath));
+          if (hash) backfill.push({ nodeId: node.id, hash });
+        }
+        hashByNodeId.set(node.id, hash);
+      }
+      if (backfill.length > 0) {
+        graph.transaction(() => {
+          for (const { nodeId, hash } of backfill) graph.setNodeScreenshotHash(nodeId, hash);
+        });
+      }
+
+      const collapse = planDuplicateCollapse(allBranches, allNodes, hashByNodeId);
+      if (collapse.deletedNodeIds.length > 0) {
+        graph.transaction(() => {
+          for (const { id, parentId } of collapse.nodeParentUpdates) {
+            graph.setNodeParent(id, parentId);
+          }
+          for (const { id, forkNodeId } of collapse.branchForkUpdates) {
+            graph.setBranchForkNode(id, forkNodeId);
+          }
+          for (const id of collapse.deletedNodeIds) graph.deleteNode(id);
+        });
+
+        // Remove the duplicate PNGs from disk. New-this-commit duplicates live at
+        // their pre-mirror outputPath; older duplicates at their stored path.
+        const outputByNodeId = new Map(
+          [...nodeByOutput.entries()].map(([out, id]) => [id, out] as const)
+        );
+        const nodeById = new Map(allNodes.map((n) => [n.id, n]));
+        await Promise.all(
+          collapse.deletedNodeIds.map(async (id) => {
+            const abs =
+              outputByNodeId.get(id) ??
+              (nodeById.has(id)
+                ? path.join(DESIGNTRAIL_ROOT, nodeById.get(id)!.screenshotPath)
+                : undefined);
+            if (abs) await fse.remove(abs);
+          })
+        );
+
+        const deleted = new Set(collapse.deletedNodeIds);
+        screenshots = screenshots.filter((s) => {
+          const id = nodeByOutput.get(s.outputPath);
+          if (id && deleted.has(id)) {
+            nodeByOutput.delete(s.outputPath);
+            return false;
+          }
+          return true;
+        });
+        entries = entries.filter((e) => !deleted.has(`${commit.hash}:${e.branchId}`));
+      }
     }
 
     // Generate a unique, design-oriented annotation (What changed + a hedged
@@ -446,6 +493,24 @@ export async function createDesignSnapshot(
         graph.setBranchForkNode(branchId, reconcileFork(branchId, parentBranchId));
       }
     });
+
+    // Phase 2: promote away branches left node-less by the duplicate collapse,
+    // hoisting their children up — the db equivalent of the renderer's
+    // promoteCollapsedBranches. Runs on the reconciled tree so the stored tree
+    // equals the drawn tree, before the folder mirror renumbers files.
+    {
+      const { branches: pBranches, nodes: pNodes } = graph.exportGraph();
+      const promotion = planBranchPromotion(pBranches, pNodes);
+      if (promotion.deletedBranchIds.length > 0 || promotion.branchUpdates.length > 0) {
+        graph.transaction(() => {
+          for (const update of promotion.branchUpdates) {
+            graph.setBranchParent(update.id, update.parentBranchId);
+            graph.setBranchForkNode(update.id, update.forkNodeId);
+          }
+          for (const id of promotion.deletedBranchIds) graph.deleteBranch(id);
+        });
+      }
+    }
 
     const screenshotPathByNodeId = await materializeFolderTree(graph, repoName);
     for (const entry of entries) {
