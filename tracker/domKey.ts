@@ -86,15 +86,21 @@ export async function computeContainerIdentity(
       else if (cur.getAttribute("data-test-id")) dName = "data-test-id";
       else if (cur.getAttribute("data-component")) dName = "data-component";
 
-      // accessible name (aria-label, else first heading descendant)
+      // accessible name (aria-label, else a single heading descendant). Repeated
+      // containers like a stats grid contain many card headings; using the first
+      // one would mislabel the grid as "Total Commits". Only a single heading is
+      // treated as the container's semantic name.
       let name = "";
       const aria = cur.getAttribute("aria-label");
       if (aria && aria.trim()) {
         name = aria.replace(/\s+/g, " ").trim();
       } else {
-        const heading = cur.querySelector("h1,h2,h3,h4,h5,h6,[role='heading']");
-        if (heading && heading.textContent && heading.textContent.trim()) {
-          name = heading.textContent.replace(/\s+/g, " ").trim();
+        const headings = cur.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading']");
+        if (headings.length === 1) {
+          const heading = headings[0];
+          if (heading && heading.textContent && heading.textContent.trim()) {
+            name = heading.textContent.replace(/\s+/g, " ").trim();
+          }
         }
       }
       if (name.length > MAX) name = name.slice(0, MAX);
