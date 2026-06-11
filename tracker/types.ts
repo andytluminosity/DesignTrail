@@ -8,6 +8,17 @@ export type CommitData = {
   annotation?: string;
 };
 
+export type AnnotationSource = "commit_message" | "user" | "ai";
+
+export type AnnotationRecord = {
+  id: string;
+  nodeId: string;
+  commitHash: string;
+  source: AnnotationSource;
+  content: string;
+  createdAt: number;
+};
+
 // On-screen geometry of a located element, in page (document) pixels. pageW/pageH
 // are the full scrollable document dimensions, so the spatial board can lay every
 // component out in one shared coordinate system.

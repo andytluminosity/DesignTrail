@@ -13,6 +13,8 @@ import { planFolderLayout } from "../../tracker/treeStore.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
 import type { RenderedBoardNode } from "../../miro/miroClient.js";
 import type {
+  AnnotationRecord,
+  AnnotationSource,
   CommitData,
   IterationNode,
   ScreenshotResult,
@@ -131,6 +133,23 @@ const CAPTURE_URL = process.env.CAPTURE_URL ?? "http://localhost:3000";
 function normalizeOptional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function buildAnnotationRecord(
+  nodeId: string,
+  commitHash: string,
+  source: AnnotationSource,
+  content: string,
+  createdAt: number
+): AnnotationRecord {
+  return {
+    id: `${nodeId}:${source}`,
+    nodeId,
+    commitHash,
+    source,
+    content,
+    createdAt,
+  };
 }
 
 /** SHA-256 of a file's bytes, or null if it can't be read. */
@@ -358,6 +377,35 @@ export async function createDesignSnapshot(
       entries.map((entry) => [`${commit.hash}:${entry.branchId}`, entry])
     );
 
+    graph.transaction(() => {
+      for (const nodeId of entryByNodeId.keys()) {
+        const commitMessage = normalizeOptional(commit.message);
+        if (commitMessage) {
+          graph.upsertAnnotation(
+            buildAnnotationRecord(
+              nodeId,
+              commit.hash,
+              "commit_message",
+              commitMessage,
+              commit.timestamp
+            )
+          );
+        }
+
+        if (manualAnnotation) {
+          graph.upsertAnnotation(
+            buildAnnotationRecord(
+              nodeId,
+              commit.hash,
+              "user",
+              manualAnnotation,
+              commit.timestamp
+            )
+          );
+        }
+      }
+    });
+
     if (generateAiAnnotations) {
       // Generate a unique, design-oriented annotation (What changed + a hedged
       // guess at Why) for each surviving screenshot via a vision pass, then persist
@@ -387,6 +435,18 @@ export async function createDesignSnapshot(
           const nodeId = nodeByOutput.get(outputPath);
           if (nodeId) {
             graph.setNodeAnnotation(nodeId, annotation);
+            const normalizedAnnotation = normalizeOptional(annotation);
+            if (normalizedAnnotation) {
+              graph.upsertAnnotation(
+                buildAnnotationRecord(
+                  nodeId,
+                  commit.hash,
+                  "ai",
+                  normalizedAnnotation,
+                  Date.now()
+                )
+              );
+            }
             const entry = entryByNodeId.get(nodeId);
             if (entry) entry.annotation = annotation;
           }

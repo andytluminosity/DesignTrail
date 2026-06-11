@@ -3,7 +3,12 @@ import { readFile } from "fs/promises";
 import { createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
-import type { BranchRecord, CommitData, IterationNode } from "../tracker/types.js";
+import type {
+  AnnotationRecord,
+  BranchRecord,
+  CommitData,
+  IterationNode,
+} from "../tracker/types.js";
 import {
   parseAnnotationBlocks,
   placeAnnotations,
@@ -579,17 +584,45 @@ export async function createConnector({
  * (short hash + branch, type, summary) plus commit-level metadata. Manual commit
  * annotations render as their own designated sticky note, not hidden here.
  */
-function buildStickyContent(
-  node: IterationNode,
-  commit: CommitData | undefined
+function groupAnnotationsByNode(
+  annotations: AnnotationRecord[]
+): Map<string, AnnotationRecord[]> {
+  const map = new Map<string, AnnotationRecord[]>();
+  for (const annotation of annotations) {
+    const list = map.get(annotation.nodeId) ?? [];
+    list.push(annotation);
+    map.set(annotation.nodeId, list);
+  }
+  return map;
+}
+
+function getAnnotationContent(
+  annotations: AnnotationRecord[] | undefined,
+  source: AnnotationRecord["source"],
+  fallback?: string
 ): string {
+  const record = annotations?.find((annotation) => annotation.source === source);
+  return (record?.content ?? fallback ?? "").trim();
+}
+
+function buildStickyContent(params: {
+  node: IterationNode;
+  commit: CommitData | undefined;
+  annotations: AnnotationRecord[] | undefined;
+}): string {
+  const { node, commit, annotations } = params;
   const shortHash = node.commitHash.slice(0, 7);
   const label = node.branchId || "main";
   const lines = [`${shortHash} · ${label}`];
   if (node.type) lines.push(node.type);
   if (node.summary) lines.push(node.summary);
+  const commitMessage = getAnnotationContent(
+    annotations,
+    "commit_message",
+    commit?.message
+  );
+  if (commitMessage) lines.push(commitMessage);
   if (commit) {
-    if (commit.message) lines.push(commit.message);
     if (commit.source) lines.push(`source: ${commit.source}`);
   }
   return lines.join("\n");
@@ -700,8 +733,14 @@ export async function renderBoardFromGraph(
   branches: BranchRecord[],
   nodes: IterationNode[],
   commitsByHash: Map<string, CommitData>,
-  options: RenderBoardOptions = {}
+  annotationsOrOptions: AnnotationRecord[] | RenderBoardOptions = [],
+  optionsArg: RenderBoardOptions = {}
 ): Promise<RenderedBoardNode[]> {
+  const annotationRecords = Array.isArray(annotationsOrOptions)
+    ? annotationsOrOptions
+    : [];
+  const options = Array.isArray(annotationsOrOptions) ? optionsArg : annotationsOrOptions;
+  const annotationsByNode = groupAnnotationsByNode(annotationRecords);
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
 
@@ -734,10 +773,18 @@ export async function renderBoardFromGraph(
         hashFileBytes(absPng),
       ]);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const manualAnnotation = (commitsByHash.get(node.commitHash)?.annotation ?? "").trim();
+      const commit = commitsByHash.get(node.commitHash);
+      const nodeAnnotations = annotationsByNode.get(node.id);
+      const manualAnnotation = getAnnotationContent(
+        nodeAnnotations,
+        "user",
+        commit?.annotation
+      );
       // A manual annotation is the user's chosen note for this commit, so it owns
       // the annotation surface and suppresses generated AI sticky notes.
-      const aiAnnotation = manualAnnotation ? "" : (node.annotation ?? "").trim();
+      const aiAnnotation = manualAnnotation
+        ? ""
+        : getAnnotationContent(nodeAnnotations, "ai", node.annotation);
       const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
@@ -882,7 +929,11 @@ export async function renderBoardFromGraph(
         createMiroStickyNote({
           accessToken,
           boardId,
-          content: buildStickyContent(p.node, commitsByHash.get(p.node.commitHash)),
+          content: buildStickyContent({
+            node: p.node,
+            commit: commitsByHash.get(p.node.commitHash),
+            annotations: annotationsByNode.get(p.node.id),
+          }),
           position: {
             x: left - NOTE_MARGIN - STICKY_W / 2,
             y: top - NOTE_MARGIN - STICKY_H / 2,

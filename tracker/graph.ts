@@ -3,6 +3,7 @@ import { fileURLToPath } from "url";
 import fse from "fs-extra";
 import Database from "better-sqlite3";
 import type {
+  AnnotationRecord,
   BranchRecord,
   CommitData,
   IterationNode,
@@ -51,6 +52,18 @@ CREATE TABLE IF NOT EXISTS nodes (
   page_w          REAL,
   page_h          REAL
 );
+
+CREATE TABLE IF NOT EXISTS annotations (
+  id          TEXT PRIMARY KEY,
+  node_id     TEXT NOT NULL,
+  commit_hash TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_node_id ON annotations (node_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_commit_hash ON annotations (commit_hash);
 `;
 
 type BranchRow = {
@@ -78,6 +91,15 @@ type NodeRow = {
   geom_h: number | null;
   page_w: number | null;
   page_h: number | null;
+};
+
+type AnnotationRow = {
+  id: string;
+  node_id: string;
+  commit_hash: string;
+  source: AnnotationRecord["source"];
+  content: string;
+  created_at: number;
 };
 
 function parseTarget(raw: string | null): ScreenshotTarget | undefined {
@@ -136,6 +158,17 @@ function toIterationNode(row: NodeRow): IterationNode {
     screenshotPath: row.screenshot_path,
     timestamp: row.timestamp,
     geometry: toGeometry(row),
+  };
+}
+
+function toAnnotationRecord(row: AnnotationRow): AnnotationRecord {
+  return {
+    id: row.id,
+    nodeId: row.node_id,
+    commitHash: row.commit_hash,
+    source: row.source,
+    content: row.content,
+    createdAt: row.created_at,
   };
 }
 
@@ -237,6 +270,28 @@ export class DesignGraph {
       });
     }
     return map;
+  }
+
+  upsertAnnotation(annotation: AnnotationRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO annotations (id, node_id, commit_hash, source, content, created_at)
+         VALUES (@id, @nodeId, @commitHash, @source, @content, @createdAt)
+         ON CONFLICT(id) DO UPDATE SET
+           node_id = excluded.node_id,
+           commit_hash = excluded.commit_hash,
+           source = excluded.source,
+           content = excluded.content,
+           created_at = excluded.created_at`
+      )
+      .run(annotation);
+  }
+
+  getAnnotations(): AnnotationRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM annotations ORDER BY created_at ASC, rowid ASC`)
+      .all() as AnnotationRow[];
+    return rows.map(toAnnotationRecord);
   }
 
   getBranches(): BranchRecord[] {
@@ -365,6 +420,7 @@ export class DesignGraph {
    * stays intact for subsequent commits.
    */
   deleteNode(id: string): void {
+    this.db.prepare(`DELETE FROM annotations WHERE node_id = ?`).run(id);
     this.db.prepare(`DELETE FROM nodes WHERE id = ?`).run(id);
   }
 
@@ -411,12 +467,20 @@ export class DesignGraph {
     this.db.transaction(fn)();
   }
 
-  exportGraph(): { branches: BranchRecord[]; nodes: IterationNode[] } {
+  exportGraph(): {
+    branches: BranchRecord[];
+    nodes: IterationNode[];
+    annotations: AnnotationRecord[];
+  } {
     const branches = this.getBranches();
     const nodeRows = this.db
       .prepare(`SELECT * FROM nodes ORDER BY rowid ASC`)
       .all() as NodeRow[];
-    return { branches, nodes: nodeRows.map(toIterationNode) };
+    return {
+      branches,
+      nodes: nodeRows.map(toIterationNode),
+      annotations: this.getAnnotations(),
+    };
   }
 
   close(): void {
