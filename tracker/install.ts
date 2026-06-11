@@ -15,7 +15,11 @@ function hookBlock(): string {
     MARKER_START,
     "# Auto-installed by DesignTrail. Runs the AI iteration tracker on each commit.",
     `DESIGNTRAIL="${TRACKER_ROOT}"`,
-    'DESIGNTRAIL_SOURCE="${DESIGNTRAIL_SOURCE:-hook}" "$DESIGNTRAIL/node_modules/.bin/tsx" "$DESIGNTRAIL/tracker/capture.ts"',
+    'DESIGNTRAIL_SOURCE="${DESIGNTRAIL_SOURCE:-hook}" \\',
+    'DESIGNTRAIL_SKIP_PROMPT="${DESIGNTRAIL_SKIP_PROMPT:-1}" \\',
+    'DESIGNTRAIL_DEFAULT_ANNOTATION_MODE="${DESIGNTRAIL_DEFAULT_ANNOTATION_MODE:-skip}" \\',
+    'DESIGNTRAIL_SYNC_MIRO="${DESIGNTRAIL_SYNC_MIRO:-false}" \\',
+    '"$DESIGNTRAIL/node_modules/.bin/tsx" "$DESIGNTRAIL/tracker/capture.ts"',
     MARKER_END,
   ].join("\n");
 }
