@@ -12,8 +12,15 @@ import { deriveContainmentParents } from "../../tracker/layout.js";
 import { planFolderLayout } from "../../tracker/treeStore.js";
 import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
 import { resolveBranch, resolveParentBranch, MAIN_BRANCH } from "../../tracker/branch.js";
-import type { RenderedBoardNode } from "../../miro/miroClient.js";
+import { renderBoardFromGraph, type RenderedBoardNode } from "../../miro/miroClient.js";
 import type {
+  AnnotationChoice,
+  AnnotationChoiceTarget,
+  AnnotationColor,
+  AnnotationMode,
+  AnnotationRecord,
+  AnnotationSource,
+  BranchRecord,
   CommitData,
   IterationNode,
   ScreenshotResult,
@@ -21,18 +28,31 @@ import type {
 } from "../../tracker/types.js";
 
 export type CreateDesignSnapshotOptions = {
+  annotationChoices?: AnnotationChoice[];
+  defaultAnnotationMode?: AnnotationMode;
+  resolveAnnotationChoices?: (
+    targets: AnnotationChoiceTarget[]
+  ) => Promise<AnnotationChoice[]>;
+  /** @deprecated Use per-screenshot annotationChoices instead. */
   annotation?: string;
+  /** @deprecated Use per-screenshot annotationChoices instead. */
+  generateAiAnnotations?: boolean;
   repoPath?: string;
   source?: string;
+  syncMiro?: boolean;
 };
 
 export type DesignSnapshotEntry = {
+  nodeId: string;
   branchId: string;
   parentBranchId: string | null;
   parentId: string | null;
   type: string;
   summary: string;
   annotation: string | null;
+  annotationMode?: AnnotationMode;
+  manualAnnotation?: string | null;
+  aiAnnotation?: string | null;
   screenshotPath: string;
 };
 
@@ -43,6 +63,13 @@ export type DesignSnapshotResult = {
   entries: DesignSnapshotEntry[];
   screenshots: ScreenshotResult[];
   miroNodes: RenderedBoardNode[];
+};
+
+export type ApplyDesignSnapshotAnnotationsOptions = {
+  annotationChoices: AnnotationChoice[];
+  commitHash?: string;
+  repoPath?: string;
+  syncMiro?: boolean;
 };
 
 /**
@@ -143,9 +170,258 @@ try {
 
 const CAPTURE_URL = process.env.CAPTURE_URL ?? "http://localhost:3000";
 
+function annotationColorForSource(source: AnnotationSource): AnnotationColor | undefined {
+  if (source === "ai") return "yellow";
+  if (source === "user") return "blue";
+  return undefined;
+}
+
 function normalizeOptional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function buildAnnotationRecord(
+  nodeId: string,
+  commitHash: string,
+  source: AnnotationSource,
+  content: string,
+  createdAt: number
+): AnnotationRecord {
+  return {
+    id: `${nodeId}:${source}`,
+    nodeId,
+    commitHash,
+    source,
+    content,
+    color: annotationColorForSource(source),
+    createdAt,
+  };
+}
+
+type ResolvedAnnotationChoice = {
+  mode: AnnotationMode;
+  annotation?: string;
+};
+
+type AppliedAnnotation = {
+  mode: AnnotationMode;
+  manualAnnotation?: string;
+  aiAnnotation?: string;
+};
+
+function wantsManualAnnotation(mode: AnnotationMode): boolean {
+  return mode === "manual" || mode === "manual_and_ai";
+}
+
+function wantsAiAnnotation(mode: AnnotationMode): boolean {
+  return mode === "ai" || mode === "manual_and_ai";
+}
+
+function choiceMatchesTarget(
+  choice: AnnotationChoice,
+  target: AnnotationChoiceTarget
+): boolean {
+  return (
+    choice.nodeId === target.nodeId ||
+    choice.branchId === target.branchId ||
+    choice.screenshotPath === target.screenshotPath
+  );
+}
+
+function resolveDefaultAnnotationMode(params: {
+  defaultAnnotationMode?: AnnotationMode;
+  legacyAnnotation?: string;
+  legacyGenerateAiAnnotations?: boolean;
+}): AnnotationMode {
+  if (params.defaultAnnotationMode) return params.defaultAnnotationMode;
+
+  if (params.legacyAnnotation) {
+    return params.legacyGenerateAiAnnotations ? "manual_and_ai" : "manual";
+  }
+
+  return params.legacyGenerateAiAnnotations === false ? "skip" : "ai";
+}
+
+async function resolveAnnotationChoices(params: {
+  targets: AnnotationChoiceTarget[];
+  choices?: AnnotationChoice[];
+  resolver?: (targets: AnnotationChoiceTarget[]) => Promise<AnnotationChoice[]>;
+  defaultMode: AnnotationMode;
+  legacyAnnotation?: string;
+}): Promise<Map<string, ResolvedAnnotationChoice>> {
+  const choices =
+    params.choices ?? (params.resolver ? await params.resolver(params.targets) : []);
+  const resolved = new Map<string, ResolvedAnnotationChoice>();
+
+  for (const target of params.targets) {
+    const choice = choices.find((candidate) => choiceMatchesTarget(candidate, target));
+    const mode = choice?.mode ?? params.defaultMode;
+    const annotation = normalizeOptional(
+      choice?.annotation ??
+        (wantsManualAnnotation(mode) ? params.legacyAnnotation : undefined)
+    );
+    resolved.set(target.nodeId, { mode, annotation });
+  }
+
+  return resolved;
+}
+
+function buildAnnotationTargets(entries: DesignSnapshotEntry[]): AnnotationChoiceTarget[] {
+  return entries.map((entry) => ({
+    nodeId: entry.nodeId,
+    commitHash: entry.nodeId.split(":")[0] ?? "",
+    branchId: entry.branchId,
+    summary: entry.summary,
+    type: entry.type,
+    screenshotPath: entry.screenshotPath,
+  }));
+}
+
+function buildEntriesForCommit(params: {
+  branches: BranchRecord[];
+  nodes: IterationNode[];
+  commitHash: string;
+}): DesignSnapshotEntry[] {
+  const branchById = new Map(params.branches.map((branch) => [branch.id, branch]));
+  return params.nodes
+    .filter((node) => node.commitHash === params.commitHash)
+    .map((node) => {
+      const branch = branchById.get(node.branchId);
+      return {
+        nodeId: node.id,
+        branchId: node.branchId,
+        parentBranchId: branch?.parentBranchId ?? null,
+        parentId: node.parentId,
+        type: node.type,
+        summary: node.summary,
+        annotation: node.annotation ?? null,
+        aiAnnotation: node.annotation ?? null,
+        manualAnnotation: null,
+        screenshotPath: node.screenshotPath,
+      };
+    });
+}
+
+function applyAnnotationsToEntries(
+  entries: DesignSnapshotEntry[],
+  applied: Map<string, AppliedAnnotation>
+): void {
+  for (const entry of entries) {
+    const annotation = applied.get(entry.nodeId);
+    entry.annotationMode = annotation?.mode ?? "skip";
+    entry.manualAnnotation = annotation?.manualAnnotation ?? null;
+    entry.aiAnnotation = annotation?.aiAnnotation ?? null;
+    entry.annotation =
+      annotation?.manualAnnotation ?? annotation?.aiAnnotation ?? null;
+  }
+}
+
+async function applyAnnotationChoicesToGraph(params: {
+  graph: DesignGraph;
+  commit: CommitData;
+  targets: AnnotationChoiceTarget[];
+  choices?: AnnotationChoice[];
+  resolver?: (targets: AnnotationChoiceTarget[]) => Promise<AnnotationChoice[]>;
+  defaultMode: AnnotationMode;
+  legacyAnnotation?: string;
+}): Promise<Map<string, AppliedAnnotation>> {
+  const resolved = await resolveAnnotationChoices({
+    targets: params.targets,
+    choices: params.choices,
+    resolver: params.resolver,
+    defaultMode: params.defaultMode,
+    legacyAnnotation: params.legacyAnnotation,
+  });
+  const applied = new Map<string, AppliedAnnotation>();
+
+  params.graph.transaction(() => {
+    for (const target of params.targets) {
+      const choice = resolved.get(target.nodeId) ?? { mode: params.defaultMode };
+      const manualAnnotation =
+        wantsManualAnnotation(choice.mode) && choice.annotation
+          ? choice.annotation
+          : undefined;
+
+      params.graph.deleteAnnotation(target.nodeId, "user");
+      params.graph.deleteAnnotation(target.nodeId, "ai");
+      params.graph.clearNodeAnnotation(target.nodeId);
+
+      const commitMessage = normalizeOptional(params.commit.message);
+      if (commitMessage) {
+        params.graph.upsertAnnotation(
+          buildAnnotationRecord(
+            target.nodeId,
+            params.commit.hash,
+            "commit_message",
+            commitMessage,
+            params.commit.timestamp
+          )
+        );
+      }
+
+      if (manualAnnotation) {
+        params.graph.upsertAnnotation(
+          buildAnnotationRecord(
+            target.nodeId,
+            params.commit.hash,
+            "user",
+            manualAnnotation,
+            Date.now()
+          )
+        );
+      }
+
+      applied.set(target.nodeId, {
+        mode: choice.mode,
+        manualAnnotation,
+      });
+    }
+  });
+
+  const aiInputs = params.targets
+    .filter((target) => wantsAiAnnotation(resolved.get(target.nodeId)?.mode ?? "skip"))
+    .map((target) => ({
+      outputPath: path.join(DESIGNTRAIL_ROOT, target.screenshotPath),
+      branchId: target.branchId,
+      summary: target.summary,
+      type: target.type,
+      commitMessage: params.commit.message,
+      diff: params.commit.diff,
+    }));
+
+  const aiAnnotations = await annotateScreenshots(aiInputs);
+  params.graph.transaction(() => {
+    for (const { outputPath, annotation } of aiAnnotations) {
+      const target = params.targets.find(
+        (candidate) =>
+          path.join(DESIGNTRAIL_ROOT, candidate.screenshotPath) === outputPath
+      );
+      if (!target) continue;
+
+      params.graph.setNodeAnnotation(target.nodeId, annotation);
+      const normalizedAnnotation = normalizeOptional(annotation);
+      if (normalizedAnnotation) {
+        params.graph.upsertAnnotation(
+          buildAnnotationRecord(
+            target.nodeId,
+            params.commit.hash,
+            "ai",
+            normalizedAnnotation,
+            Date.now()
+          )
+        );
+      }
+
+      const existing = applied.get(target.nodeId) ?? { mode: "ai" };
+      applied.set(target.nodeId, {
+        ...existing,
+        aiAnnotation: normalizedAnnotation,
+      });
+    }
+  });
+
+  return applied;
 }
 
 /** SHA-256 of a file's bytes, or null if it can't be read. */
@@ -167,6 +443,8 @@ export async function createDesignSnapshot(
   options?: CreateDesignSnapshotOptions
 ): Promise<DesignSnapshotResult> {
   const repoPath = path.resolve(options?.repoPath ?? process.cwd());
+  const manualAnnotation = normalizeOptional(options?.annotation);
+  const generateAiAnnotations = options?.generateAiAnnotations ?? !manualAnnotation;
   const { hash, message } = await getLatestCommit(repoPath);
   const diff = await getDiff(hash, repoPath);
   const repoName = await getRepoName(repoPath);
@@ -178,7 +456,7 @@ export async function createDesignSnapshot(
     timestamp: Date.now(),
     repoName,
     source: normalizeOptional(options?.source),
-    annotation: normalizeOptional(options?.annotation),
+    annotation: manualAnnotation,
   };
 
   const graph = await DesignGraph.load(repoName);
@@ -186,6 +464,12 @@ export async function createDesignSnapshot(
   let entries: DesignSnapshotEntry[] = [];
   const nodeByOutput = new Map<string, string>();
   let screenshots: ScreenshotResult[] = [];
+  let boardExport: {
+    branches: BranchRecord[];
+    nodes: IterationNode[];
+    commits: Map<string, CommitData>;
+    annotations: AnnotationRecord[];
+  } | null = null;
 
   try {
     // Read the live DOM (across pages) first so the LLM targets elements that
@@ -268,6 +552,7 @@ export async function createDesignSnapshot(
 
         const branchRecord = graph.getBranch(branchId);
         entries.push({
+          nodeId: `${commit.hash}:${branchId}`,
           branchId,
           parentBranchId: branchRecord?.parentBranchId ?? null,
           parentId,
@@ -317,6 +602,7 @@ export async function createDesignSnapshot(
         nodeByOutput.set(outputPath, nodeId);
         const branchRecord = graph.getBranch(branchId);
         const entry: DesignSnapshotEntry = {
+          nodeId,
           branchId,
           parentBranchId: branchRecord?.parentBranchId ?? null,
           parentId,
@@ -417,42 +703,21 @@ export async function createDesignSnapshot(
       }
     }
 
-    // Generate a unique, design-oriented annotation (What changed + a hedged
-    // guess at Why) for each surviving screenshot via a vision pass, then persist
-    // it on the node and back onto the entry. Runs after dedup so removed
-    // captures aren't annotated, and against the pre-mirror outputPath (the PNG
-    // still lives there at this point).
-    const entryByNodeId = new Map(
-      entries.map((entry) => [`${commit.hash}:${entry.branchId}`, entry])
-    );
-    const annotationInputs = screenshots
-      .map(({ outputPath }) => {
-        const nodeId = nodeByOutput.get(outputPath);
-        const entry = nodeId ? entryByNodeId.get(nodeId) : undefined;
-        if (!entry) return null;
-        return {
-          outputPath,
-          branchId: entry.branchId,
-          summary: entry.summary,
-          type: entry.type,
-          commitMessage: commit.message,
-          diff: commit.diff,
-        };
-      })
-      .filter((input): input is NonNullable<typeof input> => input !== null);
-
-    const annotations = await annotateScreenshots(annotationInputs);
-
-    graph.transaction(() => {
-      for (const { outputPath, annotation } of annotations) {
-        const nodeId = nodeByOutput.get(outputPath);
-        if (nodeId) {
-          graph.setNodeAnnotation(nodeId, annotation);
-          const entry = entryByNodeId.get(nodeId);
-          if (entry) entry.annotation = annotation;
-        }
-      }
+    const annotationTargets = buildAnnotationTargets(entries);
+    const appliedAnnotations = await applyAnnotationChoicesToGraph({
+      graph,
+      commit,
+      targets: annotationTargets,
+      choices: options?.annotationChoices,
+      resolver: options?.resolveAnnotationChoices,
+      defaultMode: resolveDefaultAnnotationMode({
+        defaultAnnotationMode: options?.defaultAnnotationMode,
+        legacyAnnotation: manualAnnotation,
+        legacyGenerateAiAnnotations: generateAiAnnotations,
+      }),
+      legacyAnnotation: manualAnnotation,
     });
+    applyAnnotationsToEntries(entries, appliedAnnotations);
 
     // Persist each captured element's geometry onto its node so the spatial board
     // can nest/position branches by real on-screen containment.
@@ -545,13 +810,26 @@ export async function createDesignSnapshot(
         : screenshot;
     });
 
+    const finalGraph = graph.exportGraph();
+    boardExport = {
+      branches: finalGraph.branches,
+      nodes: finalGraph.nodes,
+      commits: graph.getCommits(),
+      annotations: finalGraph.annotations,
+    };
   } finally {
     graph.close();
   }
 
-  // Miro rendering is intentionally out-of-band because it wipes and rebuilds
-  // the entire board. Run `npm run render-miro -- <repo>` when a board refresh is desired.
-  const miroNodes: RenderedBoardNode[] = [];
+  const miroNodes: RenderedBoardNode[] =
+    options?.syncMiro === false || !boardExport
+      ? []
+      : await renderBoardFromGraph(
+          boardExport.branches,
+          boardExport.nodes,
+          boardExport.commits,
+          boardExport.annotations
+        );
 
   return {
     commit,
@@ -559,6 +837,79 @@ export async function createDesignSnapshot(
     repoPath,
     entries,
     screenshots,
+    miroNodes,
+  };
+}
+
+export async function applyDesignSnapshotAnnotations(
+  options: ApplyDesignSnapshotAnnotationsOptions
+): Promise<DesignSnapshotResult> {
+  const repoPath = path.resolve(options.repoPath ?? process.cwd());
+  const repoName = await getRepoName(repoPath);
+  const commitHash = options.commitHash ?? (await getLatestCommit(repoPath)).hash;
+  const graph = await DesignGraph.load(repoName);
+
+  let commit: CommitData;
+  let entries: DesignSnapshotEntry[] = [];
+  let boardExport: {
+    branches: BranchRecord[];
+    nodes: IterationNode[];
+    commits: Map<string, CommitData>;
+    annotations: AnnotationRecord[];
+  } | null = null;
+
+  try {
+    const capturedCommit = graph.getCommits().get(commitHash);
+    if (!capturedCommit) {
+      throw new Error(`No captured DesignTrail commit found for ${commitHash}`);
+    }
+    commit = capturedCommit;
+
+    const graphSnapshot = graph.exportGraph();
+    entries = buildEntriesForCommit({
+      branches: graphSnapshot.branches,
+      nodes: graphSnapshot.nodes,
+      commitHash,
+    });
+
+    const appliedAnnotations = await applyAnnotationChoicesToGraph({
+      graph,
+      commit,
+      targets: buildAnnotationTargets(entries),
+      choices: options.annotationChoices,
+      defaultMode: "skip",
+    });
+    applyAnnotationsToEntries(entries, appliedAnnotations);
+
+    const finalGraph = graph.exportGraph();
+    boardExport = {
+      branches: finalGraph.branches,
+      nodes: finalGraph.nodes,
+      commits: graph.getCommits(),
+      annotations: finalGraph.annotations,
+    };
+  } finally {
+    graph.close();
+  }
+
+  const miroNodes =
+    options.syncMiro === false || !boardExport
+      ? []
+      : await renderBoardFromGraph(
+          boardExport.branches,
+          boardExport.nodes,
+          boardExport.commits,
+          boardExport.annotations
+        );
+
+  return {
+    commit,
+    repoName,
+    repoPath,
+    entries,
+    screenshots: entries.map((entry) => ({
+      outputPath: path.join(DESIGNTRAIL_ROOT, entry.screenshotPath),
+    })),
     miroNodes,
   };
 }

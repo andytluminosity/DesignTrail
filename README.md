@@ -22,7 +22,7 @@ flowchart TD
   branch --> node["build IterationNode (parent = branch tip)"]
   node --> store["graph.ts: addNode + ensureBranch (SQLite)"]
   loop --> shot["screenshot.ts: takeScreenshots (one browser, N captures)"]
-  shot --> annotate["annotate.ts: annotateScreenshots (vision) -> per-node annotation"]
+  shot --> annotate["per-screenshot choices + annotate.ts vision notes"]
   annotate --> save["treeStore.ts: mirror branch tree to captures/repo/(nested branch folders)"]
   store --> db["/data/repo/graph.db"]
 ```
@@ -76,7 +76,9 @@ branches (id PK, parent_branch_id, fork_node_id, created_at, -- the component tr
           nav_path, target_json)                             -- how to re-screenshot the branch
 nodes    (id PK = "<hash>:<branch>", commit_hash, branch_id, -- one per component change
           parent_id, summary, annotation, type, screenshot_path, timestamp,
-          geom_x, geom_y, geom_w, geom_h, page_w, page_h)    -- annotation + located element's on-screen rect
+          geom_x, geom_y, geom_w, geom_h, page_w, page_h)    -- AI annotation + located element's on-screen rect
+annotations (id PK, node_id, commit_hash, source, content,
+             color, created_at)                              -- commit message, user, and AI notes by screenshot
 ```
 
 Each node also records the **on-screen geometry** of its located element (the
@@ -204,17 +206,18 @@ The uninstaller ([tracker/uninstall.ts](tracker/uninstall.ts)):
 3. `analyzeCommit` sends the commit message + diff + live DOM map + existing component tree
    to OpenAI and gets back a list of changed components.
 4. For each component, a branch is resolved (reused or newly nested), an `IterationNode` is
-   written, and a targeted screenshot is captured (all captures share one browser). Each
-   surviving screenshot then gets a unique, design-oriented annotation (What changed + a
-   hedged guess at Why) from a vision pass (`annotate.ts`) that reads the captured image plus
-   the diff; it is stored on the node and surfaced in the visualizer and Miro sticky notes.
+   written, and a targeted screenshot is captured (all captures share one browser). After
+   duplicate captures are removed, annotation choices are resolved per surviving screenshot:
+   manual notes are stored as `user` records for that node, and selected AI notes are generated
+   by a vision pass (`annotate.ts`) that reads the captured image plus the diff.
 5. Once the branch tree is finalized, the screenshots are mirrored into nested branch folders
    under `captures/<repo-name>/` so the directory layout matches the component tree (each
    branch folder holds its iteration PNGs plus its child-branch subfolders). SQLite remains
    the source of truth; the folder tree is reconciled from it after every capture. Captures
    from all watched repos are centralized here and namespaced per repo.
-6. Miro is not updated during capture. When you want the external board refreshed, run the
-   manual render script (see [Rendering the board on Miro](#rendering-the-board-on-miro)).
+6. When `syncMiro` is enabled, the Miro board is wiped and re-rendered in full from the graph
+   (see [Rendering the board on Miro](#rendering-the-board-on-miro)). Because the whole tree is
+   redrawn, positions are recomputed so the board reflects the current design-evolution tree.
 
 The reusable core entry point is `createDesignSnapshot(options)` in
 `src/core/snapshotService.ts`. Integrations should pass `repoPath` explicitly
@@ -224,12 +227,23 @@ instead of changing process state:
 await createDesignSnapshot({
   repoPath: "/path/to/repo",
   source: "claude",
-  annotation: "Optional note from the integration",
+  annotationChoices: [
+    {
+      nodeId: "<commit-hash>:sidebar",
+      mode: "manual_and_ai",
+      annotation: "Sidebar controls now support faster scan-and-collapse behavior",
+    },
+  ],
+  syncMiro: true,
 });
 ```
 
-`createDesignSnapshot` captures and persists locally only. Miro rendering is a separate,
-manual step because it wipes and redraws the configured board.
+Set `syncMiro: false` to capture and persist locally without creating/updating
+Miro items. Commit integrations should ask whether to render Miro before capture starts:
+local-only runs can use `defaultAnnotationMode: "skip"` and `syncMiro: false`. Render runs
+should first capture with `defaultAnnotationMode: "skip"` and `syncMiro: false`, ask
+per-screenshot annotation choices from the returned entries, then apply those choices through
+the snapshot annotation update API with `syncMiro: true` so the board is drawn once at the end.
 
 ## LLM output contract
 
@@ -287,6 +301,9 @@ system never crashes a commit.
 | `OPENAI_API_KEY` | (required for analysis)  | Auth for the OpenAI call. Missing -> full-page fallback. |
 | `CAPTURE_URL`    | `http://localhost:3000`  | The page the screenshot is taken against.        |
 | `CAPTURE_PUBLIC_URL` / `PUBLIC_CAPTURE_URL` | `CAPTURE_URL` | Public base URL Miro uses to fetch saved screenshots. |
+| `DESIGNTRAIL_ANNOTATION_CHOICES` | (optional) | JSON array of per-node annotation choices for non-interactive hook runs. |
+| `DESIGNTRAIL_DEFAULT_ANNOTATION_MODE` | `ai` | Default mode for screenshots without an explicit choice (`skip`, `manual`, `ai`, `manual_and_ai`). |
+| `DESIGNTRAIL_SYNC_MIRO` | `true` | Set to `false` to capture into SQLite without rendering Miro. |
 
 Read from `.env` in the DesignTrail root, regardless of which repo triggered the hook.
 
@@ -306,7 +323,7 @@ tracker/
   backfill-geometry.ts  One-off: populates geometry for branches captured before geometry tracking
   install.ts      Installs the post-commit hook into target repos
   uninstall.ts    Removes the post-commit hook from target repos
-  types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry
+  types.ts        CommitData, ScreenshotTarget, ComponentChange, CommitAnalysis, IterationNode, BranchRecord, NodeGeometry, annotation choices
 miro/
   miroClient.ts   clearBoard + renderBoardFromGraph: wipe the board and redraw the whole component tree
   treeLayout.ts   computeClusterFootprint (uniform annotation-padded box) + planTreeLayout (deterministic tidy tree)

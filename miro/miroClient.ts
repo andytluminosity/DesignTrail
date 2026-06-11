@@ -1,7 +1,13 @@
 import { existsSync, readFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import type { BranchRecord, CommitData, IterationNode } from "../tracker/types.js";
+import type {
+  AnnotationColor,
+  AnnotationRecord,
+  BranchRecord,
+  CommitData,
+  IterationNode,
+} from "../tracker/types.js";
 import {
   parseAnnotationBlocks,
   placeAnnotations,
@@ -230,6 +236,7 @@ type CreateMiroImageFromFileInput = CreateMiroItemBase & {
 type CreateMiroStickyNoteInput = CreateMiroItemBase & {
   content: string;
   width?: number;
+  color?: AnnotationColor;
 };
 
 type CreateMiroShapeInput = CreateMiroItemBase & {
@@ -623,6 +630,7 @@ export async function createMiroStickyNote({
   anchorItemId,
   anchorOffset,
   width,
+  color,
 }: CreateMiroStickyNoteInput): Promise<MiroItemResponse> {
   const resolvedPosition = await resolveMiroPosition({
     accessToken,
@@ -638,6 +646,7 @@ export async function createMiroStickyNote({
     {
       data: { content },
       position: resolvedPosition,
+      ...(color ? { style: { fillColor: color } } : {}),
       ...(width ? { geometry: { width } } : {}),
     }
   );
@@ -711,22 +720,67 @@ export async function createConnector({
 
 /**
  * Builds a screenshot's HEADER sticky-note content: a per-component label
- * (short hash + branch, type, summary) plus the commit-level metadata (message,
- * source, commit annotation) for the commit this node belongs to.
+ * (short hash + branch, type, summary) plus commit-level metadata. Manual commit
+ * annotations render as their own designated sticky note, not hidden here.
  */
-function buildStickyContent(
-  node: IterationNode,
-  commit: CommitData | undefined
+function groupAnnotationsByNode(
+  annotations: AnnotationRecord[]
+): Map<string, AnnotationRecord[]> {
+  const map = new Map<string, AnnotationRecord[]>();
+  for (const annotation of annotations) {
+    const list = map.get(annotation.nodeId) ?? [];
+    list.push(annotation);
+    map.set(annotation.nodeId, list);
+  }
+  return map;
+}
+
+function getAnnotationContent(
+  annotations: AnnotationRecord[] | undefined,
+  source: AnnotationRecord["source"],
+  fallback?: string
 ): string {
+  const record = annotations?.find((annotation) => annotation.source === source);
+  return (record?.content ?? fallback ?? "").trim();
+}
+
+function colorForAnnotationSource(
+  source: AnnotationRecord["source"]
+): AnnotationColor | undefined {
+  if (source === "ai") return "yellow";
+  if (source === "user") return "blue";
+  return undefined;
+}
+
+function getAnnotationColor(
+  annotations: AnnotationRecord[] | undefined,
+  source: AnnotationRecord["source"]
+): AnnotationColor | undefined {
+  return (
+    annotations?.find((annotation) => annotation.source === source)?.color ??
+    colorForAnnotationSource(source)
+  );
+}
+
+function buildStickyContent(params: {
+  node: IterationNode;
+  commit: CommitData | undefined;
+  annotations: AnnotationRecord[] | undefined;
+}): string {
+  const { node, commit, annotations } = params;
   const shortHash = node.commitHash.slice(0, 7);
   const label = node.branchId || "main";
   const lines = [`${shortHash} · ${label}`];
   if (node.type) lines.push(node.type);
   if (node.summary) lines.push(node.summary);
+  const commitMessage = getAnnotationContent(
+    annotations,
+    "commit_message",
+    commit?.message
+  );
+  if (commitMessage) lines.push(commitMessage);
   if (commit) {
-    if (commit.message) lines.push(commit.message);
     if (commit.source) lines.push(`source: ${commit.source}`);
-    if (commit.annotation) lines.push(commit.annotation);
   }
   return lines.join("\n");
 }
@@ -744,6 +798,7 @@ async function uploadAnnotationNotes(params: {
   imageH: number;
   blocks: AnnotationBlock[];
   placements: AnnotationPlacement[];
+  color?: AnnotationColor;
 }): Promise<void> {
   const layout = computeStickyLayout(
     params.imageCenter,
@@ -765,6 +820,7 @@ async function uploadAnnotationNotes(params: {
           content: block.text,
           position: item.position,
           width: STICKY_W,
+          color: params.color,
         });
         await createConnector({
           accessToken: params.accessToken,
@@ -778,6 +834,65 @@ async function uploadAnnotationNotes(params: {
       }
     })
   );
+}
+
+async function uploadManualAnnotationNote(params: {
+  accessToken: string;
+  boardId: string;
+  imageItemId: string;
+  imageCenter: MiroPosition;
+  imageH: number;
+  nodeId: string;
+  content: string;
+  color?: AnnotationColor;
+}): Promise<void> {
+  const layout = computeStickyLayout(params.imageCenter, IMAGE_W, params.imageH, [
+    { index: 1, x: 1, y: 0.5 },
+  ]);
+  const item = layout[0];
+  if (!item) {
+    console.error(`Manual annotation note skipped for ${params.nodeId}: no layout slot.`);
+    return;
+  }
+
+  let note: MiroItemResponse;
+  try {
+    note = await createMiroStickyNote({
+      accessToken: params.accessToken,
+      boardId: params.boardId,
+      content: params.content,
+      position: item.position,
+      width: STICKY_W,
+      color: params.color,
+    });
+    console.log(
+      `Manual annotation note created for ${params.nodeId}: ${note.id} at (${Math.round(
+        item.position.x
+      )}, ${Math.round(item.position.y)}).`
+    );
+  } catch (error: unknown) {
+    console.error(
+      `Failed to create manual annotation note for ${params.nodeId}:`,
+      getErrorMessage(error)
+    );
+    return;
+  }
+
+  try {
+    await createConnector({
+      accessToken: params.accessToken,
+      boardId: params.boardId,
+      startItemId: note.id,
+      endItemId: params.imageItemId,
+      endPosition: item.anchor,
+    });
+    console.log(`Manual annotation connector created for ${params.nodeId}: ${note.id}.`);
+  } catch (error: unknown) {
+    console.error(
+      `Manual annotation note ${note.id} was created, but connector failed for ${params.nodeId}:`,
+      getErrorMessage(error)
+    );
+  }
 }
 
 function groupNodesByBranch(nodes: IterationNode[]): Map<string, IterationNode[]> {
@@ -811,8 +926,13 @@ const CHRONOLOGY_CONNECTOR_STYLE: MiroConnectorStyle = { strokeColor: "#ff0000" 
 // One screenshot node with everything precomputed for layout and drawing.
 type PreparedNode = {
   node: IterationNode;
+  aiAnnotation: string;
+  aiAnnotationColor?: AnnotationColor;
   imageH: number;
   blocks: AnnotationBlock[];
+  manualAnnotation: string;
+  manualAnnotationColor?: AnnotationColor;
+  manualPlacements: AnnotationPlacement[];
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
@@ -827,6 +947,7 @@ type DrawTreeArgs = {
   nodes: IterationNode[];
   prepared: PreparedNode[];
   commitsByHash: Map<string, CommitData>;
+  annotationsByNode: Map<string, AnnotationRecord[]>;
   // Board-units this tree is shifted to the right, so two trees sit side by side.
   offsetX: number;
   // Namespaces image-item lookups so the SAME node id can be drawn in both trees
@@ -887,6 +1008,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
     nodes,
     prepared,
     commitsByHash,
+    annotationsByNode,
     offsetX,
     keyPrefix,
     title,
@@ -1001,7 +1123,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
         createMiroStickyNote({
           accessToken,
           boardId,
-          content: buildStickyContent(p.node, commitsByHash.get(p.node.commitHash)),
+          content: buildStickyContent({
+            node: p.node,
+            commit: commitsByHash.get(p.node.commitHash),
+            annotations: annotationsByNode.get(p.node.id),
+          }),
           position: {
             x: left - NOTE_MARGIN - STICKY_W / 2,
             y: top - NOTE_MARGIN - STICKY_H / 2,
@@ -1011,6 +1137,21 @@ async function drawTree(args: DrawTreeArgs): Promise<{
           console.error("Failed to place header note:", getErrorMessage(error))
         ),
       ];
+
+      if (p.manualAnnotation) {
+        noteWork.push(
+          uploadManualAnnotationNote({
+            accessToken,
+            boardId,
+            imageItemId,
+            imageCenter,
+            imageH: p.imageH,
+            nodeId: p.node.id,
+            content: p.manualAnnotation,
+            color: p.manualAnnotationColor,
+          })
+        );
+      }
 
       // Per-element annotation notes around the image; on a missing placement we
       // fall back to a single combined note beside the image.
@@ -1024,19 +1165,21 @@ async function drawTree(args: DrawTreeArgs): Promise<{
             imageH: p.imageH,
             blocks: p.blocks,
             placements: p.placements,
+            color: p.aiAnnotationColor,
           })
         );
-      } else if ((p.node.annotation ?? "").trim()) {
+      } else if (p.aiAnnotation) {
         noteWork.push(
           createMiroStickyNote({
             accessToken,
             boardId,
-            content: (p.node.annotation ?? "").trim(),
+            content: p.aiAnnotation,
             position: {
               x: imageCenter.x + IMAGE_W / 2 + NOTE_MARGIN + STICKY_W / 2,
               y: imageCenter.y,
             },
             width: STICKY_W,
+            color: p.aiAnnotationColor,
           }).catch((error: unknown) =>
             console.error("Failed to place annotation note:", getErrorMessage(error))
           )
@@ -1108,8 +1251,14 @@ export async function renderBoardFromGraph(
   branches: BranchRecord[],
   nodes: IterationNode[],
   commitsByHash: Map<string, CommitData>,
-  options: RenderBoardOptions = {}
+  annotationsOrOptions: AnnotationRecord[] | RenderBoardOptions = [],
+  optionsArg: RenderBoardOptions = {}
 ): Promise<RenderedBoardNode[]> {
+  const annotationRecords = Array.isArray(annotationsOrOptions)
+    ? annotationsOrOptions
+    : [];
+  const options = Array.isArray(annotationsOrOptions) ? optionsArg : annotationsOrOptions;
+  const annotationsByNode = groupAnnotationsByNode(annotationRecords);
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
 
@@ -1140,15 +1289,39 @@ export async function renderBoardFromGraph(
       const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
       const dims = await readPngDimensions(absPng);
       const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const annotation = (node.annotation ?? "").trim();
-      const blocks = annotation ? parseAnnotationBlocks(annotation) : [];
+      const commit = commitsByHash.get(node.commitHash);
+      const nodeAnnotations = annotationsByNode.get(node.id);
+      const manualAnnotation = getAnnotationContent(
+        nodeAnnotations,
+        "user",
+        commit?.annotation
+      );
+      const manualAnnotationColor = manualAnnotation
+        ? getAnnotationColor(nodeAnnotations, "user")
+        : undefined;
+      const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+      const aiAnnotationColor = aiAnnotation
+        ? getAnnotationColor(nodeAnnotations, "ai")
+        : undefined;
+      const manualPlacements: AnnotationPlacement[] = manualAnnotation
+        ? [{ index: 1, x: 1, y: 0.5 }]
+        : [];
+      const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
-      const footprint = computeClusterFootprint(imageH);
+      const footprint = computeClusterFootprint(imageH, [
+        ...manualPlacements,
+        ...placements,
+      ]);
       return {
         node,
+        aiAnnotation,
+        aiAnnotationColor,
         imageH,
         blocks,
+        manualAnnotation,
+        manualAnnotationColor,
+        manualPlacements,
         placements,
         footprint,
         url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
@@ -1183,6 +1356,7 @@ export async function renderBoardFromGraph(
     nodes: prunedNodes,
     prepared: prunedPrepared,
     commitsByHash,
+    annotationsByNode,
     offsetX: 0,
     keyPrefix: "pruned:",
     title: "Significant changes only",
@@ -1197,6 +1371,7 @@ export async function renderBoardFromGraph(
     nodes,
     prepared,
     commitsByHash,
+    annotationsByNode,
     offsetX: pruned.maxRight + TREE_GAP,
     keyPrefix: "",
     title: "Full history",

@@ -31,8 +31,13 @@ async function renderRepo(repo: string): Promise<void> {
 
   const graph = await DesignGraph.load(repo);
   try {
-    const { branches, nodes } = graph.exportGraph();
-    const rendered = await renderBoardFromGraph(branches, nodes, graph.getCommits());
+    const { branches, nodes, annotations } = graph.exportGraph();
+    const rendered = await renderBoardFromGraph(
+      branches,
+      nodes,
+      graph.getCommits(),
+      annotations
+    );
     console.log(`${repo}: rendered ${rendered.length} screenshot(s) to Miro.`);
   } finally {
     graph.close();
