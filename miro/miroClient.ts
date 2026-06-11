@@ -9,11 +9,13 @@ import type {
   IterationNode,
 } from "../tracker/types.js";
 import {
+  classifyAnnotationVisuals,
   parseAnnotationBlocks,
   placeAnnotations,
   readPngDimensions,
   type AnnotationBlock,
   type AnnotationPlacement,
+  type AnnotationVisual,
 } from "./annotationPlacement.js";
 import {
   computeClusterFootprint,
@@ -233,6 +235,13 @@ type CreateMiroStickyNoteInput = CreateMiroItemBase & {
   color?: AnnotationColor;
 };
 
+type CreateMiroTextInput = CreateMiroItemBase & {
+  content: string;
+  width?: number;
+  color?: string;
+  fontSize?: number;
+};
+
 type CreateMiroShapeInput = CreateMiroItemBase & {
   shape: "rectangle";
   width: number;
@@ -279,6 +288,10 @@ export type RenderedBoardNode = {
 
 type RenderBoardOptions = {
   publicBaseUrl?: string;
+};
+
+type RenderableAnnotationBlock = AnnotationBlock & {
+  visual: AnnotationVisual;
 };
 
 function getStoredMiroAccessToken(): string | null {
@@ -564,6 +577,41 @@ export async function createMiroStickyNote({
   );
 }
 
+async function createMiroText({
+  accessToken,
+  boardId,
+  content,
+  position = { x: 0, y: 0 },
+  anchorItemId,
+  anchorOffset,
+  width,
+  color = "#1a1a1a",
+  fontSize = 24,
+}: CreateMiroTextInput): Promise<MiroItemResponse> {
+  const resolvedPosition = await resolveMiroPosition({
+    accessToken,
+    boardId,
+    position,
+    anchorItemId,
+    anchorOffset,
+  });
+
+  return postMiroItem(
+    `https://api.miro.com/v2/boards/${boardId}/texts`,
+    accessToken,
+    {
+      data: { content },
+      position: resolvedPosition,
+      style: {
+        color,
+        fontSize,
+        textAlign: "left",
+      },
+      ...(width ? { geometry: { width } } : {}),
+    }
+  );
+}
+
 async function createMiroShape({
   accessToken,
   boardId,
@@ -698,17 +746,18 @@ function buildStickyContent(params: {
 }
 
 /**
- * Creates one sticky note per annotation block in its computed margin slot and
- * draws a connector from each note to the exact element it describes on the
+ * Creates one rendered mark per AI annotation block in its computed margin slot:
+ * concise labels become text callouts, review comments remain sticky notes. Each
+ * mark gets a connector to the exact element it describes on the
  * image. Individual note/connector failures are logged but never abort the rest.
  */
-async function uploadAnnotationNotes(params: {
+async function uploadAnnotationMarks(params: {
   accessToken: string;
   boardId: string;
   imageItemId: string;
   imageCenter: MiroPosition;
   imageH: number;
-  blocks: AnnotationBlock[];
+  blocks: RenderableAnnotationBlock[];
   placements: AnnotationPlacement[];
   color?: AnnotationColor;
 }): Promise<void> {
@@ -726,23 +775,32 @@ async function uploadAnnotationNotes(params: {
       if (!block) return;
 
       try {
-        const note = await createMiroStickyNote({
-          accessToken: params.accessToken,
-          boardId: params.boardId,
-          content: block.text,
-          position: item.position,
-          width: STICKY_W,
-          color: params.color,
-        });
+        const mark =
+          block.visual === "text"
+            ? await createMiroText({
+                accessToken: params.accessToken,
+                boardId: params.boardId,
+                content: block.text,
+                position: item.position,
+                width: STICKY_W,
+              })
+            : await createMiroStickyNote({
+                accessToken: params.accessToken,
+                boardId: params.boardId,
+                content: block.text,
+                position: item.position,
+                width: STICKY_W,
+                color: params.color,
+              });
         await createConnector({
           accessToken: params.accessToken,
           boardId: params.boardId,
-          startItemId: note.id,
+          startItemId: mark.id,
           endItemId: params.imageItemId,
           endPosition: item.anchor,
         });
       } catch (error: unknown) {
-        console.error("Failed to place annotation note:", getErrorMessage(error));
+        console.error("Failed to place annotation mark:", getErrorMessage(error));
       }
     })
   );
@@ -841,7 +899,7 @@ type PreparedNode = {
   aiAnnotation: string;
   aiAnnotationColor?: AnnotationColor;
   imageH: number;
-  blocks: AnnotationBlock[];
+  blocks: RenderableAnnotationBlock[];
   manualAnnotation: string;
   manualAnnotationColor?: AnnotationColor;
   manualPlacements: AnnotationPlacement[];
@@ -1032,11 +1090,11 @@ async function drawTree(args: DrawTreeArgs): Promise<{
         );
       }
 
-      // Per-element annotation notes around the image; on a missing placement we
-      // fall back to a single combined note beside the image.
+      // Per-element AI annotation marks around the image; on a missing placement
+      // we fall back to a single combined sticky note beside the image.
       if (p.placements.length > 0 && p.blocks.length > 0) {
         noteWork.push(
-          uploadAnnotationNotes({
+          uploadAnnotationMarks({
             accessToken,
             boardId,
             imageItemId,
@@ -1184,6 +1242,15 @@ export async function renderBoardFromGraph(
         ? [{ index: 1, x: 1, y: 0.5 }]
         : [];
       const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
+      const visualChoices =
+        blocks.length > 0 ? await classifyAnnotationVisuals(blocks) : null;
+      const visualByIndex = new Map(
+        (visualChoices ?? []).map((choice) => [choice.index, choice.visual] as const)
+      );
+      const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => ({
+        ...block,
+        visual: visualByIndex.get(block.index) ?? "sticky",
+      }));
       const placements =
         blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
       const footprint = computeClusterFootprint(imageH, [
@@ -1195,7 +1262,7 @@ export async function renderBoardFromGraph(
         aiAnnotation,
         aiAnnotationColor,
         imageH,
-        blocks,
+        blocks: renderableBlocks,
         manualAnnotation,
         manualAnnotationColor,
         manualPlacements,

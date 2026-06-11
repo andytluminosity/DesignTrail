@@ -16,6 +16,13 @@ export type AnnotationBlock = {
   text: string;
 };
 
+export type AnnotationVisual = "text" | "sticky";
+
+export type AnnotationVisualChoice = {
+  index: number;
+  visual: AnnotationVisual;
+};
+
 // Normalized location of an annotation's target element on the screenshot,
 // where x/y are in [0, 1] relative to the image's top-left corner.
 export type AnnotationPlacement = {
@@ -131,9 +138,86 @@ Rules:
 - Include every index you were given exactly once.
 - If you cannot locate an element, estimate the most plausible position; never omit an index.`;
 
+const VISUAL_CLASSIFICATION_SYSTEM_PROMPT = `You are classifying design annotations for a Miro design review board.
+
+Each annotation describes something about a UI screenshot. Decide whether each annotation should render as:
+
+- "text": a direct label or factual callout attached to a UI element. Use this for short, descriptive observations such as what changed, what an element is, or where something moved.
+- "sticky": a review/comment note. Use this for opinions, rationale, concerns, questions, recommendations, tradeoffs, TODOs, or anything that reads like feedback from a reviewer.
+
+Return STRICT JSON in exactly this shape, with one entry per annotation index given to you:
+{ "annotations": [ { "index": <number>, "visual": "text" | "sticky" } ] }
+
+Rules:
+- Output ONLY the JSON object. No prose, no markdown.
+- Include every annotation index exactly once.
+- Use only "text" or "sticky" for visual.
+- Prefer "text" for concise element labels and factual change descriptions.
+- Prefer "sticky" for longer explanations, subjective judgments, risks, open questions, or action items.
+- If unsure, choose "sticky" because ambiguous review content should remain comment-like.`;
+
 function clamp01(value: number): number {
   if (Number.isNaN(value)) return 0.5;
   return Math.min(1, Math.max(0, value));
+}
+
+function isAnnotationVisual(value: unknown): value is AnnotationVisual {
+  return value === "text" || value === "sticky";
+}
+
+/**
+ * Asks the model whether each generated annotation is an element label/callout
+ * (`text`) or review/comment content (`sticky`). Returns null on model failures;
+ * callers should default AI annotations to sticky notes in that case.
+ */
+export async function classifyAnnotationVisuals(
+  blocks: AnnotationBlock[]
+): Promise<AnnotationVisualChoice[] | null> {
+  if (blocks.length === 0) return null;
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const blockList = blocks
+    .map((block) => `[${block.index}] ${block.text}`)
+    .join("\n\n");
+
+  try {
+    const client = new OpenAI({ apiKey });
+    const completion = await client.chat.completions.create({
+      model: VISION_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: VISUAL_CLASSIFICATION_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `Classify these ${blocks.length} annotation(s):\n${blockList}`,
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content?.trim();
+    if (!content) return null;
+
+    const parsed = JSON.parse(content) as {
+      annotations?: Array<{ index?: unknown; visual?: unknown }>;
+    };
+    if (!Array.isArray(parsed.annotations)) return null;
+
+    const visualByIndex = new Map<number, AnnotationVisual>();
+    for (const raw of parsed.annotations) {
+      const index = Number(raw.index);
+      if (!Number.isFinite(index) || !isAnnotationVisual(raw.visual)) continue;
+      visualByIndex.set(index, raw.visual);
+    }
+
+    return blocks.map((block) => ({
+      index: block.index,
+      visual: visualByIndex.get(block.index) ?? "sticky",
+    }));
+  } catch {
+    return null;
+  }
 }
 
 /**
