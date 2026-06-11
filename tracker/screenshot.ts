@@ -350,14 +350,21 @@ async function climbAncestors(
  * branch), then climbs the DOM ancestor chain capturing each container up to
  * `main`. Falls back to a full page capture (with no ancestors) on any failure.
  * Throws only if navigation itself fails (so the caller can decide).
+ *
+ * `chain` is the true DOM containment succession for this job, innermost-first:
+ * the job's own branch followed by each climbed ancestor branch up to `main`.
+ * It is the authoritative ancestor order (a thing physically nested inside
+ * another in the live DOM), used to build the component tree instead of relying
+ * on bounding-box geometry, which cannot express overflow/equal-rect nesting.
  */
 async function captureOnePage(
   page: Page,
   job: ScreenshotJob,
   url: string
-): Promise<{ self: ScreenshotResult; ancestors: AncestorCapture[] }> {
+): Promise<{ self: ScreenshotResult; ancestors: AncestorCapture[]; chain: string[] }> {
   const { outputPath, target, navPath = "/" } = job;
   const outputDir = path.dirname(outputPath);
+  const selfBranchId = path.basename(outputPath, ".png");
   await fse.ensureDir(outputDir);
 
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
@@ -373,7 +380,8 @@ async function captureOnePage(
         const geometry = await readGeometry(element, page);
         console.log(`Screenshot saved (${target.mode}): ${outputPath}`);
         const ancestors = await climbAncestors(page, element, outputDir, navPath);
-        return { self: { outputPath, geometry }, ancestors };
+        const chain = [selfBranchId, ...ancestors.map((a) => a.branchId)];
+        return { self: { outputPath, geometry }, ancestors, chain };
       }
     } catch {
       console.warn(
@@ -389,24 +397,53 @@ async function captureOnePage(
   // spatial tree with a page-sized rect (which would mis-nest the branch).
   const geometry = target.mode === "full" ? await fullPageGeometry(page) : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
-  return { self: { outputPath, geometry }, ancestors: [] };
+  return { self: { outputPath, geometry }, ancestors: [], chain: [selfBranchId] };
+}
+
+// True DOM containment succession discovered while climbing: each branch mapped
+// to the branch it is directly nested inside (its next captured ancestor up the
+// chain). `main` (the page root) has no entry. This is the authoritative source
+// for the component tree's parent_branch_id.
+export type DomAncestry = Map<string, string>;
+
+/**
+ * Folds a single job's containment chain (innermost-first, ending at `main`)
+ * into the run-wide ancestry map. Each branch's parent is the next branch up the
+ * chain; first writer wins so a deeper job's fuller chain isn't clobbered by a
+ * shallower one (the DOM is a tree, so the parent is the same either way).
+ */
+function recordChain(ancestry: DomAncestry, chain: string[]): void {
+  for (let i = 0; i < chain.length - 1; i += 1) {
+    const child = chain[i];
+    const parent = chain[i + 1];
+    if (child && parent && child !== parent && !ancestry.has(child)) {
+      ancestry.set(child, parent);
+    }
+  }
 }
 
 /**
  * Captures many targeted screenshots reusing a SINGLE browser/page (one launch
  * for N component captures). A failure on one job does not abort the rest.
- * Returns one `result` per successfully captured job, plus the deduped set of
+ * Returns one `result` per successfully captured job, the deduped set of
  * `ancestors` discovered by climbing the DOM container chain of each job (a
- * given ancestor branch is captured once per run, first climb wins).
+ * given ancestor branch is captured once per run, first climb wins), and the
+ * `ancestry` map of true DOM containment edges (child branch -> the branch it is
+ * nested inside) built from every job's full climb.
  */
 export async function takeScreenshots(
   jobs: ScreenshotJob[],
   url: string
-): Promise<{ results: ScreenshotResult[]; ancestors: AncestorCapture[] }> {
-  if (jobs.length === 0) return { results: [], ancestors: [] };
+): Promise<{
+  results: ScreenshotResult[];
+  ancestors: AncestorCapture[];
+  ancestry: DomAncestry;
+}> {
+  if (jobs.length === 0) return { results: [], ancestors: [], ancestry: new Map() };
 
   const results: ScreenshotResult[] = [];
   const ancestors: AncestorCapture[] = [];
+  const ancestry: DomAncestry = new Map();
   // Seed with each job's OWN branch (its output filename is `<branchId>.png`) so
   // a climbed ancestor that derives the same id never overwrites a level-0
   // capture's PNG or double-nodes a branch the job already owns.
@@ -420,8 +457,16 @@ export async function takeScreenshots(
 
     for (const job of jobs) {
       try {
-        const { self, ancestors: jobAncestors } = await captureOnePage(page, job, url);
+        const { self, ancestors: jobAncestors, chain } = await captureOnePage(
+          page,
+          job,
+          url
+        );
         results.push(self);
+        // Build ancestry from the FULL per-job chain (before cross-job ancestor
+        // dedup) so containment edges are never dropped for branches that also
+        // appear as their own jobs.
+        recordChain(ancestry, chain);
         for (const ancestor of jobAncestors) {
           if (seenAncestorBranches.has(ancestor.branchId)) continue;
           seenAncestorBranches.add(ancestor.branchId);
@@ -442,7 +487,7 @@ export async function takeScreenshots(
   } finally {
     await browser?.close();
   }
-  return { results, ancestors };
+  return { results, ancestors, ancestry };
 }
 
 export async function takeScreenshot(

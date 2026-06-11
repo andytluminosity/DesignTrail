@@ -263,7 +263,7 @@ export async function createDesignSnapshot(
       }
     });
 
-    const { results, ancestors } = await takeScreenshots(jobs, CAPTURE_URL);
+    const { results, ancestors, ancestry } = await takeScreenshots(jobs, CAPTURE_URL);
     screenshots = results;
 
     // Climb-the-DOM ancestor capture: takeScreenshots walked the live container
@@ -399,7 +399,14 @@ export async function createDesignSnapshot(
     });
 
     const { branches, nodes } = graph.exportGraph();
-    const derived = deriveContainmentParents(branches, nodes);
+    // Parent of each branch: the true DOM containment succession from the climb
+    // is authoritative (it captures overflow/equal-rect nesting that bounding-box
+    // geometry cannot), and bounding-box containment fills in any branch the
+    // climb didn't touch this run.
+    const derived = new Map<string, string | null>(
+      deriveContainmentParents(branches, nodes)
+    );
+    for (const [child, parent] of ancestry) derived.set(child, parent);
 
     // Nodes export in chronological (rowid) order, so each branch's list is
     // oldest-first and the fork node can be picked by timestamp.
