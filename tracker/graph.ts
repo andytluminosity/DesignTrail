@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS annotations (
   commit_hash TEXT NOT NULL,
   source      TEXT NOT NULL,
   content     TEXT NOT NULL,
+  color       TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -99,6 +100,7 @@ type AnnotationRow = {
   commit_hash: string;
   source: AnnotationRecord["source"];
   content: string;
+  color: AnnotationRecord["color"] | null;
   created_at: number;
 };
 
@@ -168,6 +170,7 @@ function toAnnotationRecord(row: AnnotationRow): AnnotationRecord {
     commitHash: row.commit_hash,
     source: row.source,
     content: row.content,
+    color: row.color ?? undefined,
     createdAt: row.created_at,
   };
 }
@@ -230,6 +233,13 @@ export class DesignGraph {
     if (!nodeCols.includes("annotation")) {
       db.exec(`ALTER TABLE nodes ADD COLUMN annotation TEXT`);
     }
+
+    const annotationCols = (db.prepare(`PRAGMA table_info(annotations)`).all() as {
+      name: string;
+    }[]).map((c) => c.name);
+    if (!annotationCols.includes("color")) {
+      db.exec(`ALTER TABLE annotations ADD COLUMN color TEXT`);
+    }
   }
 
   upsertCommit(commit: CommitData): void {
@@ -275,16 +285,20 @@ export class DesignGraph {
   upsertAnnotation(annotation: AnnotationRecord): void {
     this.db
       .prepare(
-        `INSERT INTO annotations (id, node_id, commit_hash, source, content, created_at)
-         VALUES (@id, @nodeId, @commitHash, @source, @content, @createdAt)
+        `INSERT INTO annotations (id, node_id, commit_hash, source, content, color, created_at)
+         VALUES (@id, @nodeId, @commitHash, @source, @content, @color, @createdAt)
          ON CONFLICT(id) DO UPDATE SET
            node_id = excluded.node_id,
            commit_hash = excluded.commit_hash,
            source = excluded.source,
            content = excluded.content,
+           color = excluded.color,
            created_at = excluded.created_at`
       )
-      .run(annotation);
+      .run({
+        ...annotation,
+        color: annotation.color ?? null,
+      });
   }
 
   getAnnotations(): AnnotationRecord[] {
@@ -292,6 +306,12 @@ export class DesignGraph {
       .prepare(`SELECT * FROM annotations ORDER BY created_at ASC, rowid ASC`)
       .all() as AnnotationRow[];
     return rows.map(toAnnotationRecord);
+  }
+
+  deleteAnnotation(nodeId: string, source: AnnotationRecord["source"]): void {
+    this.db
+      .prepare(`DELETE FROM annotations WHERE node_id = ? AND source = ?`)
+      .run(nodeId, source);
   }
 
   getBranches(): BranchRecord[] {
@@ -429,6 +449,10 @@ export class DesignGraph {
     this.db
       .prepare(`UPDATE nodes SET annotation = @annotation WHERE id = @id`)
       .run({ id: nodeId, annotation });
+  }
+
+  clearNodeAnnotation(nodeId: string): void {
+    this.db.prepare(`UPDATE nodes SET annotation = NULL WHERE id = ?`).run(nodeId);
   }
 
   /** Records the on-screen geometry of a node's located element. */

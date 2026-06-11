@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import type {
+  AnnotationColor,
   AnnotationRecord,
   BranchRecord,
   CommitData,
@@ -219,6 +220,7 @@ type CreateMiroImageInput = CreateMiroItemBase & {
 type CreateMiroStickyNoteInput = CreateMiroItemBase & {
   content: string;
   width?: number;
+  color?: AnnotationColor;
 };
 
 type MiroConnectorShape = "straight" | "elbowed" | "curved";
@@ -530,6 +532,7 @@ export async function createMiroStickyNote({
   anchorItemId,
   anchorOffset,
   width,
+  color,
 }: CreateMiroStickyNoteInput): Promise<MiroItemResponse> {
   const resolvedPosition = await resolveMiroPosition({
     accessToken,
@@ -545,6 +548,7 @@ export async function createMiroStickyNote({
     {
       data: { content },
       position: resolvedPosition,
+      ...(color ? { style: { fillColor: color } } : {}),
       ...(width ? { geometry: { width } } : {}),
     }
   );
@@ -605,6 +609,24 @@ function getAnnotationContent(
   return (record?.content ?? fallback ?? "").trim();
 }
 
+function colorForAnnotationSource(
+  source: AnnotationRecord["source"]
+): AnnotationColor | undefined {
+  if (source === "ai") return "yellow";
+  if (source === "user") return "blue";
+  return undefined;
+}
+
+function getAnnotationColor(
+  annotations: AnnotationRecord[] | undefined,
+  source: AnnotationRecord["source"]
+): AnnotationColor | undefined {
+  return (
+    annotations?.find((annotation) => annotation.source === source)?.color ??
+    colorForAnnotationSource(source)
+  );
+}
+
 function buildStickyContent(params: {
   node: IterationNode;
   commit: CommitData | undefined;
@@ -641,6 +663,7 @@ async function uploadAnnotationNotes(params: {
   imageH: number;
   blocks: AnnotationBlock[];
   placements: AnnotationPlacement[];
+  color?: AnnotationColor;
 }): Promise<void> {
   const layout = computeStickyLayout(
     params.imageCenter,
@@ -662,6 +685,7 @@ async function uploadAnnotationNotes(params: {
           content: block.text,
           position: item.position,
           width: STICKY_W,
+          color: params.color,
         });
         await createConnector({
           accessToken: params.accessToken,
@@ -685,6 +709,7 @@ async function uploadManualAnnotationNote(params: {
   imageH: number;
   nodeId: string;
   content: string;
+  color?: AnnotationColor;
 }): Promise<void> {
   const layout = computeStickyLayout(params.imageCenter, IMAGE_W, params.imageH, [
     { index: 1, x: 1, y: 0.5 },
@@ -703,6 +728,7 @@ async function uploadManualAnnotationNote(params: {
       content: params.content,
       position: item.position,
       width: STICKY_W,
+      color: params.color,
     });
     console.log(
       `Manual annotation note created for ${params.nodeId}: ${note.id} at (${Math.round(
@@ -766,9 +792,11 @@ const CHRONOLOGY_CONNECTOR_STYLE: MiroConnectorStyle = { strokeColor: "#ff0000" 
 type PreparedNode = {
   node: IterationNode;
   aiAnnotation: string;
+  aiAnnotationColor?: AnnotationColor;
   imageH: number;
   blocks: AnnotationBlock[];
   manualAnnotation: string;
+  manualAnnotationColor?: AnnotationColor;
   manualPlacements: AnnotationPlacement[];
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
@@ -838,11 +866,13 @@ export async function renderBoardFromGraph(
         "user",
         commit?.annotation
       );
-      // A manual annotation is the user's chosen note for this commit, so it owns
-      // the annotation surface and suppresses generated AI sticky notes.
-      const aiAnnotation = manualAnnotation
-        ? ""
-        : getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+      const manualAnnotationColor = manualAnnotation
+        ? getAnnotationColor(nodeAnnotations, "user")
+        : undefined;
+      const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+      const aiAnnotationColor = aiAnnotation
+        ? getAnnotationColor(nodeAnnotations, "ai")
+        : undefined;
       const manualPlacements: AnnotationPlacement[] = manualAnnotation
         ? [{ index: 1, x: 1, y: 0.5 }]
         : [];
@@ -856,9 +886,11 @@ export async function renderBoardFromGraph(
       return {
         node,
         aiAnnotation,
+        aiAnnotationColor,
         imageH,
         blocks,
         manualAnnotation,
+        manualAnnotationColor,
         manualPlacements,
         placements,
         footprint,
@@ -927,6 +959,7 @@ export async function renderBoardFromGraph(
             y: index * (STICKY_H + NOTE_MARGIN),
           },
           width: STICKY_W,
+          color: "blue",
         }).catch((error: unknown) =>
           console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
         )
@@ -1015,6 +1048,7 @@ export async function renderBoardFromGraph(
             imageH: p.imageH,
             nodeId: p.node.id,
             content: p.manualAnnotation,
+            color: p.manualAnnotationColor,
           })
         );
       }
@@ -1031,6 +1065,7 @@ export async function renderBoardFromGraph(
             imageH: p.imageH,
             blocks: p.blocks,
             placements: p.placements,
+            color: p.aiAnnotationColor,
           })
         );
       } else if (p.aiAnnotation) {
@@ -1044,6 +1079,7 @@ export async function renderBoardFromGraph(
               y: imageCenter.y,
             },
             width: STICKY_W,
+            color: p.aiAnnotationColor,
           }).catch((error: unknown) =>
             console.error("Failed to place annotation note:", getErrorMessage(error))
           )
@@ -1077,6 +1113,7 @@ export async function renderBoardFromGraph(
             y: top + index * (STICKY_H + NOTE_MARGIN),
           },
           width: STICKY_W,
+          color: "blue",
         }).catch((error: unknown) =>
           console.error("Failed to place standalone manual annotation note:", getErrorMessage(error))
         )

@@ -1,5 +1,5 @@
 ---
-allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd)
+allowed-tools: AskUserQuestions, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(git rev-parse:*), Bash(pwd), Bash(curl:*)
 description: Commit changes through DesignTrail with annotation options
 ---
 
@@ -24,43 +24,53 @@ git diff --staged
 git log --oneline -5
 ```
 
-2. Call `AskUserQuestions` with exactly one single-select question:
+2. Stage only the files relevant to the user-requested commit.
 
-- id: `annotationMode`
-- prompt: `How should DesignTrail annotate this commit?`
+3. Run `git commit` with DesignTrail capture enabled but annotation/Miro rendering deferred:
+
+```bash
+DESIGNTRAIL_SOURCE=claude \
+DESIGNTRAIL_SKIP_PROMPT=1 \
+DESIGNTRAIL_DEFAULT_ANNOTATION_MODE=skip \
+DESIGNTRAIL_SYNC_MIRO=false \
+git commit -m "<commit message>"
+```
+
+4. Read the DesignTrail hook output. For each returned screenshot/component, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
+
+- prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
 - options:
   - `Skip annotations`
   - `Manually add annotation`
   - `AI generated annotations`
   - `Manual and AI generated annotations`
 
-3. If the user chose `Manually add annotation` or `Manual and AI generated annotations`, ask for a short manual annotation describing the design intent behind the change.
+5. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
 
-4. Stage only the files relevant to the user-requested commit.
-
-5. Run `git commit` with DesignTrail environment variables on the same command invocation so the post-commit hook receives the selected mode:
+6. Apply the per-screenshot choices and render Miro:
 
 ```bash
-DESIGNTRAIL_SOURCE=claude \
-DESIGNTRAIL_SKIP_PROMPT=1 \
-DESIGNTRAIL_AI_ANNOTATIONS=<true-or-false> \
-DESIGNTRAIL_ANNOTATION="<manual annotation when present>" \
-git commit -m "<commit message>"
+curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repoPath": "<absolute-repo-path>",
+    "commitHash": "<commit-hash>",
+    "annotationChoices": [
+      {
+        "nodeId": "<entry-node-id>",
+        "mode": "skip|manual|ai|manual_and_ai",
+        "annotation": "<manual annotation when present>"
+      }
+    ],
+    "syncMiro": true
+  }'
 ```
 
-For `Skip annotations`, set `DESIGNTRAIL_AI_ANNOTATIONS=false` and omit `DESIGNTRAIL_ANNOTATION`.
-
-For `Manually add annotation`, set `DESIGNTRAIL_AI_ANNOTATIONS=false` and include `DESIGNTRAIL_ANNOTATION`.
-
-For `AI generated annotations`, set `DESIGNTRAIL_AI_ANNOTATIONS=true` and omit `DESIGNTRAIL_ANNOTATION`.
-
-For `Manual and AI generated annotations`, set `DESIGNTRAIL_AI_ANNOTATIONS=true` and include `DESIGNTRAIL_ANNOTATION`.
-
-6. After the commit completes, summarize:
+7. After the annotation update completes, summarize:
 
 - Commit hash and message.
-- Which DesignTrail annotation mode was used.
-- Whether the post-commit hook reported a successful capture.
+- Each screenshot/component's annotation mode.
+- Whether the post-commit hook reported a successful capture and whether Miro synced.
 
 ## Safety
 

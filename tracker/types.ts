@@ -9,6 +9,8 @@ export type CommitData = {
 };
 
 export type AnnotationSource = "commit_message" | "user" | "ai";
+export type AnnotationColor = "yellow" | "blue";
+export type AnnotationMode = "skip" | "manual" | "ai" | "manual_and_ai";
 
 export type AnnotationRecord = {
   id: string;
@@ -16,7 +18,25 @@ export type AnnotationRecord = {
   commitHash: string;
   source: AnnotationSource;
   content: string;
+  color?: AnnotationColor;
   createdAt: number;
+};
+
+export type AnnotationChoiceTarget = {
+  nodeId: string;
+  commitHash: string;
+  branchId: string;
+  summary: string;
+  type: CommitType | string;
+  screenshotPath: string;
+};
+
+export type AnnotationChoice = {
+  nodeId?: string;
+  branchId?: string;
+  screenshotPath?: string;
+  mode: AnnotationMode;
+  annotation?: string;
 };
 
 // On-screen geometry of a located element, in page (document) pixels. pageW/pageH

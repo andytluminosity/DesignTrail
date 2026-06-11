@@ -11,43 +11,61 @@ Capture the current repository's latest design snapshot through DesignTrail.
 
 - The app being captured is running at `CAPTURE_URL` (usually `http://localhost:3000`).
 - The DesignTrail service is running at `http://localhost:3002`.
-- Miro board rendering is manual via `npm run render-miro -- <repo>` after capture.
+- Miro board rendering is deferred until per-screenshot annotation choices are applied.
 
 ## Workflow
 
-1. Call `AskUserQuestions` with exactly one single-select question:
-   - id: `annotationMode`
-   - prompt: `How should DesignTrail annotate this capture?`
-   - options:
-     - `Skip annotations`
-     - `Manually add annotation`
-     - `AI generated annotations`
-     - `Manual and AI generated annotations`
-2. If the user chose a manual annotation mode, ask for a short annotation describing the design intent behind the latest change.
-3. Resolve the absolute path of the current repository. Use the current working directory unless the user provides a different repo path.
-4. Send a POST request to `http://localhost:3002/snapshot`:
+1. Resolve the absolute path of the current repository. Use the current working directory unless the user provides a different repo path.
+2. Capture the latest commit without annotations or Miro rendering:
 
 ```bash
 curl -sS -X POST "http://localhost:3002/snapshot" \
   -H "Content-Type: application/json" \
   -d '{
     "repoPath": "<absolute-repo-path>",
-    "annotation": "<manual annotation when present>",
-    "generateAiAnnotations": <true-or-false>,
-    "source": "claude"
+    "defaultAnnotationMode": "skip",
+    "source": "claude",
+    "syncMiro": false
   }'
 ```
 
-Use `generateAiAnnotations: false` for Skip annotations and Manually add annotation.
-Use `generateAiAnnotations: true` for AI generated annotations and Manual and AI generated annotations.
+3. If the response is not successful, show the returned error and stop.
 
-5. If the response is not successful, show the returned error and stop.
-6. If the response is successful, summarize:
+4. For each returned entry, call `AskUserQuestions` with one single-select question using the entry's `nodeId` in the question id:
+   - prompt: `How should DesignTrail annotate <branchId> (<summary>)?`
+   - options:
+     - `Skip annotations`
+     - `Manually add annotation`
+     - `AI generated annotations`
+     - `Manual and AI generated annotations`
+
+5. For every entry whose selected mode includes manual annotation, ask for a short manual annotation describing the design intent for that specific screenshot/component.
+
+6. Apply the per-screenshot choices and render Miro:
+
+```bash
+curl -sS -X POST "http://localhost:3002/snapshot/annotations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repoPath": "<absolute-repo-path>",
+    "commitHash": "<commit-hash>",
+    "annotationChoices": [
+      {
+        "nodeId": "<entry-node-id>",
+        "mode": "skip|manual|ai|manual_and_ai",
+        "annotation": "<manual annotation when present>"
+      }
+    ],
+    "syncMiro": true
+  }'
+```
+
+7. If the annotation response is successful, summarize:
    - Repository name and commit hash.
    - Commit message.
    - Screenshot count.
-   - That Miro was not synced during capture.
-   - Each returned entry's `branchId`, `type`, `summary`, and `screenshotPath`.
+   - Whether Miro synced.
+   - Each returned entry's `nodeId`, `branchId`, `type`, `summary`, `screenshotPath`, and selected annotation mode.
 
 ## Response Handling
 
@@ -60,12 +78,20 @@ Expected success shape:
     "hash": "...",
     "message": "...",
     "timestamp": 1781097600000,
-    "source": "claude",
-    "annotation": "..."
+    "source": "claude"
   },
   "repoName": "TempRepo",
   "repoPath": "/Users/mikezhang/Desktop/Development/TempRepo",
-  "entries": [],
+  "entries": [
+    {
+      "nodeId": "...",
+      "branchId": "sidebar",
+      "type": "UI_CHANGE",
+      "summary": "...",
+      "annotationMode": "manual",
+      "screenshotPath": "captures/..."
+    }
+  ],
   "screenshotCount": 1,
   "miroSynced": false
 }
