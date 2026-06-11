@@ -179,8 +179,7 @@ app.post("/snapshot", async (req, res) => {
     generateAiAnnotations,
     source,
     syncMiro,
-  } =
-    req.body as SnapshotRequestBody;
+  } = req.body as SnapshotRequestBody;
 
   if (typeof repoPath !== "string" || repoPath.trim().length === 0) {
     return res.status(400).json({

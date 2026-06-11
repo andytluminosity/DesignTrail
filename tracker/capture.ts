@@ -97,10 +97,16 @@ function parseAnnotationMode(value: string | undefined): AnnotationMode | undefi
   return undefined;
 }
 
-function defaultAnnotationMode(): AnnotationMode {
+function defaultAnnotationMode(
+  legacyAnnotation: string | undefined,
+  legacyGenerateAiAnnotations: boolean
+): AnnotationMode {
   const explicit = parseAnnotationMode(envOptionalString("DESIGNTRAIL_DEFAULT_ANNOTATION_MODE"));
   if (explicit) return explicit;
-  return envBoolean("DESIGNTRAIL_AI_ANNOTATIONS", true) ? "ai" : "skip";
+  if (legacyAnnotation) {
+    return legacyGenerateAiAnnotations ? "manual_and_ai" : "manual";
+  }
+  return legacyGenerateAiAnnotations ? "ai" : "skip";
 }
 
 function parseAnnotationChoicesEnv(): AnnotationChoice[] | undefined {
@@ -219,7 +225,15 @@ async function main(): Promise<void> {
   const repoPath = path.resolve(process.argv[2] ?? process.cwd());
   const skipPrompt = envBoolean("DESIGNTRAIL_SKIP_PROMPT", false);
   const annotationChoices = parseAnnotationChoicesEnv();
-  const defaultMode = defaultAnnotationMode();
+  const legacyAnnotation = envOptionalString("DESIGNTRAIL_ANNOTATION");
+  const legacyGenerateAiAnnotations = envBoolean(
+    "DESIGNTRAIL_AI_ANNOTATIONS",
+    !legacyAnnotation
+  );
+  const defaultMode = defaultAnnotationMode(
+    legacyAnnotation,
+    legacyGenerateAiAnnotations
+  );
   const source = envOptionalString("DESIGNTRAIL_SOURCE") ?? "cli";
   const syncMiro = envBoolean("DESIGNTRAIL_SYNC_MIRO", true);
   const result = await createDesignSnapshot({
@@ -227,6 +241,8 @@ async function main(): Promise<void> {
     source,
     annotationChoices,
     defaultAnnotationMode: defaultMode,
+    annotation: legacyAnnotation,
+    generateAiAnnotations: legacyGenerateAiAnnotations,
     syncMiro,
     resolveAnnotationChoices:
       annotationChoices || skipPrompt
