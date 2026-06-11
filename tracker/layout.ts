@@ -108,6 +108,11 @@ export function deriveContainmentParents(
   const parents = new Map<string, string | null>();
 
   for (const [id, g] of entries) {
+    // `main` is the universal page root; it never nests under anything.
+    if (id === MAIN_BRANCH) {
+      parents.set(id, null);
+      continue;
+    }
     let bestId: string | null = null;
     let bestGeom: NodeGeometry | null = null;
     for (const [otherId, og] of entries) {
@@ -117,7 +122,15 @@ export function deriveContainmentParents(
         otherId === MAIN_BRANCH ||
         navPathByBranch.get(otherId) === navPathByBranch.get(id);
       if (!sameRoute) continue;
-      if (!contains(og, g)) continue;
+      // `main` is the whole-page root and contains every branch on every route
+      // by definition. Its representative box is measured on just one route, so
+      // its captured height can be shorter than a taller page on another route
+      // (full-page height is route-specific). Requiring strict box containment
+      // there would wrongly detach that taller route's page root — and its whole
+      // subtree — into a disconnected island. So `main` always qualifies as a
+      // container; every other candidate must really enclose the child. Smallest
+      // area still wins, so a tighter same-route container is preferred over main.
+      if (otherId !== MAIN_BRANCH && !contains(og, g)) continue;
       if (!bestGeom || area(og) < area(bestGeom)) {
         bestId = otherId;
         bestGeom = og;
