@@ -73,6 +73,7 @@ async function rederiveRepo(repo: string): Promise<void> {
       const branchNodes = grouped.get(b.id) ?? [];
       if (!isRealComponent(branchNodes)) continue;
       jobs.push({
+        jobId: b.id,
         outputPath: path.join(tmpDir, `${b.id}.png`),
         target: b.target,
         navPath: b.navPath ?? "/",

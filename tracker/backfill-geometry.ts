@@ -50,7 +50,7 @@ async function backfillRepo(repo: string): Promise<void> {
       const navPath = b.navPath ?? "/";
       const outputPath = path.join(tmpDir, `${b.id}.png`);
       nodeByOutput.set(outputPath, node.id);
-      jobs.push({ outputPath, target, navPath });
+      jobs.push({ jobId: b.id, outputPath, target, navPath });
     }
 
     if (jobs.length === 0) {

@@ -10,7 +10,8 @@ import type {
   ScreenshotTarget,
   UiElement,
 } from "./types.js";
-import { deriveDomBranchId, MAIN_BRANCH } from "./branch.js";
+import { MAIN_BRANCH } from "./branch.js";
+import { computeContainerIdentity, keyToBranchId } from "./domKey.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
@@ -195,21 +196,6 @@ async function parentElementHandle(
   return handle.asElement() as ElementHandle | null;
 }
 
-/** Reads a climbed container's DOM identity (id + first class) for branch derivation. */
-async function readIdentity(
-  el: ElementHandle
-): Promise<{ id?: string; firstClass?: string }> {
-  return await el.evaluate((node) => {
-    const e = node as HTMLElement;
-    const id = e.id || undefined;
-    const firstClass =
-      typeof e.className === "string" && e.className.trim()
-        ? e.className.trim().split(/\s+/)[0]
-        : undefined;
-    return { id, firstClass };
-  });
-}
-
 const CHANGE_HIGHLIGHT_ID = "__designtrail_change_box__";
 
 /**
@@ -318,6 +304,9 @@ async function fullPageGeometry(page: Page): Promise<NodeGeometry> {
 }
 
 export type ScreenshotJob = {
+  // Opaque id echoed back on the result so the caller can join a capture to the
+  // source change (its summary/type/target), regardless of the DOM-derived branch.
+  jobId: string;
   outputPath: string;
   target: ScreenshotTarget;
   navPath?: string;
@@ -326,10 +315,11 @@ export type ScreenshotJob = {
 /**
  * Climbs the live DOM ancestor chain above the already-captured container
  * (`fromHandle`), capturing each ancestor up to body/html. Each ancestor's
- * branch id is derived from its DOM identity (id, else first class); anonymous
- * wrappers (no stable id) are skipped for capture but still climbed through, so
- * the chain always reaches the page root. Once body/html is reached, a single
- * full-page capture is taken and tagged for the `main` branch.
+ * branch id is derived from its stable, instance-unique DOM identity (a
+ * shortest anchored DOM path), so siblings sharing a class never collide.
+ * Anonymous wrappers (no id/class/role/name) are skipped for capture but still
+ * climbed through, so the chain always reaches the page root. Once body/html is
+ * reached, a single full-page capture is taken and tagged for the `main` branch.
  *
  * Ancestor PNGs are written alongside the job's own output (same commit dir),
  * named by derived branch id. `seenBranches` dedupes within the climb so a
@@ -377,14 +367,26 @@ async function climbAncestors(
         break;
       }
 
-      const branchId = deriveDomBranchId(await readIdentity(parent));
+      const identity = await computeContainerIdentity(parent, navPath);
+      // Only meaningful, identifiable containers become their own branch; pure
+      // anonymous wrappers are climbed THROUGH (so the chain reaches the root)
+      // but never noded, otherwise the structural fallback would turn every
+      // wrapper div into a container.
+      const branchId = identity.meaningful ? keyToBranchId(identity) : null;
       if (branchId && !seenBranches.has(branchId)) {
         seenBranches.add(branchId);
         const ancestorPath = path.join(outputDir, `${branchId}.png`);
         try {
           await parent.screenshot({ path: ancestorPath });
           const geometry = await readGeometry(parent, page);
-          ancestors.push({ branchId, outputPath: ancestorPath, geometry, navPath });
+          ancestors.push({
+            branchId,
+            outputPath: ancestorPath,
+            geometry,
+            navPath,
+            label: identity.label,
+            selector: identity.selector,
+          });
           console.log(`Ancestor screenshot saved (${branchId}): ${ancestorPath}`);
         } catch {
           // Skip ancestors that can't be screenshot (e.g. zero-size); keep climbing.
@@ -419,9 +421,8 @@ async function captureOnePage(
   job: ScreenshotJob,
   url: string
 ): Promise<{ self: ScreenshotResult; ancestors: AncestorCapture[]; chain: string[] }> {
-  const { outputPath, target, navPath = "/" } = job;
+  const { jobId, outputPath, target, navPath = "/" } = job;
   const outputDir = path.dirname(outputPath);
-  const selfBranchId = path.basename(outputPath, ".png");
   await fse.ensureDir(outputDir);
 
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
@@ -432,6 +433,10 @@ async function captureOnePage(
       const located = await captureLocator(page, target);
       if (located) {
         const { container, located: changedElement } = located;
+        // The captured container's stable DOM identity defines this component's
+        // branch — instance-unique, so two sibling cards never collapse together.
+        const identity = await computeContainerIdentity(container, navPath);
+        const selfBranchId = keyToBranchId(identity);
         await container.screenshot({ path: outputPath });
         // Measure the SAME element we screenshot (the climbed container when one
         // was chosen), so geometry == the captured container's rect.
@@ -445,7 +450,19 @@ async function captureOnePage(
           changedElement
         );
         const chain = [selfBranchId, ...ancestors.map((a) => a.branchId)];
-        return { self: { outputPath, geometry }, ancestors, chain };
+        return {
+          self: {
+            jobId,
+            outputPath,
+            geometry,
+            branchId: selfBranchId,
+            label: identity.label,
+            selector: identity.selector,
+            navPath,
+          },
+          ancestors,
+          chain,
+        };
       }
     } catch {
       console.warn(
@@ -458,10 +475,15 @@ async function captureOnePage(
   // Only treat a full-page capture as real geometry when the target WAS full
   // (e.g. main). A targeted capture that fell back to full page never actually
   // measured its component, so record no geometry rather than polluting the
-  // spatial tree with a page-sized rect (which would mis-nest the branch).
+  // spatial tree with a page-sized rect (which would mis-nest the branch). A
+  // full/fallback capture has no isolable container, so it belongs to `main`.
   const geometry = target.mode === "full" ? await fullPageGeometry(page) : undefined;
   console.log(`Screenshot saved (full): ${outputPath}`);
-  return { self: { outputPath, geometry }, ancestors: [], chain: [selfBranchId] };
+  return {
+    self: { jobId, outputPath, geometry, branchId: MAIN_BRANCH, label: MAIN_BRANCH, navPath },
+    ancestors: [],
+    chain: [MAIN_BRANCH],
+  };
 }
 
 // True DOM containment succession discovered while climbing: each branch mapped
@@ -508,12 +530,11 @@ export async function takeScreenshots(
   const results: ScreenshotResult[] = [];
   const ancestors: AncestorCapture[] = [];
   const ancestry: DomAncestry = new Map();
-  // Seed with each job's OWN branch (its output filename is `<branchId>.png`) so
-  // a climbed ancestor that derives the same id never overwrites a level-0
-  // capture's PNG or double-nodes a branch the job already owns.
-  const seenAncestorBranches = new Set<string>(
-    jobs.map((job) => path.basename(job.outputPath, ".png"))
-  );
+  // A climbed ancestor that resolves to a branch a job already captured as its
+  // OWN container must not be re-captured (it would double-node that branch).
+  // The job branch id is now the container's DOM identity, only known after
+  // capture, so we accumulate self branch ids as jobs complete.
+  const seenAncestorBranches = new Set<string>();
   let browser;
   try {
     browser = await chromium.launch();
@@ -527,6 +548,7 @@ export async function takeScreenshots(
           url
         );
         results.push(self);
+        if (self.branchId) seenAncestorBranches.add(self.branchId);
         // Build ancestry from the FULL per-job chain (before cross-job ancestor
         // dedup) so containment edges are never dropped for branches that also
         // appear as their own jobs.
@@ -560,6 +582,9 @@ export async function takeScreenshot(
   url: string,
   navPath: string = "/"
 ): Promise<ScreenshotResult | undefined> {
-  const { results } = await takeScreenshots([{ outputPath, target, navPath }], url);
+  const { results } = await takeScreenshots(
+    [{ jobId: "single", outputPath, target, navPath }],
+    url
+  );
   return results[0];
 }
