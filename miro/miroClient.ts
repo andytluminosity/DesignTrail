@@ -936,6 +936,10 @@ type PreparedNode = {
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
+  // Local PNG to upload instead of `node.screenshotPath`. Used by the commit
+  // overview tree to upload the clean `main-original.png` sidecar (no red box)
+  // even though the node still points at the boxed `main.png`.
+  screenshotPathOverride?: string;
 };
 
 type DrawTreeArgs = {
@@ -1105,7 +1109,7 @@ async function drawTree(args: DrawTreeArgs): Promise<{
           accessToken,
           boardId,
           url: p.url,
-          screenshotPath: p.node.screenshotPath,
+          screenshotPath: p.screenshotPathOverride ?? p.node.screenshotPath,
           position: imageCenter,
           width: IMAGE_W,
         });
@@ -1398,7 +1402,11 @@ export async function renderBoardFromGraph(
       const sidecarRel = originalMainSidecarPath(p.node.screenshotPath);
       const sidecarAbs = path.join(DESIGNTRAIL_ROOT, sidecarRel);
       if (!existsSync(sidecarAbs)) return p;
-      return { ...p, url: publicScreenshotUrl(sidecarRel, options.publicBaseUrl) };
+      return {
+        ...p,
+        screenshotPathOverride: sidecarRel,
+        url: publicScreenshotUrl(sidecarRel, options.publicBaseUrl),
+      };
     });
 
   const commitOverview = await drawTree({
