@@ -9,8 +9,7 @@
     "untrack": "tsx tracker/uninstall.ts",
     "visualize": "tsx tracker/visualize.ts",
     "render-miro": "tsx tracker/render-miro.ts",
-    "backfill-geometry": "tsx tracker/backfill-geometry.ts",
-    "rederive-hierarchy": "tsx tracker/rederive-hierarchy.ts"
+    "backfill-geometry": "tsx tracker/backfill-geometry.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

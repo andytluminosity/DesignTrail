@@ -7,12 +7,14 @@ import { takeScreenshots, getSiteContext } from "../../tracker/screenshot.js";
 import type { ScreenshotJob } from "../../tracker/screenshot.js";
 import { analyzeCommit } from "../../tracker/llm.js";
 import { annotateScreenshots } from "../../tracker/annotate.js";
+import { classifyComponent } from "../../tracker/classify.js";
 import { DesignGraph } from "../../tracker/graph.js";
-import { contains, deriveContainmentParents, geometryByBranch } from "../../tracker/layout.js";
-import { planFolderLayout } from "../../tracker/treeStore.js";
-import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
-import { MAIN_BRANCH } from "../../tracker/branch.js";
-import { renderBoardFromGraph, type RenderedBoardNode } from "../../miro/miroClient.js";
+import { MAIN_BRANCH, slug } from "../../tracker/branch.js";
+import {
+  renderBoardFromGraph,
+  type BoardGraph,
+  type RenderedBoardNode,
+} from "../../miro/miroClient.js";
 import { writeMiroItemMap } from "./miroItemMap.js";
 import type {
   AnnotationChoice,
@@ -21,9 +23,8 @@ import type {
   AnnotationMode,
   AnnotationRecord,
   AnnotationSource,
-  BranchRecord,
   CommitData,
-  IterationNode,
+  CommitType,
   ScreenshotResult,
   ScreenshotTarget,
 } from "../../tracker/types.js";
@@ -77,84 +78,8 @@ export type RenderDesignSnapshotBoardOptions = {
   repoPath?: string;
 };
 
-/**
- * How to re-screenshot an ancestor branch whose stored target is missing
- * (legacy branches created before per-branch target persistence). main -> full
- * page; any other branch -> its class as a best-effort component selector.
- */
-function fallbackTarget(branchId: string): ScreenshotTarget {
-  if (branchId === MAIN_BRANCH) return { mode: "full" };
-  return { mode: "selector", value: `[class~="${branchId}"]` };
-}
-
 // Resolve DesignTrail root so the workflow works no matter which repo invokes it.
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-
-/**
- * Recursively removes directories left empty under `dir` after screenshots move
- * into the nested branch tree. `dir` itself is preserved.
- */
-async function pruneEmptyDirs(dir: string): Promise<void> {
-  if (!(await fse.pathExists(dir))) return;
-  for (const entry of await fse.readdir(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      const child = path.join(dir, entry.name);
-      await pruneEmptyDirs(child);
-      const remaining = await fse.readdir(child);
-      if (remaining.length === 0) await fse.remove(child);
-    }
-  }
-}
-
-/**
- * The clean (unboxed) sidecar for a full-page `main` capture. The DOM climb
- * writes `main.png` (with the change-highlight box) and a `main-original.png`
- * copy without it; the sidecar must follow `main.png` whenever it moves or is
- * removed so the commit-overview tree can still find it by name convention.
- */
-function originalSidecarPath(pngPath: string): string {
-  return pngPath.replace(/\.png$/i, "-original.png");
-}
-
-/**
- * Mirrors the finalized branch tree onto disk and repoints node screenshot paths
- * so SQLite remains the source of truth for the current PNG location.
- */
-async function materializeFolderTree(
-  graph: DesignGraph,
-  repoName: string
-): Promise<Map<string, string>> {
-  const { branches, nodes } = graph.exportGraph();
-  const moves = planFolderLayout(branches, nodes, repoName);
-  const screenshotPathByNodeId = new Map(
-    moves.map((move) => [move.nodeId, move.desiredPath])
-  );
-
-  const applied: { nodeId: string; desiredPath: string }[] = [];
-  for (const move of moves) {
-    if (move.currentPath === move.desiredPath) continue;
-    const from = path.join(DESIGNTRAIL_ROOT, move.currentPath);
-    const to = path.join(DESIGNTRAIL_ROOT, move.desiredPath);
-    if (move.currentPath && (await fse.pathExists(from))) {
-      await fse.move(from, to, { overwrite: true });
-      // Keep the clean main sidecar adjacent to its boxed counterpart.
-      const sidecarFrom = originalSidecarPath(from);
-      if (await fse.pathExists(sidecarFrom)) {
-        await fse.move(sidecarFrom, originalSidecarPath(to), { overwrite: true });
-      }
-    }
-    applied.push({ nodeId: move.nodeId, desiredPath: move.desiredPath });
-  }
-
-  graph.transaction(() => {
-    for (const { nodeId, desiredPath } of applied) {
-      graph.setNodeScreenshotPath(nodeId, desiredPath);
-    }
-  });
-
-  await pruneEmptyDirs(path.join(DESIGNTRAIL_ROOT, "captures", repoName));
-  return screenshotPathByNodeId;
-}
 
 try {
   process.loadEnvFile(path.join(DESIGNTRAIL_ROOT, ".env"));
@@ -163,6 +88,48 @@ try {
 }
 
 const CAPTURE_URL = process.env.CAPTURE_URL ?? "http://localhost:3000";
+
+// Tree 1 node id helpers. A page is identified by its route; a component by its
+// DOM-derived branch id; a version by its commit + component.
+function pageNodeId(navPath: string): string {
+  return `page:${navPath}`;
+}
+function versionNodeId(commitHash: string, componentId: string): string {
+  return `${commitHash}:${componentId}`;
+}
+/** Filesystem-safe folder segment for a route ("/" -> "root"). */
+function navSlug(navPath: string): string {
+  return slug(navPath) || "root";
+}
+
+// Everything renderBoardFromGraph needs, captured before the DB is closed.
+type BoardExport = {
+  tree1: BoardGraph;
+  tree2: BoardGraph;
+  tree3: BoardGraph;
+  commits: Map<string, CommitData>;
+  annotations: AnnotationRecord[];
+};
+
+function exportBoard(graph: DesignGraph): BoardExport {
+  return {
+    tree1: graph.exportTree1Graph(),
+    tree2: graph.exportTree2Graph(),
+    tree3: graph.exportTree3Graph(),
+    commits: graph.getCommits(),
+    annotations: graph.getAnnotations(),
+  };
+}
+
+async function renderBoard(board: BoardExport): Promise<RenderedBoardNode[]> {
+  return renderBoardFromGraph(
+    board.tree1,
+    board.tree2,
+    board.tree3,
+    board.commits,
+    board.annotations
+  );
+}
 
 function annotationColorForSource(source: AnnotationSource): AnnotationColor | undefined {
   if (source === "ai") return "yellow";
@@ -272,27 +239,36 @@ function buildAnnotationTargets(entries: DesignSnapshotEntry[]): AnnotationChoic
   }));
 }
 
-function buildEntriesForCommit(params: {
-  branches: BranchRecord[];
-  nodes: IterationNode[];
-  commitHash: string;
-}): DesignSnapshotEntry[] {
-  const branchById = new Map(params.branches.map((branch) => [branch.id, branch]));
-  return params.nodes
-    .filter((node) => node.commitHash === params.commitHash)
-    .map((node) => {
-      const branch = branchById.get(node.branchId);
+/**
+ * Rebuilds the annotation entries for an already-captured commit from the stored
+ * Tree 1 nodes: the version leaves captured by that commit (plus any page node
+ * whose latest capture is that commit). These are the screenshots a re-run of
+ * the annotation flow can target.
+ */
+function buildEntriesForCommit(
+  graph: DesignGraph,
+  commitHash: string
+): DesignSnapshotEntry[] {
+  const rows = graph.getTree1Nodes();
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  return rows
+    .filter(
+      (r) => (r.kind === "version" || r.kind === "page") && r.commitHash === commitHash
+    )
+    .map((r) => {
+      const componentId = r.kind === "version" ? r.parentId : null;
+      const component = componentId ? byId.get(componentId) : undefined;
       return {
-        nodeId: node.id,
-        branchId: node.branchId,
-        parentBranchId: branch?.parentBranchId ?? null,
-        parentId: node.parentId,
-        type: node.type,
-        summary: node.summary,
-        annotation: node.annotation ?? null,
-        aiAnnotation: node.annotation ?? null,
+        nodeId: r.id,
+        branchId: componentId ?? r.id,
+        parentBranchId: component?.parentId ?? null,
+        parentId: null,
+        type: r.type,
+        summary: r.summary,
+        annotation: r.annotation ?? null,
+        aiAnnotation: r.annotation ?? null,
         manualAnnotation: null,
-        screenshotPath: node.screenshotPath,
+        screenshotPath: r.screenshotPath,
       };
     });
 }
@@ -339,7 +315,7 @@ async function applyAnnotationChoicesToGraph(params: {
 
       params.graph.deleteAnnotation(target.nodeId, "user");
       params.graph.deleteAnnotation(target.nodeId, "ai");
-      params.graph.clearNodeAnnotation(target.nodeId);
+      params.graph.clearTree1NodeAnnotation(target.nodeId);
 
       const commitMessage = normalizeOptional(params.commit.message);
       if (commitMessage) {
@@ -393,7 +369,7 @@ async function applyAnnotationChoicesToGraph(params: {
       );
       if (!target) continue;
 
-      params.graph.setNodeAnnotation(target.nodeId, annotation);
+      params.graph.setTree1NodeAnnotation(target.nodeId, annotation);
       const normalizedAnnotation = normalizeOptional(annotation);
       if (normalizedAnnotation) {
         params.graph.upsertAnnotation(
@@ -428,6 +404,15 @@ async function hashFile(absPath: string): Promise<string | null> {
   }
 }
 
+// One component capture pending classification after persistence.
+type PendingClassification = {
+  componentKey: string;
+  label: string;
+  screenshotPath: string;
+  screenshotAbs: string;
+  hash: string | null;
+};
+
 /**
  * Creates a DesignTrail design snapshot for the latest commit in the target
  * repository. CLI callers can omit repoPath and use cwd; integrations should
@@ -452,271 +437,287 @@ export async function createDesignSnapshot(
     source: normalizeOptional(options?.source),
     annotation: manualAnnotation,
   };
+  const shortHash = commit.hash.slice(0, 8);
 
   const graph = await DesignGraph.load(repoName);
-  const jobs: ScreenshotJob[] = [];
   let entries: DesignSnapshotEntry[] = [];
-  const nodeByOutput = new Map<string, string>();
   let screenshots: ScreenshotResult[] = [];
-  let boardExport: {
-    branches: BranchRecord[];
-    nodes: IterationNode[];
-    commits: Map<string, CommitData>;
-    annotations: AnnotationRecord[];
-  } | null = null;
+  let boardExport: BoardExport | null = null;
 
   try {
     // Read the live DOM (across pages) first so the LLM targets elements that
-    // actually exist, and pass the existing branch tree so it reuses/nests
-    // component branches correctly.
+    // actually exist.
     const siteContext = await getSiteContext(CAPTURE_URL);
-
     const { components } = await analyzeCommit({
       diff: commit.diff,
       commitMessage: commit.message,
       siteContext,
-      existingBranches: graph.getBranches(),
     });
 
-    // Build one capture job per detected change. Container identity (which
-    // screenshots group together) is now derived from the LIVE DOM at capture
-    // time — a stable, instance-unique container key — NOT from the LLM. So we
-    // do NOT create component branches/nodes here; that happens after capture,
-    // keyed by the real DOM container. `main` is ensured up front so cascading
-    // updates can always reach the root.
-    type JobSpec = {
+    graph.transaction(() => graph.upsertCommit(commit));
+
+    // Split the detected changes into component captures (targeted) and the
+    // routes that need a full-page capture. Every route touched by any change
+    // gets exactly ONE full-page capture (the page node + commit overview), and
+    // each targeted change gets its own container capture. No DOM climbing.
+    type CompSpec = {
+      jobId: string;
       summary: string;
-      type: IterationNode["type"];
+      type: CommitType;
       navPath: string;
       target: ScreenshotTarget;
     };
-    const jobSpecById = new Map<string, JobSpec>();
-
-    graph.transaction(() => {
-      graph.upsertCommit(commit);
-      graph.ensureBranch(MAIN_BRANCH, null, null, "/", { mode: "full" });
-    });
+    const compSpecs: CompSpec[] = [];
+    const routeSummary = new Map<string, { summary: string; type: CommitType }>();
+    const explicitFullRoutes = new Set<string>();
 
     components.forEach((change, index) => {
       const navPath = change.path ?? "/";
-      const isFull = change.screenshotTarget.mode === "full";
-      const jobId = `c${index}`;
-      // A full/global change has no isolable container, so it lands on `main` and
-      // keeps the conventional main.png name (so the clean-sidecar logic applies).
-      // A located change writes to a neutral path; its real branch (folder) is
-      // assigned after the DOM key is known, and the folder mirror renames it.
-      const fileName = isFull ? `${MAIN_BRANCH}.png` : `__${jobId}.png`;
-      const screenshotPath = path.join("captures", repoName, commit.hash, fileName);
-      const outputPath = path.join(DESIGNTRAIL_ROOT, screenshotPath);
-      jobSpecById.set(jobId, {
-        summary: change.summary,
-        type: change.type,
-        navPath,
-        target: change.screenshotTarget,
-      });
-      jobs.push({ jobId, outputPath, target: change.screenshotTarget, navPath });
+      if (change.screenshotTarget.mode === "full") {
+        explicitFullRoutes.add(navPath);
+        routeSummary.set(navPath, { summary: change.summary, type: change.type });
+      } else {
+        compSpecs.push({
+          jobId: `c${index}`,
+          summary: change.summary,
+          type: change.type,
+          navPath,
+          target: change.screenshotTarget,
+        });
+        if (!routeSummary.has(navPath)) {
+          routeSummary.set(navPath, { summary: "Page updated", type: change.type });
+        }
+      }
     });
 
-    const { results, ancestors, ancestry } = await takeScreenshots(jobs, CAPTURE_URL);
+    const jobs: ScreenshotJob[] = [];
+
+    // Page jobs (one per route) write directly to their final per-commit path.
+    type PageSpec = { jobId: string; navPath: string; summary: string; type: CommitType };
+    const pageSpecById = new Map<string, PageSpec>();
+    let routeIndex = 0;
+    for (const [navPath, info] of routeSummary) {
+      const jobId = `p${routeIndex++}`;
+      const rel = path.join(
+        "captures",
+        repoName,
+        "pages",
+        navSlug(navPath),
+        `${shortHash}.png`
+      );
+      jobs.push({
+        jobId,
+        outputPath: path.join(DESIGNTRAIL_ROOT, rel),
+        target: { mode: "full" },
+        navPath,
+      });
+      pageSpecById.set(jobId, { jobId, navPath, summary: info.summary, type: info.type });
+    }
+
+    // Component jobs write to a temp commit dir; they move to their final
+    // component folder after the DOM key is known.
+    const compSpecById = new Map(compSpecs.map((spec) => [spec.jobId, spec]));
+    for (const spec of compSpecs) {
+      const rel = path.join("captures", repoName, commit.hash, `__${spec.jobId}.png`);
+      jobs.push({
+        jobId: spec.jobId,
+        outputPath: path.join(DESIGNTRAIL_ROOT, rel),
+        target: spec.target,
+        navPath: spec.navPath,
+      });
+    }
+
+    const { results } = await takeScreenshots(jobs, CAPTURE_URL);
     screenshots = results;
 
-    // Create/reuse each captured component's branch from its DOM container key.
-    // Grouping is deterministic and DOM-driven: two sibling cards that share a
-    // class get distinct keys (so distinct branches), and the SAME container
-    // reuses its branch across commits because the key is deterministic.
-    graph.transaction(() => {
-      for (const result of results) {
-        const spec = result.jobId ? jobSpecById.get(result.jobId) : undefined;
-        if (!spec) continue;
-        const branchId = result.branchId ?? MAIN_BRANCH;
-        const navPath = result.navPath ?? spec.navPath;
+    // --- Pages + commit overview (Tree 1 page nodes + Tree 3) ---------------
+    for (const result of results) {
+      const spec = result.jobId ? pageSpecById.get(result.jobId) : undefined;
+      if (!spec) continue;
+      const navPath = result.navPath ?? spec.navPath;
+      const rel = path.relative(DESIGNTRAIL_ROOT, result.outputPath);
+      const fileHash = await hashFile(result.outputPath);
+      const pageId = pageNodeId(navPath);
 
-        if (branchId !== MAIN_BRANCH) {
-          if (!graph.branchExists(branchId)) {
-            // Provisional parent = main; real nesting is fixed below from the DOM
-            // containment chain.
-            const forkNodeId = graph.getBranchTip(MAIN_BRANCH);
-            graph.ensureBranch(branchId, MAIN_BRANCH, forkNodeId, navPath, spec.target);
-          } else {
-            graph.setBranchCapture(branchId, navPath, spec.target);
-          }
-        }
-
-        const parentId = graph.getBranchTip(branchId);
-        const nodeId = `${commit.hash}:${branchId}`;
-        const screenshotPath = path.relative(DESIGNTRAIL_ROOT, result.outputPath);
-
-        graph.addNode({
-          id: nodeId,
+      graph.transaction(() => {
+        graph.upsertTree1Node({
+          id: pageId,
+          kind: "page",
+          parentId: null,
+          navPath,
+          componentKey: null,
+          label: navPath,
           commitHash: commit.hash,
-          branchId,
-          parentId,
+          screenshotPath: rel,
+          screenshotHash: fileHash,
           summary: spec.summary,
           type: spec.type,
-          screenshotPath,
           timestamp: commit.timestamp,
+          geometry: result.geometry,
         });
+        graph.upsertCommitScreenshot({
+          id: `${commit.hash}:${navPath}`,
+          commitHash: commit.hash,
+          navPath,
+          screenshotPath: rel,
+          screenshotHash: fileHash,
+          summary: spec.summary,
+          timestamp: commit.timestamp,
+          pageW: result.geometry?.pageW,
+          pageH: result.geometry?.pageH,
+        });
+      });
 
-        nodeByOutput.set(result.outputPath, nodeId);
-        const branchRecord = graph.getBranch(branchId);
+      // A page-level (full) change annotates the page node; pages captured only
+      // as the backdrop for a component change are not annotation targets.
+      if (explicitFullRoutes.has(navPath)) {
         entries.push({
-          nodeId,
-          branchId,
-          parentBranchId: branchRecord?.parentBranchId ?? null,
-          parentId,
+          nodeId: pageId,
+          branchId: pageId,
+          parentBranchId: null,
+          parentId: null,
           type: spec.type,
           summary: spec.summary,
           annotation: null,
-          screenshotPath,
+          screenshotPath: rel,
         });
-      }
-    });
-
-    // Climb-the-DOM ancestor capture: takeScreenshots walked the live container
-    // chain above each located component up to the page root, capturing every
-    // ancestor container (branch id derived from its DOM identity) plus a
-    // full-page `main`. Materialize each as a node on its branch, reusing the
-    // branch when it already exists. Branches a level-0 component already noded
-    // this commit were skipped during capture, so there is no collision here.
-    graph.transaction(() => {
-      for (const ancestor of ancestors) {
-        const { branchId, outputPath, navPath } = ancestor;
-
-        if (branchId !== MAIN_BRANCH && !graph.branchExists(branchId)) {
-          // Provisional parent = main; real nesting is fixed below from the DOM
-          // containment chain. Re-capture target = the container's own (valid
-          // CSS) selector from the DOM-key walk, falling back to a class guess.
-          const forkNodeId = graph.getBranchTip(MAIN_BRANCH);
-          const target: ScreenshotTarget = ancestor.selector
-            ? { mode: "selector", value: ancestor.selector }
-            : fallbackTarget(branchId);
-          graph.ensureBranch(branchId, MAIN_BRANCH, forkNodeId, navPath, target);
-        }
-
-        const parentId = graph.getBranchTip(branchId);
-        const nodeId = `${commit.hash}:${branchId}`;
-        const screenshotPath = path.relative(DESIGNTRAIL_ROOT, outputPath);
-
-        graph.addNode({
-          id: nodeId,
-          commitHash: commit.hash,
-          branchId,
-          parentId,
-          summary: "Updated to reflect a nested change",
-          type: "UI_CHANGE",
-          screenshotPath,
-          timestamp: commit.timestamp,
-        });
-
-        nodeByOutput.set(outputPath, nodeId);
-        const branchRecord = graph.getBranch(branchId);
-        const entry: DesignSnapshotEntry = {
-          nodeId,
-          branchId,
-          parentBranchId: branchRecord?.parentBranchId ?? null,
-          parentId,
-          type: "UI_CHANGE",
-          summary: "Updated to reflect a nested change",
-          annotation: null,
-          screenshotPath,
-        };
-        entries.push(entry);
-        screenshots.push({ outputPath, geometry: ancestor.geometry });
-      }
-    });
-
-    // Hash every newly captured screenshot and persist it on its node, so the
-    // whole-graph duplicate collapse below can run off stored hashes (steady
-    // state only re-reads this commit's new files).
-    const newHashes = await Promise.all(
-      [...nodeByOutput.entries()].map(async ([outputPath, nodeId]) => ({
-        nodeId,
-        hash: await hashFile(outputPath),
-      }))
-    );
-    graph.transaction(() => {
-      for (const { nodeId, hash } of newHashes) {
-        if (hash) graph.setNodeScreenshotHash(nodeId, hash);
-      }
-    });
-
-    // Phase 1: collapse byte-identical screenshots across the WHOLE graph so each
-    // unique image survives exactly once — the destructive db equivalent of the
-    // renderer's canonical-survivor map. Replaces the old per-branch-vs-parent
-    // dedup (a strict subset). Runs before annotation/geometry so removed
-    // captures aren't annotated. Re-points any parentId / forkNodeId that
-    // referenced a dropped duplicate onto the surviving node.
-    {
-      const { branches: allBranches, nodes: allNodes } = graph.exportGraph();
-      const storedHashes = graph.getNodeHashes();
-      const hashByNodeId = new Map<string, string | null>();
-      const backfill: { nodeId: string; hash: string }[] = [];
-      for (const node of allNodes) {
-        let hash = storedHashes.get(node.id) ?? null;
-        if (hash == null) {
-          // Legacy node without a stored hash: hash its file once and backfill.
-          hash = await hashFile(path.join(DESIGNTRAIL_ROOT, node.screenshotPath));
-          if (hash) backfill.push({ nodeId: node.id, hash });
-        }
-        hashByNodeId.set(node.id, hash);
-      }
-      if (backfill.length > 0) {
-        graph.transaction(() => {
-          for (const { nodeId, hash } of backfill) graph.setNodeScreenshotHash(nodeId, hash);
-        });
-      }
-
-      const collapse = planDuplicateCollapse(allBranches, allNodes, hashByNodeId);
-      if (collapse.deletedNodeIds.length > 0) {
-        graph.transaction(() => {
-          for (const { id, parentId } of collapse.nodeParentUpdates) {
-            graph.setNodeParent(id, parentId);
-          }
-          for (const { id, forkNodeId } of collapse.branchForkUpdates) {
-            graph.setBranchForkNode(id, forkNodeId);
-          }
-          for (const id of collapse.deletedNodeIds) graph.deleteNode(id);
-        });
-
-        // Remove the duplicate PNGs from disk. New-this-commit duplicates live at
-        // their pre-mirror outputPath; older duplicates at their stored path.
-        const outputByNodeId = new Map(
-          [...nodeByOutput.entries()].map(([out, id]) => [id, out] as const)
-        );
-        const nodeById = new Map(allNodes.map((n) => [n.id, n]));
-        await Promise.all(
-          collapse.deletedNodeIds.map(async (id) => {
-            const abs =
-              outputByNodeId.get(id) ??
-              (nodeById.has(id)
-                ? path.join(DESIGNTRAIL_ROOT, nodeById.get(id)!.screenshotPath)
-                : undefined);
-            if (abs) {
-              await fse.remove(abs);
-              // Drop the clean main sidecar too, so no orphan is left behind.
-              await fse.remove(originalSidecarPath(abs));
-            }
-          })
-        );
-
-        const deleted = new Set(collapse.deletedNodeIds);
-        screenshots = screenshots.filter((s) => {
-          const id = nodeByOutput.get(s.outputPath);
-          if (id && deleted.has(id)) {
-            nodeByOutput.delete(s.outputPath);
-            return false;
-          }
-          return true;
-        });
-        entries = entries.filter((e) => !deleted.has(`${commit.hash}:${e.branchId}`));
       }
     }
 
-    const annotationTargets = buildAnnotationTargets(entries);
+    // --- Components + versions (Tree 1) + classifications (Tree 2) -----------
+    const pendingClassifications: PendingClassification[] = [];
+    for (const result of results) {
+      const spec = result.jobId ? compSpecById.get(result.jobId) : undefined;
+      if (!spec) continue;
+
+      const componentKey = result.componentKey;
+      const componentId = result.branchId;
+      // A locate failure falls back to a full page (branchId "main", no key); the
+      // route's page job already covered that, so drop the redundant capture.
+      if (!componentKey || !componentId || componentId === MAIN_BRANCH) {
+        await fse.remove(result.outputPath).catch(() => undefined);
+        continue;
+      }
+
+      const navPath = result.navPath ?? spec.navPath;
+      const fileHash = await hashFile(result.outputPath);
+
+      // Byte-identical to the component's latest version => no new version.
+      const latestHash = graph.getLatestVersionHash(componentId);
+      if (fileHash && latestHash && fileHash === latestHash) {
+        await fse.remove(result.outputPath).catch(() => undefined);
+        continue;
+      }
+
+      const finalRel = path.join(
+        "captures",
+        repoName,
+        "components",
+        componentId,
+        `${shortHash}.png`
+      );
+      const finalAbs = path.join(DESIGNTRAIL_ROOT, finalRel);
+      await fse.ensureDir(path.dirname(finalAbs));
+      await fse.move(result.outputPath, finalAbs, { overwrite: true });
+
+      const pageId = pageNodeId(navPath);
+      const versionId = versionNodeId(commit.hash, componentId);
+      const label = result.label ?? componentId;
+
+      graph.transaction(() => {
+        graph.upsertTree1Node({
+          id: componentId,
+          kind: "component",
+          parentId: pageId,
+          navPath,
+          componentKey,
+          label,
+          commitHash: commit.hash,
+          screenshotPath: finalRel,
+          screenshotHash: fileHash,
+          summary: spec.summary,
+          type: spec.type,
+          timestamp: commit.timestamp,
+          geometry: result.geometry,
+        });
+        graph.upsertTree1Node({
+          id: versionId,
+          kind: "version",
+          parentId: componentId,
+          navPath,
+          componentKey,
+          label,
+          commitHash: commit.hash,
+          screenshotPath: finalRel,
+          screenshotHash: fileHash,
+          summary: spec.summary,
+          type: spec.type,
+          timestamp: commit.timestamp,
+          geometry: result.geometry,
+        });
+      });
+
+      entries.push({
+        nodeId: versionId,
+        branchId: componentId,
+        parentBranchId: pageId,
+        parentId: null,
+        type: spec.type,
+        summary: spec.summary,
+        annotation: null,
+        screenshotPath: finalRel,
+      });
+
+      pendingClassifications.push({
+        componentKey,
+        label,
+        screenshotPath: finalRel,
+        screenshotAbs: finalAbs,
+        hash: fileHash,
+      });
+    }
+
+    // Tree 2 classification: classify a component the first time it is seen and
+    // persist it; otherwise reuse the stored group and just refresh its latest
+    // screenshot. Runs sequentially so freshly-added groups are reused.
+    for (const pending of pendingClassifications) {
+      const existing = graph.getClassification(pending.componentKey);
+      if (existing) {
+        graph.transaction(() =>
+          graph.setClassificationScreenshot(
+            pending.componentKey,
+            pending.screenshotPath,
+            pending.hash
+          )
+        );
+        continue;
+      }
+      const { groupName } = await classifyComponent({
+        screenshotPath: pending.screenshotAbs,
+        label: pending.label,
+        existingGroups: graph.getClassificationGroups(),
+      });
+      graph.transaction(() =>
+        graph.upsertClassification({
+          componentKey: pending.componentKey,
+          groupName,
+          label: pending.label,
+          screenshotPath: pending.screenshotPath,
+          screenshotHash: pending.hash,
+          classifiedAt: Date.now(),
+        })
+      );
+    }
+
+    // Clean up the temp commit dir (component temp files were moved/removed).
+    await fse
+      .remove(path.join(DESIGNTRAIL_ROOT, "captures", repoName, commit.hash))
+      .catch(() => undefined);
+
     const appliedAnnotations = await applyAnnotationChoicesToGraph({
       graph,
       commit,
-      targets: annotationTargets,
+      targets: buildAnnotationTargets(entries),
       choices: options?.annotationChoices,
       resolver: options?.resolveAnnotationChoices,
       defaultMode: resolveDefaultAnnotationMode({
@@ -728,130 +729,13 @@ export async function createDesignSnapshot(
     });
     applyAnnotationsToEntries(entries, appliedAnnotations);
 
-    // Persist each captured element's geometry onto its node so the spatial board
-    // can nest/position branches by real on-screen containment.
-    graph.transaction(() => {
-      for (const { outputPath, geometry } of screenshots) {
-        if (!geometry) continue;
-        const nodeId = nodeByOutput.get(outputPath);
-        if (nodeId) graph.setNodeGeometry(nodeId, geometry);
-      }
-    });
-
-    const { branches, nodes } = graph.exportGraph();
-    // Parent of each branch: the true DOM containment succession from the climb
-    // is authoritative (it captures overflow/equal-rect nesting that bounding-box
-    // geometry cannot), and bounding-box containment fills in any branch the
-    // climb didn't touch this run.
-    const derived = new Map<string, string | null>(
-      deriveContainmentParents(branches, nodes)
-    );
-    // The DOM climb is authoritative for nesting, but only apply an ancestry edge
-    // when geometry actually confirms the climbed parent encloses the child (or
-    // the parent is `main`, the universal root, or geometry is unknown so we
-    // can't disprove it). This guards against an overflow/clipped ancestor whose
-    // measured box is smaller than its child being forced in as the parent,
-    // keeping the invariant that a child is always a smaller, contained box.
-    const branchGeometry = geometryByBranch(branches, nodes);
-    for (const [child, parent] of ancestry) {
-      const childGeom = branchGeometry.get(child);
-      const parentGeom = branchGeometry.get(parent);
-      if (parent === MAIN_BRANCH || !childGeom || !parentGeom || contains(parentGeom, childGeom)) {
-        derived.set(child, parent);
-      }
-    }
-
-    // Nodes export in chronological (rowid) order, so each branch's list is
-    // oldest-first and the fork node can be picked by timestamp.
-    const nodesByBranch = new Map<string, IterationNode[]>();
-    for (const node of nodes) {
-      const list = nodesByBranch.get(node.branchId) ?? [];
-      list.push(node);
-      nodesByBranch.set(node.branchId, list);
-    }
-
-    // Pick the node on the (new) parent branch this branch forks from: the
-    // parent's state when the child first appeared (latest parent node at/just
-    // before the child's first node), falling back to the parent's first node.
-    // null when there is no parent or the parent has no nodes, in which case no
-    // fork edge is drawn. This keeps fork_node_id on the direct parent branch so
-    // every stored fork edge crosses exactly one level.
-    const reconcileFork = (
-      branchId: string,
-      parentBranchId: string | null
-    ): string | null => {
-      if (!parentBranchId) return null;
-      const parentNodes = nodesByBranch.get(parentBranchId) ?? [];
-      if (parentNodes.length === 0) return null;
-      const childFirst = nodesByBranch.get(branchId)?.[0];
-      if (!childFirst) return parentNodes[0].id;
-      let fork = parentNodes[0];
-      for (const candidate of parentNodes) {
-        if (candidate.timestamp <= childFirst.timestamp) fork = candidate;
-        else break;
-      }
-      return fork.id;
-    };
-
-    graph.transaction(() => {
-      for (const [branchId, parentBranchId] of derived) {
-        graph.setBranchParent(branchId, parentBranchId);
-        graph.setBranchForkNode(branchId, reconcileFork(branchId, parentBranchId));
-      }
-    });
-
-    // Phase 2: promote away branches left node-less by the duplicate collapse,
-    // hoisting their children up — the db equivalent of the renderer's
-    // promoteCollapsedBranches. Runs on the reconciled tree so the stored tree
-    // equals the drawn tree, before the folder mirror renumbers files.
-    {
-      const { branches: pBranches, nodes: pNodes } = graph.exportGraph();
-      const promotion = planBranchPromotion(pBranches, pNodes);
-      if (promotion.deletedBranchIds.length > 0 || promotion.branchUpdates.length > 0) {
-        graph.transaction(() => {
-          for (const update of promotion.branchUpdates) {
-            graph.setBranchParent(update.id, update.parentBranchId);
-            graph.setBranchForkNode(update.id, update.forkNodeId);
-          }
-          for (const id of promotion.deletedBranchIds) graph.deleteBranch(id);
-        });
-      }
-    }
-
-    const screenshotPathByNodeId = await materializeFolderTree(graph, repoName);
-    for (const entry of entries) {
-      entry.screenshotPath =
-        screenshotPathByNodeId.get(`${commit.hash}:${entry.branchId}`) ??
-        entry.screenshotPath;
-    }
-    screenshots = screenshots.map((screenshot) => {
-      const nodeId = nodeByOutput.get(screenshot.outputPath);
-      const screenshotPath = nodeId ? screenshotPathByNodeId.get(nodeId) : undefined;
-      return screenshotPath
-        ? { ...screenshot, outputPath: path.join(DESIGNTRAIL_ROOT, screenshotPath) }
-        : screenshot;
-    });
-
-    const finalGraph = graph.exportGraph();
-    boardExport = {
-      branches: finalGraph.branches,
-      nodes: finalGraph.nodes,
-      commits: graph.getCommits(),
-      annotations: finalGraph.annotations,
-    };
+    boardExport = exportBoard(graph);
   } finally {
     graph.close();
   }
 
   const miroNodes: RenderedBoardNode[] =
-    options?.syncMiro === false || !boardExport
-      ? []
-      : await renderBoardFromGraph(
-          boardExport.branches,
-          boardExport.nodes,
-          boardExport.commits,
-          boardExport.annotations
-        );
+    options?.syncMiro === false || !boardExport ? [] : await renderBoard(boardExport);
 
   await writeMiroItemMap({ repoName, repoPath, miroNodes });
 
@@ -875,12 +759,7 @@ export async function applyDesignSnapshotAnnotations(
 
   let commit: CommitData;
   let entries: DesignSnapshotEntry[] = [];
-  let boardExport: {
-    branches: BranchRecord[];
-    nodes: IterationNode[];
-    commits: Map<string, CommitData>;
-    annotations: AnnotationRecord[];
-  } | null = null;
+  let boardExport: BoardExport | null = null;
 
   try {
     const capturedCommit = graph.getCommits().get(commitHash);
@@ -889,12 +768,7 @@ export async function applyDesignSnapshotAnnotations(
     }
     commit = capturedCommit;
 
-    const graphSnapshot = graph.exportGraph();
-    entries = buildEntriesForCommit({
-      branches: graphSnapshot.branches,
-      nodes: graphSnapshot.nodes,
-      commitHash,
-    });
+    entries = buildEntriesForCommit(graph, commitHash);
 
     const appliedAnnotations = await applyAnnotationChoicesToGraph({
       graph,
@@ -905,26 +779,13 @@ export async function applyDesignSnapshotAnnotations(
     });
     applyAnnotationsToEntries(entries, appliedAnnotations);
 
-    const finalGraph = graph.exportGraph();
-    boardExport = {
-      branches: finalGraph.branches,
-      nodes: finalGraph.nodes,
-      commits: graph.getCommits(),
-      annotations: finalGraph.annotations,
-    };
+    boardExport = exportBoard(graph);
   } finally {
     graph.close();
   }
 
   const miroNodes =
-    options.syncMiro === false || !boardExport
-      ? []
-      : await renderBoardFromGraph(
-          boardExport.branches,
-          boardExport.nodes,
-          boardExport.commits,
-          boardExport.annotations
-        );
+    options.syncMiro === false || !boardExport ? [] : await renderBoard(boardExport);
 
   await writeMiroItemMap({ repoName, repoPath, miroNodes });
 
@@ -947,33 +808,14 @@ export async function renderDesignSnapshotBoard(
   const repoName = await getRepoName(repoPath);
   const graph = await DesignGraph.load(repoName);
 
-  let boardExport: {
-    branches: BranchRecord[];
-    nodes: IterationNode[];
-    commits: Map<string, CommitData>;
-    annotations: AnnotationRecord[];
-  };
-
+  let boardExport: BoardExport;
   try {
-    const graphSnapshot = graph.exportGraph();
-    boardExport = {
-      branches: graphSnapshot.branches,
-      nodes: graphSnapshot.nodes,
-      commits: graph.getCommits(),
-      annotations: graphSnapshot.annotations,
-    };
+    boardExport = exportBoard(graph);
   } finally {
     graph.close();
   }
 
-  const miroNodes = await renderBoardFromGraph(
-    boardExport.branches,
-    boardExport.nodes,
-    boardExport.commits,
-    boardExport.annotations
-  );
-
+  const miroNodes = await renderBoard(boardExport);
   await writeMiroItemMap({ repoName, repoPath, miroNodes });
-
   return miroNodes;
 }

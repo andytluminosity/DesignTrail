@@ -114,14 +114,78 @@ export type BranchRecord = {
 // element was located, that element's on-screen geometry. `branchId`/`label`/
 // `selector` describe the captured container's stable DOM identity (the basis
 // for grouping); `branchId` is "main" when the capture fell back to full page.
+// `componentKey` is the full, route-scoped DOM identity key used to recognize the
+// same component across commits and to group it in the component library.
 export type ScreenshotResult = {
   jobId?: string;
   outputPath: string;
   geometry?: NodeGeometry;
   branchId?: string;
+  componentKey?: string;
   label?: string;
   selector?: string;
   navPath?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Three-tree data model (the SQLite source of truth).
+//
+// Tree 1 (Main view): Page -> Component -> ComponentVersion, stored as a single
+// adjacency table of nodes (`kind` discriminates the level). Tree 2 (Component
+// Library): one persisted LLM classification per component. Tree 3 (Commit
+// overview): one full-page screenshot per commit x changed route.
+// ---------------------------------------------------------------------------
+
+export type Tree1Kind = "page" | "component" | "version";
+
+// One row of the Tree 1 adjacency table. A `page` is a route (parent null), a
+// `component` is a DOM container on that page (parent = page), and a `version`
+// is one captured iteration of that component (parent = component). Page and
+// component rows always mirror the LATEST screenshot; version rows are the
+// immutable chronological history.
+export type Tree1NodeRecord = {
+  id: string;
+  kind: Tree1Kind;
+  parentId: string | null;
+  navPath: string | null;
+  componentKey: string | null;
+  label: string | null;
+  commitHash: string | null;
+  screenshotPath: string;
+  screenshotHash: string | null;
+  summary: string;
+  annotation?: string;
+  type: CommitType;
+  createdAt: number;
+  timestamp: number;
+  geometry?: NodeGeometry;
+};
+
+// One persisted component-library classification, keyed by the component's
+// stable DOM identity key so it is reused across commits rather than
+// re-classified. `screenshotPath`/`screenshotHash` track the component's latest
+// captured screenshot so the library view shows its current look.
+export type Tree2Classification = {
+  componentKey: string;
+  groupName: string;
+  label: string | null;
+  screenshotPath: string;
+  screenshotHash: string | null;
+  classifiedAt: number;
+};
+
+// One full-page screenshot captured for a commit on a given route. The overall
+// view of what that commit changed on that page.
+export type Tree3CommitScreenshot = {
+  id: string; // `${commitHash}:${navPath}`
+  commitHash: string;
+  navPath: string | null;
+  screenshotPath: string;
+  screenshotHash: string | null;
+  summary: string;
+  timestamp: number;
+  pageW?: number;
+  pageH?: number;
 };
 
 // One container captured while climbing the live DOM ancestor chain above a

@@ -186,7 +186,7 @@ function buildHtml(
 async function visualizeRepo(repo: string): Promise<string> {
   const graph = await DesignGraph.load(repo);
   try {
-    const { branches, nodes } = graph.exportGraph();
+    const { branches, nodes } = graph.exportTree1Graph();
     const outPath = path.join(DATA_DIR, repo, "graph.html");
     const html = buildHtml(repo, branches, nodes, path.dirname(outPath));
     await fse.writeFile(outPath, html, "utf8");

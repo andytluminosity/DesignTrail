@@ -30,16 +30,18 @@ import {
   type MiroRelativePosition,
   type NodeBox,
 } from "./treeLayout.js";
-import {
-  planSignificancePrune,
-  applySignificancePrune,
-} from "../tracker/significancePrune.js";
-import { MAIN_BRANCH } from "../tracker/branch.js";
-
 const DESIGNTRAIL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// Horizontal gap between the full-history tree and the significance-pruned tree
-// drawn beside it. Much larger than the in-tree H_GAP so the two never touch.
+// One tree's worth of branches/nodes, projected onto the layout/drawing shape.
+// The DesignGraph adapters build one of these per tree (main view, component
+// library, commit overview).
+export type BoardGraph = {
+  branches: BranchRecord[];
+  nodes: IterationNode[];
+};
+
+// Horizontal gap between adjacent trees drawn side by side. Much larger than the
+// in-tree H_GAP so two trees never touch.
 const TREE_GAP = 4000;
 // Vertical clearance above a tree where its title note sits.
 const TREE_TITLE_OFFSET = 500;
@@ -533,16 +535,6 @@ function pathToUrlPath(value: string): string {
     .split(path.sep)
     .join("/")
     .replace(/^\/+/, "");
-}
-
-/**
- * The clean (unboxed) sidecar path for a full-page `main` capture. The DOM climb
- * saves `main.png` with the change highlight box (used by the full + compressed
- * trees) and a `main-original.png` copy without it (used by the commit-overview
- * tree). Derived by name convention so it tracks the node's current PNG path.
- */
-function originalMainSidecarPath(screenshotPath: string): string {
-  return screenshotPath.replace(/\.png$/i, "-original.png");
 }
 
 /** Public URL Miro fetches a saved screenshot from, derived from its repo path. */
@@ -1259,10 +1251,10 @@ type PreparedNode = {
   placements: AnnotationPlacement[];
   footprint: ClusterFootprint;
   url: string;
-  // Local PNG to upload instead of `node.screenshotPath`. Used by the commit
-  // overview tree to upload the clean `main-original.png` sidecar (no red box)
-  // even though the node still points at the boxed `main.png`.
-  screenshotPathOverride?: string;
+  // A non-image node rendered as a sticky-note label instead of a screenshot
+  // (used for Tree 2 component-group headers). When set, no image is uploaded.
+  labelOnly?: boolean;
+  labelText?: string;
 };
 
 type DrawTreeArgs = {
@@ -1440,13 +1432,33 @@ async function drawTree(args: DrawTreeArgs): Promise<{
         y: box.y + p.footprint.imageCenterOffset.y,
       };
 
+      // Label nodes (e.g. component-group headers) draw a single sticky note in
+      // place of a screenshot, and register it so child connectors can land on
+      // it. They carry no commit/nav metadata, so they are not "rendered" nodes.
+      if (p.labelOnly) {
+        try {
+          const labelNote = await createMiroStickyNote({
+            accessToken,
+            boardId,
+            content: p.labelText ?? p.node.summary,
+            position: imageCenter,
+            width: IMAGE_W,
+          });
+          generatedItems.addItem(labelNote);
+          imageIdByNode.set(keyPrefix + p.node.id, labelNote.id);
+        } catch (error: unknown) {
+          console.error("Failed to place group label note:", getErrorMessage(error));
+        }
+        return;
+      }
+
       let imageItemId: string;
       try {
         const imageItem = await createScreenshotImage({
           accessToken,
           boardId,
           url: p.url,
-          screenshotPath: p.screenshotPathOverride ?? p.node.screenshotPath,
+          screenshotPath: p.node.screenshotPath,
           position: imageCenter,
           width: IMAGE_W,
         });
@@ -1597,29 +1609,119 @@ async function drawTree(args: DrawTreeArgs): Promise<{
 }
 
 /**
- * Clears the previous DesignTrail-generated group and re-renders the ENTIRE
- * design-evolution graph as THREE spatial trees side by side: a
- * significance-pruned tree first (where screenshots that are only a minor change
- * from their parent have been hidden), then the full-history tree to its right,
- * then a per-commit overview tree (the full-page `main` capture for each commit,
- * one screenshot per commit, as the overall view of what that commit changed).
- * Children re-anchor upward in the pruned tree and leaves are preserved. Each
- * node draws its screenshot, header note, and per-element annotation notes; tree
- * connectors show per-branch chronology and branch forks. Positions come from
- * planTreeLayout so each tree is non-overlapping. Called fresh on every render so
- * the board always reflects the full, current graph.
+ * Precomputes the draw data for one tree's nodes: image height, annotation
+ * blocks, vision-placed annotation positions, the cluster footprint, and the
+ * public image URL. Image nodes whose screenshot file is missing on disk are
+ * dropped; label nodes (empty screenshotPath) become a sticky-note label box.
+ */
+async function prepareNodes(
+  nodes: IterationNode[],
+  annotationsByNode: Map<string, AnnotationRecord[]>,
+  commitsByHash: Map<string, CommitData>,
+  options: RenderBoardOptions
+): Promise<PreparedNode[]> {
+  const drawable = nodes.filter(
+    (node) =>
+      !node.screenshotPath ||
+      existsSync(path.join(DESIGNTRAIL_ROOT, node.screenshotPath))
+  );
+
+  return mapWithConcurrency(drawable, PRECOMPUTE_CONCURRENCY, async (node) => {
+    // Label node: a group header rendered as a sticky note, no screenshot.
+    if (!node.screenshotPath) {
+      const imageH = STICKY_H;
+      const footprint = computeClusterFootprint(imageH, []);
+      return {
+        node,
+        aiAnnotation: "",
+        imageH,
+        blocks: [],
+        manualAnnotation: "",
+        manualPlacements: [],
+        placements: [],
+        footprint,
+        url: "",
+        labelOnly: true,
+        labelText: node.summary,
+      };
+    }
+
+    const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
+    const dims = await readPngDimensions(absPng);
+    const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
+    const commit = commitsByHash.get(node.commitHash);
+    const nodeAnnotations = annotationsByNode.get(node.id);
+    const manualAnnotation = getAnnotationContent(
+      nodeAnnotations,
+      "user",
+      commit?.annotation
+    );
+    const manualAnnotationColor = manualAnnotation
+      ? getAnnotationColor(nodeAnnotations, "user")
+      : undefined;
+    const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
+    const aiAnnotationColor = aiAnnotation
+      ? getAnnotationColor(nodeAnnotations, "ai")
+      : undefined;
+    const manualPlacements: AnnotationPlacement[] = manualAnnotation
+      ? [{ index: 1, x: 1, y: 0.5 }]
+      : [];
+    const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
+    const markPlans =
+      blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
+    const markPlanByIndex = new Map(markPlans.map((plan) => [plan.index, plan] as const));
+    const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => {
+      const markPlan = markPlanByIndex.get(block.index);
+      return {
+        ...block,
+        visual: markPlan?.visual ?? "sticky",
+        labelText: markPlan?.labelText || block.label,
+      };
+    });
+    const placements: AnnotationPlacement[] = markPlans.map(({ index, x, y }) => ({
+      index,
+      x,
+      y,
+    }));
+    const footprint = computeClusterFootprint(imageH, [
+      ...manualPlacements,
+      ...placements,
+    ]);
+    return {
+      node,
+      aiAnnotation,
+      aiAnnotationColor,
+      imageH,
+      blocks: renderableBlocks,
+      manualAnnotation,
+      manualAnnotationColor,
+      manualPlacements,
+      placements,
+      footprint,
+      url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
+    };
+  });
+}
+
+/**
+ * Clears the previous DesignTrail-generated group and re-renders the three
+ * stored trees side by side:
+ *   - Tree 1 (Main view): Page -> Component -> ComponentVersion, depth 3.
+ *   - Tree 2 (Component Library): ComponentGroup -> Component.
+ *   - Tree 3 (Commit overview): one full-page screenshot per commit.
+ * Each node draws its screenshot, header note, and per-element annotation notes;
+ * connectors show per-branch chronology (red) and tree forks. Positions come
+ * from planTreeLayout so each tree is non-overlapping. Called fresh on every
+ * render so the board always reflects the full, current model.
  */
 export async function renderBoardFromGraph(
-  branches: BranchRecord[],
-  nodes: IterationNode[],
+  tree1: BoardGraph,
+  tree2: BoardGraph,
+  tree3: BoardGraph,
   commitsByHash: Map<string, CommitData>,
-  annotationsOrOptions: AnnotationRecord[] | RenderBoardOptions = [],
-  optionsArg: RenderBoardOptions = {}
+  annotationRecords: AnnotationRecord[] = [],
+  options: RenderBoardOptions = {}
 ): Promise<RenderedBoardNode[]> {
-  const annotationRecords = Array.isArray(annotationsOrOptions)
-    ? annotationsOrOptions
-    : [];
-  const options = Array.isArray(annotationsOrOptions) ? optionsArg : annotationsOrOptions;
   const annotationsByNode = groupAnnotationsByNode(annotationRecords);
   const accessToken = getStoredMiroAccessToken();
   const boardId = process.env.MIRO_BOARD_ID;
@@ -1634,80 +1736,17 @@ export async function renderBoardFromGraph(
     return [];
   }
 
-  // Keep only nodes whose screenshot file actually exists on disk.
-  const renderable = nodes.filter(
-    (node) =>
-      node.screenshotPath &&
-      existsSync(path.join(DESIGNTRAIL_ROOT, node.screenshotPath))
-  );
+  const [tree1Prepared, tree2Prepared, tree3Prepared] = await Promise.all([
+    prepareNodes(tree1.nodes, annotationsByNode, commitsByHash, options),
+    prepareNodes(tree2.nodes, annotationsByNode, commitsByHash, options),
+    prepareNodes(tree3.nodes, annotationsByNode, commitsByHash, options),
+  ]);
 
-  // Precompute, per node: image height, annotation blocks, vision-placed
-  // annotation positions, the cluster footprint, and the public image URL. Done
-  // once and reused by BOTH trees (the pruned tree draws a subset of these).
-  const prepared: PreparedNode[] = await mapWithConcurrency(
-    renderable,
-    PRECOMPUTE_CONCURRENCY,
-    async (node) => {
-      const absPng = path.join(DESIGNTRAIL_ROOT, node.screenshotPath);
-      const dims = await readPngDimensions(absPng);
-      const imageH = IMAGE_W * (dims ? dims.height / dims.width : DEFAULT_IMAGE_ASPECT);
-      const commit = commitsByHash.get(node.commitHash);
-      const nodeAnnotations = annotationsByNode.get(node.id);
-      const manualAnnotation = getAnnotationContent(
-        nodeAnnotations,
-        "user",
-        commit?.annotation
-      );
-      const manualAnnotationColor = manualAnnotation
-        ? getAnnotationColor(nodeAnnotations, "user")
-        : undefined;
-      const aiAnnotation = getAnnotationContent(nodeAnnotations, "ai", node.annotation);
-      const aiAnnotationColor = aiAnnotation
-        ? getAnnotationColor(nodeAnnotations, "ai")
-        : undefined;
-      const manualPlacements: AnnotationPlacement[] = manualAnnotation
-        ? [{ index: 1, x: 1, y: 0.5 }]
-        : [];
-      const blocks = aiAnnotation ? parseAnnotationBlocks(aiAnnotation) : [];
-      const markPlans =
-        blocks.length > 0 ? (await placeAnnotations(absPng, blocks)) ?? [] : [];
-      const markPlanByIndex = new Map(
-        markPlans.map((plan) => [plan.index, plan] as const)
-      );
-      const renderableBlocks: RenderableAnnotationBlock[] = blocks.map((block) => {
-        const markPlan = markPlanByIndex.get(block.index);
-        return {
-          ...block,
-          visual: markPlan?.visual ?? "sticky",
-          labelText: markPlan?.labelText || block.label,
-        };
-      });
-      const placements: AnnotationPlacement[] = markPlans.map(({ index, x, y }) => ({
-        index,
-        x,
-        y,
-      }));
-      const footprint = computeClusterFootprint(imageH, [
-        ...manualPlacements,
-        ...placements,
-      ]);
-      return {
-        node,
-        aiAnnotation,
-        aiAnnotationColor,
-        imageH,
-        blocks: renderableBlocks,
-        manualAnnotation,
-        manualAnnotationColor,
-        manualPlacements,
-        placements,
-        footprint,
-        url: publicScreenshotUrl(node.screenshotPath, options.publicBaseUrl),
-      };
-    }
-  );
-
-  if (prepared.length === 0) {
+  if (
+    tree1Prepared.length === 0 &&
+    tree2Prepared.length === 0 &&
+    tree3Prepared.length === 0
+  ) {
     console.error("No renderable screenshots found for this repo; skipping Miro render.");
     return [];
   }
@@ -1715,88 +1754,59 @@ export async function renderBoardFromGraph(
   await clearPreviousDesignTrailRender(accessToken, boardId);
   const generatedItems = new GeneratedMiroItems();
 
-  // Tree 1: the significance-pruned view. Compute the prune plan (one vision call
-  // per hierarchy level band), apply it to IN-MEMORY graph copies (the DB is
-  // never touched), and draw the surviving nodes first.
-  const prunePlan = await planSignificancePrune(branches, nodes, DESIGNTRAIL_ROOT);
-  const { branches: prunedBranches, nodes: prunedNodes } = applySignificancePrune(
-    branches,
-    nodes,
-    prunePlan
-  );
-  const deletedIds = new Set(prunePlan.deletedNodeIds);
-  const prunedPrepared = prepared.filter((p) => !deletedIds.has(p.node.id));
-
-  const pruned = await drawTree({
+  // Tree 1: Page -> Component -> ComponentVersion.
+  const mainView = await drawTree({
     accessToken,
     boardId,
-    branches: prunedBranches,
-    nodes: prunedNodes,
-    prepared: prunedPrepared,
+    branches: tree1.branches,
+    nodes: tree1.nodes,
+    prepared: tree1Prepared,
     commitsByHash,
     annotationsByNode,
     generatedItems,
     offsetX: 0,
-    keyPrefix: "pruned:",
-    title: "Significant changes only",
+    keyPrefix: "main:",
+    title: "Main view (page → component → versions)",
   });
 
-  // Tree 2: the full design-evolution history exactly as stored, placed to the
-  // right of the compressed tree.
-  const full = await drawTree({
+  // Tree 2: Component Library (group -> component), right of the main view.
+  const library = await drawTree({
     accessToken,
     boardId,
-    branches,
-    nodes,
-    prepared,
+    branches: tree2.branches,
+    nodes: tree2.nodes,
+    prepared: tree2Prepared,
     commitsByHash,
     annotationsByNode,
     generatedItems,
-    offsetX: pruned.maxRight + TREE_GAP,
-    keyPrefix: "",
-    title: "Full history",
+    offsetX: mainView.maxRight + TREE_GAP,
+    keyPrefix: "library:",
+    title: "Component library",
   });
 
-  // Tree 3: the per-commit overview. Each commit's full-page `main` capture is
-  // the overall view of what that commit changed, so feeding only the main
-  // branch's nodes to the same layout yields a single chronological row (one
-  // screenshot per commit), placed to the right of the full-history tree.
-  const mainBranches = branches.filter((b) => b.id === MAIN_BRANCH);
-  const mainNodes = nodes.filter((n) => n.branchId === MAIN_BRANCH);
-  // The commit-overview tree shows the original, unboxed full page: swap each
-  // main node's image to its clean `main-original.png` sidecar when present
-  // (falling back to the boxed `main.png` used by the other two trees).
-  const mainPrepared = prepared
-    .filter((p) => p.node.branchId === MAIN_BRANCH)
-    .map((p) => {
-      const sidecarRel = originalMainSidecarPath(p.node.screenshotPath);
-      const sidecarAbs = path.join(DESIGNTRAIL_ROOT, sidecarRel);
-      if (!existsSync(sidecarAbs)) return p;
-      return {
-        ...p,
-        screenshotPathOverride: sidecarRel,
-        url: publicScreenshotUrl(sidecarRel, options.publicBaseUrl),
-      };
-    });
-
+  // Tree 3: the per-commit overview, right of the component library.
   const commitOverview = await drawTree({
     accessToken,
     boardId,
-    branches: mainBranches,
-    nodes: mainNodes,
-    prepared: mainPrepared,
+    branches: tree3.branches,
+    nodes: tree3.nodes,
+    prepared: tree3Prepared,
     commitsByHash,
     annotationsByNode,
     generatedItems,
-    offsetX: full.maxRight + TREE_GAP,
+    offsetX: library.maxRight + TREE_GAP,
     keyPrefix: "commit:",
     title: "Commit overview (one per commit)",
   });
 
-  const rendered = [...pruned.rendered, ...full.rendered, ...commitOverview.rendered];
+  const rendered = [
+    ...mainView.rendered,
+    ...library.rendered,
+    ...commitOverview.rendered,
+  ];
   console.log(
-    `Miro board re-rendered: significant-changes (${pruned.rendered.length}), ` +
-      `full history (${full.rendered.length}), and ` +
+    `Miro board re-rendered: main view (${mainView.rendered.length}), ` +
+      `component library (${library.rendered.length}), and ` +
       `commit overview (${commitOverview.rendered.length}) trees.`
   );
   await persistDesignTrailRenderGroup(accessToken, boardId, generatedItems);
