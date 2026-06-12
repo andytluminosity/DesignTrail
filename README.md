@@ -409,6 +409,52 @@ each manual render and the board shows the complete tree for the selected repo.
 Configure the board with `MIRO_BOARD_ID` and complete the OAuth flow in
 `miro-service/` first. Capture/smoke-test flows never touch Miro directly.
 
+## View this change (open a commit's version in the app)
+
+Right-click any screenshot on the Miro board and choose **View this change** to
+check out the commit that screenshot came from in an isolated git worktree, serve
+it, and open your browser at the exact route that was captured. Your working repo
+is never touched (the checkout happens in a separate worktree).
+
+How the pieces fit together:
+
+1. **Item map.** On every Miro render, `renderBoardFromGraph` reports each
+   screenshot's Miro image id along with its `commitHash` and `navPath`. The
+   snapshot service writes these to `data/miro-item-map.json`, keyed by board id
+   ([src/core/miroItemMap.ts](src/core/miroItemMap.ts)). The board is
+   wipe-and-rerendered, so this map is replaced each sync and stale ids drop out.
+2. **Miro Web SDK app.** A small static bundle
+   ([miro-service/public/miro-app/](miro-service/public/miro-app/)) registers a
+   custom context-menu action. When clicked, it sends the board id + selected
+   image item id to `POST /view-change`.
+3. **Endpoint.** `POST /view-change` ([miro-service/src/server.ts](miro-service/src/server.ts))
+   resolves the item to `{ repoPath, commitHash, navPath }` via the map (or you
+   can pass `{ repoPath, commitHash, navPath }` directly), then calls the preview
+   service.
+4. **Preview service.** [src/core/previewService.ts](src/core/previewService.ts)
+   runs `git worktree add --detach <dir> <commitHash>` under
+   `.preview-worktrees/<repo>/<shortHash>`, installs deps if needed, prefers
+   `npm run build` + `npm run preview` (falls back to `npm run dev`) on
+   `DESIGNTRAIL_PREVIEW_PORT` (default `4180`), waits for the server, and opens
+   the browser at `http://localhost:<port><navPath>`. Only one preview runs at a
+   time; a new request tears down the previous worktree and process.
+
+### One-time Miro app setup
+
+The custom right-click menu requires Miro's Web SDK on your Miro app (reuse the
+same app behind `MIRO_CLIENT_ID`):
+
+1. Start the service: `cd miro-service && npm start` (serves the app bundle at
+   `http://localhost:3002/miro-app/app.html`).
+2. In the [Miro developer portal](https://developers.miro.com/), open your app
+   and enable the **Web SDK**.
+3. Set the app **iframe / App URL** to `http://localhost:3002/miro-app/app.html`
+   (use your tunnel URL, e.g. ngrok, if Miro can't reach localhost).
+4. (Re)install/open the app on the DesignTrail board so the action registers.
+5. Right-click a screenshot and choose **View this change**.
+
+Set `DESIGNTRAIL_PREVIEW_PORT` if `4180` conflicts with another server.
+
 ## Manual testing
 
 ```bash

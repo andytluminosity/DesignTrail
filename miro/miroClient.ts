@@ -306,6 +306,11 @@ type MiroRenderGroupState = {
 export type RenderedBoardNode = {
   nodeId: string;
   miroImageId: string;
+  // The commit this screenshot was captured from, and the route that was
+  // navigated to before capture. Persisted alongside the Miro item id so a
+  // right-click "View this change" action can recover what to check out and open.
+  commitHash: string;
+  navPath: string;
 };
 
 type RenderBoardOptions = {
@@ -1347,6 +1352,12 @@ async function drawTree(args: DrawTreeArgs): Promise<{
   const rendered: RenderedBoardNode[] = [];
   if (prepared.length === 0) return { rendered, maxRight: offsetX };
 
+  // Route to navigate to for each branch, so each rendered node can record the
+  // nav path captured for it (defaulting to "/" for branches without one).
+  const navPathByBranch = new Map<string, string>(
+    branches.map((b) => [b.id, b.navPath ?? "/"] as const)
+  );
+
   const boxes: NodeBox[] = prepared.map((p) => ({
     id: p.node.id,
     width: p.footprint.width,
@@ -1442,7 +1453,12 @@ async function drawTree(args: DrawTreeArgs): Promise<{
         imageItemId = imageItem.id;
         generatedItems.addItem(imageItem);
         imageIdByNode.set(keyPrefix + p.node.id, imageItem.id);
-        rendered.push({ nodeId: p.node.id, miroImageId: imageItem.id });
+        rendered.push({
+          nodeId: p.node.id,
+          miroImageId: imageItem.id,
+          commitHash: p.node.commitHash,
+          navPath: navPathByBranch.get(p.node.branchId) ?? "/",
+        });
       } catch (error: unknown) {
         console.error(
           `Failed to render Miro screenshot (${p.node.branchId || "main"}):`,

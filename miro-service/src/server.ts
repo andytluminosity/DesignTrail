@@ -10,6 +10,8 @@ import {
   createDesignSnapshot,
   renderDesignSnapshotBoard,
 } from "../../src/core/snapshotService.js";
+import { resolveMiroItem } from "../../src/core/miroItemMap.js";
+import { startPreview } from "../../src/core/previewService.js";
 import type { AnnotationChoice, AnnotationMode } from "../../tracker/types.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,6 +27,19 @@ let miroAccessToken: string | null = null;
 
 const app = express();
 app.use(express.json());
+
+// The Miro Web SDK app calls /view-change from inside an iframe, so allow the
+// cross-origin request (and its preflight) on the API routes.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 app.use(
   "/captures",
   express.static(path.join(DESIGNTRAIL_ROOT, "captures"), {
@@ -32,6 +47,13 @@ app.use(
       res.setHeader("Access-Control-Allow-Origin", "*");
     },
   })
+);
+
+// The Miro Web SDK app bundle (app.html/app.js) registers the "View this change"
+// context-menu action; Miro loads this as the app's iframe URL.
+app.use(
+  "/miro-app",
+  express.static(path.join(__dirname, "..", "public", "miro-app"))
 );
 
 type SnapshotRequestBody = {
@@ -51,6 +73,17 @@ type ApplyAnnotationsRequestBody = {
   commitHash?: unknown;
   annotationChoices?: unknown;
   syncMiro?: unknown;
+};
+
+type ViewChangeRequestBody = {
+  // Preferred: the Miro board + image item id the user right-clicked. The
+  // commit/navPath/repo are resolved from the persisted item map.
+  boardId?: unknown;
+  itemId?: unknown;
+  // Fallback: caller supplies the change details directly.
+  repoPath?: unknown;
+  commitHash?: unknown;
+  navPath?: unknown;
 };
 
 type MiroRenderJobStatus = "running" | "completed" | "failed";
@@ -446,6 +479,89 @@ app.get("/miro/render-jobs/:jobId", (req, res) => {
     success: true,
     job: publicMiroRenderJob(job),
   });
+});
+
+app.post("/view-change", async (req, res) => {
+  const { boardId, itemId, repoPath, commitHash, navPath } =
+    req.body as ViewChangeRequestBody;
+
+  let resolvedRepoPath: string | undefined;
+  let resolvedRepoName: string | undefined;
+  let resolvedCommitHash: string | undefined;
+  let resolvedNavPath = "/";
+
+  try {
+    const directRepoPath = normalizeOptionalString(repoPath, "repoPath");
+    const directCommitHash = normalizeOptionalString(commitHash, "commitHash");
+    const directNavPath = normalizeOptionalString(navPath, "navPath");
+
+    if (directRepoPath && directCommitHash) {
+      // Caller supplied the change details directly.
+      resolvedRepoPath = path.resolve(directRepoPath);
+      resolvedRepoName = path.basename(resolvedRepoPath);
+      resolvedCommitHash = directCommitHash;
+      resolvedNavPath = directNavPath ?? "/";
+    } else {
+      // Resolve from the persisted board item map.
+      const normalizedBoardId = normalizeOptionalString(boardId, "boardId");
+      const normalizedItemId = normalizeOptionalString(itemId, "itemId");
+      if (!normalizedBoardId || !normalizedItemId) {
+        throw new Error(
+          "Provide either { boardId, itemId } or { repoPath, commitHash }"
+        );
+      }
+
+      const item = await resolveMiroItem(normalizedBoardId, normalizedItemId);
+      if (!item) {
+        return res.status(404).json({
+          success: false,
+          error: `No stored change found for item ${normalizedItemId} on board ${normalizedBoardId}. Re-sync the board to refresh the map.`,
+        });
+      }
+
+      resolvedRepoPath = item.repoPath;
+      resolvedRepoName = item.repoName;
+      resolvedCommitHash = item.commitHash;
+      resolvedNavPath = item.navPath || "/";
+    }
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (!resolvedRepoPath || !resolvedRepoName || !resolvedCommitHash) {
+    return res.status(400).json({
+      success: false,
+      error: "Could not resolve repo path and commit for the requested change",
+    });
+  }
+
+  try {
+    const result = await startPreview({
+      repoPath: resolvedRepoPath,
+      repoName: resolvedRepoName,
+      commitHash: resolvedCommitHash,
+      navPath: resolvedNavPath,
+    });
+
+    return res.json({
+      success: true,
+      url: result.url,
+      port: result.port,
+      commitHash: result.commitHash,
+      navPath: resolvedNavPath,
+      reused: result.reused,
+    });
+  } catch (error) {
+    console.error("View-change preview failed:", error);
+    return res.status(500).json({
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to start change preview",
+    });
+  }
 });
 
 app.post("/test-node", async (req, res) => {

@@ -16,6 +16,9 @@ captures/
 data/
 .designtrail/
 
+# Isolated git worktrees created by the "View this change" preview flow
+.preview-worktrees/
+
 # Logs
 logs/
 *.log

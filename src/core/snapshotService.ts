@@ -13,6 +13,7 @@ import { planFolderLayout } from "../../tracker/treeStore.js";
 import { planDuplicateCollapse, planBranchPromotion } from "../../tracker/prune.js";
 import { MAIN_BRANCH } from "../../tracker/branch.js";
 import { renderBoardFromGraph, type RenderedBoardNode } from "../../miro/miroClient.js";
+import { writeMiroItemMap } from "./miroItemMap.js";
 import type {
   AnnotationChoice,
   AnnotationChoiceTarget,
@@ -852,6 +853,8 @@ export async function createDesignSnapshot(
           boardExport.annotations
         );
 
+  await writeMiroItemMap({ repoName, repoPath, miroNodes });
+
   return {
     commit,
     repoName,
@@ -923,6 +926,8 @@ export async function applyDesignSnapshotAnnotations(
           boardExport.annotations
         );
 
+  await writeMiroItemMap({ repoName, repoPath, miroNodes });
+
   return {
     commit,
     repoName,
@@ -961,10 +966,14 @@ export async function renderDesignSnapshotBoard(
     graph.close();
   }
 
-  return renderBoardFromGraph(
+  const miroNodes = await renderBoardFromGraph(
     boardExport.branches,
     boardExport.nodes,
     boardExport.commits,
     boardExport.annotations
   );
+
+  await writeMiroItemMap({ repoName, repoPath, miroNodes });
+
+  return miroNodes;
 }
