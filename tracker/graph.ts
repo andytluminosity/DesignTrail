@@ -69,15 +69,17 @@ CREATE TABLE IF NOT EXISTS tree2_classifications (
 );
 
 CREATE TABLE IF NOT EXISTS tree3_commit_screenshots (
-  id              TEXT PRIMARY KEY,
-  commit_hash     TEXT NOT NULL,
-  nav_path        TEXT,
-  screenshot_path TEXT,
-  screenshot_hash TEXT,
-  summary         TEXT,
-  timestamp       INTEGER NOT NULL,
-  page_w          REAL,
-  page_h          REAL
+  id                       TEXT PRIMARY KEY,
+  commit_hash              TEXT NOT NULL,
+  nav_path                 TEXT,
+  screenshot_path          TEXT,
+  screenshot_hash          TEXT,
+  summary                  TEXT,
+  timestamp                INTEGER NOT NULL,
+  page_w                   REAL,
+  page_h                   REAL,
+  highlight_screenshot_path TEXT,
+  highlight_screenshot_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS annotations (
@@ -140,6 +142,8 @@ type Tree3Row = {
   timestamp: number;
   page_w: number | null;
   page_h: number | null;
+  highlight_screenshot_path: string | null;
+  highlight_screenshot_hash: string | null;
 };
 
 type AnnotationRow = {
@@ -222,6 +226,8 @@ function toCommitScreenshot(row: Tree3Row): Tree3CommitScreenshot {
     timestamp: row.timestamp,
     pageW: row.page_w ?? undefined,
     pageH: row.page_h ?? undefined,
+    highlightScreenshotPath: row.highlight_screenshot_path ?? undefined,
+    highlightScreenshotHash: row.highlight_screenshot_hash ?? undefined,
   };
 }
 
@@ -242,6 +248,11 @@ function tableExists(db: Database.Database, name: string): boolean {
     .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
     .get(name);
   return row !== undefined;
+}
+
+function columnExists(db: Database.Database, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return rows.some((row) => row.name === column);
 }
 
 // Input shapes for the Tree 1 upserts. Geometry is optional and applied across
@@ -297,6 +308,19 @@ export class DesignGraph {
     }
 
     db.exec(SCHEMA);
+
+    // Additive migration: older databases predate the highlighted commit-overview
+    // variant, so add the columns in place rather than dropping data.
+    if (
+      tableExists(db, "tree3_commit_screenshots") &&
+      !columnExists(db, "tree3_commit_screenshots", "highlight_screenshot_path")
+    ) {
+      db.exec(
+        `ALTER TABLE tree3_commit_screenshots ADD COLUMN highlight_screenshot_path TEXT;
+         ALTER TABLE tree3_commit_screenshots ADD COLUMN highlight_screenshot_hash TEXT;`
+      );
+    }
+
     return new DesignGraph(db);
   }
 
@@ -575,6 +599,26 @@ export class DesignGraph {
       });
   }
 
+  /**
+   * Records (or clears) the highlighted variant for an already-stored commit
+   * overview screenshot. Kept separate from the upsert because the highlight is
+   * captured as its own job and applied after the plain full-page row exists.
+   */
+  setCommitScreenshotHighlight(
+    id: string,
+    highlightScreenshotPath: string | null,
+    highlightScreenshotHash: string | null
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE tree3_commit_screenshots
+            SET highlight_screenshot_path = @highlightScreenshotPath,
+                highlight_screenshot_hash = @highlightScreenshotHash
+          WHERE id = @id`
+      )
+      .run({ id, highlightScreenshotPath, highlightScreenshotHash });
+  }
+
   getCommitScreenshots(): Tree3CommitScreenshot[] {
     const rows = this.db
       .prepare(`SELECT * FROM tree3_commit_screenshots ORDER BY timestamp ASC, rowid ASC`)
@@ -736,7 +780,10 @@ export class DesignGraph {
   /**
    * Tree 3 as branches/nodes: a single chronological chain of full-page
    * screenshots (one per commit x route), so the commit overview reads as one
-   * row of "what each commit changed" exactly as before.
+   * row of "what each commit changed". When a screenshot has a highlighted
+   * variant (the same page with its changed containers outlined in red), that
+   * variant is emitted as a one-node child branch forking off the original, so
+   * it hangs directly below it without altering the original row.
    */
   exportTree3Graph(): { branches: BranchRecord[]; nodes: IterationNode[] } {
     const rows = this.getCommitScreenshots();
@@ -765,6 +812,26 @@ export class DesignGraph {
         timestamp: r.timestamp,
       });
       prevId = r.id;
+
+      if (r.highlightScreenshotPath) {
+        const highlightBranchId = `commit-overview-highlight:${r.id}`;
+        branches.push({
+          id: highlightBranchId,
+          parentBranchId: branchId,
+          forkNodeId: r.id, // hang directly under the original screenshot
+          createdAt: r.timestamp,
+        });
+        nodes.push({
+          id: `${r.id}:highlight`,
+          commitHash: r.commitHash,
+          branchId: highlightBranchId,
+          parentId: null,
+          summary: "Highlighted changes",
+          type: "UNKNOWN",
+          screenshotPath: r.highlightScreenshotPath,
+          timestamp: r.timestamp,
+        });
+      }
     }
     return { branches, nodes };
   }

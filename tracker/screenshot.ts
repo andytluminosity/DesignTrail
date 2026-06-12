@@ -255,6 +255,25 @@ async function captureLocator(
   return { container: elementHandle, located: elementHandle };
 }
 
+/**
+ * Outlines a single changed container with a red dotted border, in-browser, so a
+ * subsequent full-page screenshot captures the highlight exactly as it renders
+ * (no coordinate math or device-scale mismatch). Resolves the same container the
+ * targeted component capture would (the located element's immediate parent, or
+ * the element itself), applies an `outline` (which does not shift layout), and
+ * reports whether a container was found. Failures are swallowed by the caller.
+ */
+async function applyHighlight(page: Page, target: ScreenshotTarget): Promise<boolean> {
+  const located = await captureLocator(page, target);
+  if (!located) return false;
+  await located.container.evaluate((node) => {
+    const el = node as HTMLElement;
+    el.style.setProperty("outline", "4px dotted #ff0000", "important");
+    el.style.setProperty("outline-offset", "2px", "important");
+  });
+  return true;
+}
+
 /** Full scrollable document dimensions of the currently loaded page. */
 async function pageDimensions(page: Page): Promise<{ pageW: number; pageH: number }> {
   return await page.evaluate(() => ({
@@ -299,6 +318,11 @@ export type ScreenshotJob = {
   outputPath: string;
   target: ScreenshotTarget;
   navPath?: string;
+  // When set, this is a highlight capture: a full-page screenshot of the route
+  // with each of these targets' changed container outlined in a red dotted
+  // border. The route's plain full-page capture is a separate job, so the
+  // original screenshot is never modified.
+  highlightTargets?: ScreenshotTarget[];
 };
 
 /**
@@ -326,6 +350,31 @@ async function captureOnePage(
   // stable regardless of which equivalent alias (e.g. "/" vs "/dashboard") the
   // analyzer requested.
   const resolvedNavPath = canonicalNavPath(page.url());
+
+  // Highlight capture: outline each changed container in red, then screenshot
+  // the whole page. The plain full-page capture is a separate job, so the
+  // original commit-overview screenshot is left untouched.
+  if (job.highlightTargets && job.highlightTargets.length > 0) {
+    let highlightCount = 0;
+    for (const highlightTarget of job.highlightTargets) {
+      try {
+        if (await applyHighlight(page, highlightTarget)) highlightCount += 1;
+      } catch {
+        // A container that can't be located is simply not outlined.
+      }
+    }
+    await page.screenshot({ path: outputPath, fullPage: true });
+    console.log(`Screenshot saved (highlight, ${highlightCount} outlined): ${outputPath}`);
+    return {
+      jobId,
+      outputPath,
+      geometry: await fullPageGeometry(page),
+      branchId: MAIN_BRANCH,
+      label: MAIN_BRANCH,
+      navPath: resolvedNavPath,
+      highlightCount,
+    };
+  }
 
   if (target.mode !== "full") {
     try {

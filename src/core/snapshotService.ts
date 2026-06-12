@@ -527,6 +527,38 @@ export async function createDesignSnapshot(
       });
     }
 
+    // Highlight jobs: one extra full-page capture per route that has targeted
+    // changes, outlining each changed container in a red dotted border. The
+    // original page capture above is untouched; this variant branches off it in
+    // the commit overview tree.
+    const routeHighlightTargets = new Map<string, ScreenshotTarget[]>();
+    for (const spec of compSpecs) {
+      const list = routeHighlightTargets.get(spec.navPath) ?? [];
+      list.push(spec.target);
+      routeHighlightTargets.set(spec.navPath, list);
+    }
+    type HighlightSpec = { jobId: string; navPath: string };
+    const highlightSpecById = new Map<string, HighlightSpec>();
+    let highlightIndex = 0;
+    for (const [navPath, targets] of routeHighlightTargets) {
+      const jobId = `h${highlightIndex++}`;
+      const rel = path.join(
+        "captures",
+        repoName,
+        "pages",
+        navSlug(navPath),
+        `${shortHash}-highlight.png`
+      );
+      jobs.push({
+        jobId,
+        outputPath: path.join(DESIGNTRAIL_ROOT, rel),
+        target: { mode: "full" },
+        navPath,
+        highlightTargets: targets,
+      });
+      highlightSpecById.set(jobId, { jobId, navPath });
+    }
+
     const { results } = await takeScreenshots(jobs, CAPTURE_URL);
     screenshots = results;
 
@@ -582,6 +614,25 @@ export async function createDesignSnapshot(
           screenshotPath: rel,
         });
       }
+    }
+
+    // --- Highlighted commit-overview variants (Tree 3 child nodes) -----------
+    // Attach each highlight capture to its already-upserted commit-overview row.
+    // A capture that outlined nothing is discarded so we never branch an
+    // unhighlighted duplicate of the original.
+    for (const result of results) {
+      const spec = result.jobId ? highlightSpecById.get(result.jobId) : undefined;
+      if (!spec) continue;
+      const navPath = result.navPath ?? spec.navPath;
+      if (!result.highlightCount) {
+        await fse.remove(result.outputPath).catch(() => undefined);
+        continue;
+      }
+      const rel = path.relative(DESIGNTRAIL_ROOT, result.outputPath);
+      const fileHash = await hashFile(result.outputPath);
+      graph.transaction(() =>
+        graph.setCommitScreenshotHighlight(`${commit.hash}:${navPath}`, rel, fileHash)
+      );
     }
 
     // --- Components + versions (Tree 1) + classifications (Tree 2) -----------

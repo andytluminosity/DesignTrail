@@ -125,6 +125,10 @@ export type ScreenshotResult = {
   label?: string;
   selector?: string;
   navPath?: string;
+  // For a highlight capture (a full-page shot with the changed containers
+  // outlined): how many containers were actually located and outlined. 0 means
+  // nothing could be highlighted, so the caller should discard the capture.
+  highlightCount?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -186,6 +190,12 @@ export type Tree3CommitScreenshot = {
   timestamp: number;
   pageW?: number;
   pageH?: number;
+  // A second full-page screenshot of the SAME page with the changed DOM
+  // containers outlined by a red dotted border. The original screenshotPath is
+  // left untouched; this highlighted variant branches off it in the commit
+  // overview tree. Undefined when no container could be highlighted on the page.
+  highlightScreenshotPath?: string;
+  highlightScreenshotHash?: string;
 };
 
 // One container captured while climbing the live DOM ancestor chain above a
