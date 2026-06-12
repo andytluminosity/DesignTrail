@@ -3,7 +3,6 @@ import http from "http";
 import { fileURLToPath } from "url";
 import { spawn, type ChildProcess } from "child_process";
 import fse from "fs-extra";
-import simpleGit from "simple-git";
 
 // Resolve DesignTrail root so worktrees live beside the rest of the install.
 const DESIGNTRAIL_ROOT = path.resolve(
@@ -171,16 +170,20 @@ async function ensureWorktree(
   commitHash: string
 ): Promise<void> {
   // Reuse an existing checkout for this commit when present.
-  if (await fse.pathExists(path.join(worktreeDir, ".git"))) return;
+  if (
+    (await fse.pathExists(path.join(worktreeDir, ".git"))) &&
+    (await fse.pathExists(path.join(worktreeDir, "package.json")))
+  ) {
+    return;
+  }
 
-  const git = simpleGit(repoPath);
   // Clear any stale worktree registrations before (re)creating this one.
-  await git.raw(["worktree", "prune"]);
+  await runGit(["worktree", "prune"], repoPath);
   if (await fse.pathExists(worktreeDir)) {
     await fse.remove(worktreeDir);
   }
   await fse.ensureDir(path.dirname(worktreeDir));
-  await git.raw(["worktree", "add", "--detach", worktreeDir, commitHash]);
+  await runGit(["worktree", "add", "--detach", worktreeDir, commitHash], repoPath);
 }
 
 async function removeWorktree(
@@ -188,13 +191,12 @@ async function removeWorktree(
   worktreeDir: string
 ): Promise<void> {
   try {
-    const git = simpleGit(repoPath);
-    await git.raw(["worktree", "remove", "--force", worktreeDir]);
+    await runGit(["worktree", "remove", "--force", worktreeDir], repoPath);
   } catch {
     // Fall back to a plain delete + prune if git refuses (e.g. dirty worktree).
     await fse.remove(worktreeDir).catch(() => undefined);
     try {
-      await simpleGit(repoPath).raw(["worktree", "prune"]);
+      await runGit(["worktree", "prune"], repoPath);
     } catch {
       // Best effort; nothing else to do.
     }
@@ -265,6 +267,34 @@ function runToCompletion(
     child.on("exit", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${command} ${args.join(" ")} exited with code ${code}`));
+    });
+  });
+}
+
+function gitSafeEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  // Git hooks export these variables for the hook's repository. Nested git
+  // commands (notably `git worktree add`) must resolve from their own cwd
+  // instead, otherwise a checked-out worktree's `.git` file can be mistaken for
+  // the hook repo's git directory and checkout fails with ".git/index".
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_PREFIX;
+  return env;
+}
+
+function runGit(args: string[], cwd: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      stdio: "inherit",
+      env: gitSafeEnv(),
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`git ${args.join(" ")} exited with code ${code}`));
     });
   });
 }

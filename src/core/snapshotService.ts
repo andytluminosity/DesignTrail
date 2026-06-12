@@ -776,10 +776,22 @@ export async function createDesignSnapshot(
               : undefined;
             if (!capture) continue;
 
-            // Accept only when the SAME component (same DOM identity) is present
-            // in the parent code. A brand-new component (added this commit) or a
-            // missing element falls back to "main"/another id and is discarded.
-            if (beforeResult.branchId !== capture.componentId) {
+            // The before-capture re-runs the IDENTICAL target (same selector AND
+            // climbLevels) on the parent commit, so it screenshots the same
+            // container, climbed to the same level, as the after capture — the
+            // two are directly comparable. We attribute the baseline to the after
+            // component (capture.componentId) rather than requiring an identical
+            // recomputed DOM identity, because the change itself often alters the
+            // container the identity is derived from. We only require that a real
+            // element was actually located on the parent: a brand-new component
+            // can't be located, falls back to a full-page capture (branchId ===
+            // "main", no componentKey), and is skipped so we never invent a
+            // baseline for something that did not exist before.
+            if (
+              !beforeResult.branchId ||
+              beforeResult.branchId === MAIN_BRANCH ||
+              !beforeResult.componentKey
+            ) {
               await fse.remove(beforeResult.outputPath).catch(() => undefined);
               continue;
             }
@@ -796,14 +808,18 @@ export async function createDesignSnapshot(
             await fse.ensureDir(path.dirname(beforeAbs));
             await fse.move(beforeResult.outputPath, beforeAbs, { overwrite: true });
 
+            // Attribute the baseline to the after component so it nests as that
+            // component's earlier version (label/navPath taken from the after
+            // capture for a consistent caption), with the before screenshot's own
+            // measured geometry.
             beforeByComponent.set(capture.componentId, {
               versionId: versionNodeId(parent.hash, capture.componentId),
               commitHash: parent.hash,
               timestamp: parent.timestamp,
               screenshotRel: beforeRel,
               screenshotHash: beforeHash,
-              label: beforeResult.label ?? capture.label,
-              navPath: beforeResult.navPath ?? capture.navPath,
+              label: capture.label,
+              navPath: capture.navPath,
               geometry: beforeResult.geometry,
             });
           }
