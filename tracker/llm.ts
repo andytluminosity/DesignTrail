@@ -30,12 +30,12 @@ Given a commit message, its diff, and a snapshot of the LIVE rendered DOM for ea
 identify EVERY distinct UI element the commit changed, and for each one decide what to
 screenshot and on which page.
 
-YOU DO NOT DECIDE GROUPING OR NESTING. The tracker derives each component's container and its
-place in the component tree DETERMINISTICALLY from the live DOM: it takes the single element
-you locate, climbs exactly ONE level to its parent (that parent container DEFINES the
-component), then climbs the ENTIRE ancestor chain up to the page root, capturing each
-enclosing container automatically. Each container is identified by a stable DOM key, so two
-elements that share a CSS class but are separate DOM nodes (e.g. two cards) are kept as
+YOU DO NOT DECIDE GROUPING OR NESTING. The tracker derives each component's container
+DETERMINISTICALLY from the live DOM: it takes the single element you locate, then climbs up
+the ancestor chain to the NEAREST MEANINGFUL container (one with an id, class, data-* hook,
+role, or name), so an anonymous wrapper is skipped in favor of a container whose name makes
+sense. That container DEFINES the component. Each container is identified by a stable DOM key,
+so two elements that share a CSS class but are separate DOM nodes (e.g. two cards) are kept as
 SEPARATE containers, and the SAME container is matched across commits. Therefore NEVER try to
 name, group, or nest containers yourself — just locate each precise change.
 
@@ -66,9 +66,10 @@ CRITICAL targeting rules:
   that actually changed (the text node, icon, button, etc.) and make sure it exists in the UI
   CONTEXT. Prefer "text" (exact visible text from the context) or "role" because they are the
   most robust; use "selector" only when a class/id from the context clearly isolates it.
-- The tracker screenshots the located element's IMMEDIATE PARENT as the component container,
-  so locate a direct child of the area you care about (e.g. to frame a card, locate the text
-  or control inside it). To frame a container AS A WHOLE, locate a direct child of it.
+- The tracker screenshots the nearest MEANINGFUL container above the located element as the
+  component (climbing past anonymous wrappers), so locate a precise element inside the area you
+  care about (e.g. to frame a card, locate the text or control inside it) and the tracker
+  resolves the enclosing container automatically.
 - NEVER use mode "full" for a specific area. "full" screenshots the ENTIRE page and is
   reserved EXCLUSIVELY for a genuinely global, page-wide, or non-visual change. A small
   text/style tweak to one area (a footer version string, a single label, one stat value) is

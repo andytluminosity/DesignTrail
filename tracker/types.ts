@@ -53,8 +53,9 @@ export type NodeGeometry = {
 
 export type ScreenshotTarget = {
   // How to locate the changed element (or full page). For a non-full target we
-  // screenshot/measure the located element's immediate parent container, which
-  // defines this component's branch and drives the recorded geometry.
+  // screenshot/measure the nearest meaningful container above the located element
+  // (climbing past anonymous wrappers), which defines this component's branch and
+  // drives the recorded geometry.
   mode: "full" | "selector" | "text" | "role";
   value?: string;
 };

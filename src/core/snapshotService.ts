@@ -461,7 +461,8 @@ export async function createDesignSnapshot(
     // Split the detected changes into component captures (targeted) and the
     // routes that need a full-page capture. Every route touched by any change
     // gets exactly ONE full-page capture (the page node + commit overview), and
-    // each targeted change gets its own container capture. No DOM climbing.
+    // each targeted change gets its own container capture (the located element's
+    // nearest meaningful ancestor; see captureLocator).
     type CompSpec = {
       jobId: string;
       summary: string;
