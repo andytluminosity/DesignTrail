@@ -63,6 +63,15 @@ therefore produce several nodes and several screenshots. Nodes are organized int
   targets that same component (instead of inventing a near-duplicate like `side-nav` vs
   `sidebar`). A validation backstop drops any `parentBranch` that isn't a real branch.
 - **Broad / non-visual changes** land on `main` with a full-page capture.
+- **First-version before/after capture.** The first time a component is versioned, its
+  pre-change look would otherwise be lost (only the post-commit "after" exists). To preserve
+  it, DesignTrail serves the **parent commit** (`HEAD~1`) in an isolated git worktree on a
+  separate port (`DESIGNTRAIL_BEFORE_PORT`, default `4190`), re-screenshots the same
+  component there, and inserts that "before" image as an earlier version node so the history
+  shows both. This only runs on a component's first version, only when a parent commit
+  exists, and only when the component is still locatable with the same DOM identity in the
+  parent code (brand-new components are skipped). If the parent server can't be served, the
+  "before" is skipped and the commit/capture still succeed.
 
 Everything is persisted per repo in SQLite at `data/<repo>/graph.db` (no server, fully
 deterministic, rebuilt from disk on every commit). `DesignGraph.exportGraph()` returns
@@ -304,6 +313,7 @@ system never crashes a commit.
 | `DESIGNTRAIL_ANNOTATION_CHOICES` | (optional) | JSON array of per-node annotation choices for non-interactive hook runs. |
 | `DESIGNTRAIL_DEFAULT_ANNOTATION_MODE` | `ai` | Default mode for screenshots without an explicit choice (`skip`, `manual`, `ai`, `manual_and_ai`). |
 | `DESIGNTRAIL_SYNC_MIRO` | `true` | Set to `false` to capture into SQLite without rendering Miro. |
+| `DESIGNTRAIL_BEFORE_PORT` | `4190` | Port for the temporary worktree server used to capture a component's "before" (parent-commit) look on its first version. |
 
 Read from `.env` in the DesignTrail root, regardless of which repo triggered the hook.
 

@@ -2,9 +2,10 @@ import path from "path";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import fse from "fs-extra";
-import { getLatestCommit, getDiff, getRepoName } from "../../tracker/git.js";
+import { getLatestCommit, getDiff, getParentCommit, getRepoName } from "../../tracker/git.js";
 import { takeScreenshots, getSiteContext } from "../../tracker/screenshot.js";
 import type { ScreenshotJob } from "../../tracker/screenshot.js";
+import { serveCommitHeadless, type HeadlessServer } from "./previewService.js";
 import { analyzeCommit } from "../../tracker/llm.js";
 import { annotateScreenshots } from "../../tracker/annotate.js";
 import { classifyComponent } from "../../tracker/classify.js";
@@ -25,6 +26,7 @@ import type {
   AnnotationSource,
   CommitData,
   CommitType,
+  NodeGeometry,
   ScreenshotResult,
   ScreenshotTarget,
 } from "../../tracker/types.js";
@@ -636,7 +638,30 @@ export async function createDesignSnapshot(
     }
 
     // --- Components + versions (Tree 1) + classifications (Tree 2) -----------
+    //
+    // Two passes so a component's FIRST version can also record its prior look:
+    //   A) decide which captures are genuinely new versions and move their files;
+    //   B) for components being versioned for the FIRST time, capture their
+    //      "before" state from the parent commit and insert it as an earlier
+    //      version; then upsert the component + "after" version nodes.
+    type ComponentCapture = {
+      componentId: string;
+      componentKey: string;
+      navPath: string;
+      target: ScreenshotTarget;
+      label: string;
+      summary: string;
+      type: CommitType;
+      finalRel: string;
+      finalAbs: string;
+      fileHash: string | null;
+      geometry?: NodeGeometry;
+      isFirst: boolean;
+    };
+
     const pendingClassifications: PendingClassification[] = [];
+    const componentCaptures: ComponentCapture[] = [];
+
     for (const result of results) {
       const spec = result.jobId ? compSpecById.get(result.jobId) : undefined;
       if (!spec) continue;
@@ -654,12 +679,15 @@ export async function createDesignSnapshot(
       const fileHash = await hashFile(result.outputPath);
 
       // Byte-identical to the component's latest version => no new version.
+      // Captured before any new version row is inserted this run, so the
+      // "before" capture below can never make the "after" look like a duplicate.
       const latestHash = graph.getLatestVersionHash(componentId);
       if (fileHash && latestHash && fileHash === latestHash) {
         await fse.remove(result.outputPath).catch(() => undefined);
         continue;
       }
 
+      const isFirst = graph.getComponentVersions(componentId).length === 0;
       const finalRel = path.join(
         "captures",
         repoName,
@@ -671,60 +699,199 @@ export async function createDesignSnapshot(
       await fse.ensureDir(path.dirname(finalAbs));
       await fse.move(result.outputPath, finalAbs, { overwrite: true });
 
-      const pageId = pageNodeId(navPath);
-      const versionId = versionNodeId(commit.hash, componentId);
-      const label = result.label ?? componentId;
+      componentCaptures.push({
+        componentId,
+        componentKey,
+        navPath,
+        target: spec.target,
+        label: result.label ?? componentId,
+        summary: spec.summary,
+        type: spec.type,
+        finalRel,
+        finalAbs,
+        fileHash,
+        geometry: result.geometry,
+        isFirst,
+      });
+    }
+
+    // --- "Before" versions: a component's first capture also records the look
+    // it had in the parent commit, rendered from an isolated worktree, so the
+    // pre-change version is preserved instead of lost. -----------------------
+    type BeforeVersion = {
+      versionId: string;
+      commitHash: string;
+      timestamp: number;
+      screenshotRel: string;
+      screenshotHash: string | null;
+      label: string;
+      navPath: string;
+      geometry?: NodeGeometry;
+    };
+    const beforeByComponent = new Map<string, BeforeVersion>();
+
+    const firstByComponent = new Map<string, ComponentCapture>();
+    for (const capture of componentCaptures) {
+      if (capture.isFirst && !firstByComponent.has(capture.componentId)) {
+        firstByComponent.set(capture.componentId, capture);
+      }
+    }
+
+    if (firstByComponent.size > 0) {
+      const parent = await getParentCommit(commit.hash, repoPath);
+      if (parent) {
+        const parentShort = parent.hash.slice(0, 8);
+        const beforeTmpDir = path.join(
+          DESIGNTRAIL_ROOT,
+          "captures",
+          repoName,
+          commit.hash,
+          "before"
+        );
+        const beforeJobs: ScreenshotJob[] = Array.from(firstByComponent.values()).map(
+          (capture) => ({
+            jobId: capture.componentId,
+            outputPath: path.join(beforeTmpDir, `${capture.componentId}.png`),
+            target: capture.target,
+            navPath: capture.navPath,
+          })
+        );
+
+        let beforeServer: HeadlessServer | null = null;
+        try {
+          beforeServer = await serveCommitHeadless({
+            repoPath,
+            repoName,
+            commitHash: parent.hash,
+          });
+          const { results: beforeResults } = await takeScreenshots(
+            beforeJobs,
+            beforeServer.url
+          );
+
+          for (const beforeResult of beforeResults) {
+            const capture = beforeResult.jobId
+              ? firstByComponent.get(beforeResult.jobId)
+              : undefined;
+            if (!capture) continue;
+
+            // Accept only when the SAME component (same DOM identity) is present
+            // in the parent code. A brand-new component (added this commit) or a
+            // missing element falls back to "main"/another id and is discarded.
+            if (beforeResult.branchId !== capture.componentId) {
+              await fse.remove(beforeResult.outputPath).catch(() => undefined);
+              continue;
+            }
+
+            const beforeHash = await hashFile(beforeResult.outputPath);
+            const beforeRel = path.join(
+              "captures",
+              repoName,
+              "components",
+              capture.componentId,
+              `${parentShort}.png`
+            );
+            const beforeAbs = path.join(DESIGNTRAIL_ROOT, beforeRel);
+            await fse.ensureDir(path.dirname(beforeAbs));
+            await fse.move(beforeResult.outputPath, beforeAbs, { overwrite: true });
+
+            beforeByComponent.set(capture.componentId, {
+              versionId: versionNodeId(parent.hash, capture.componentId),
+              commitHash: parent.hash,
+              timestamp: parent.timestamp,
+              screenshotRel: beforeRel,
+              screenshotHash: beforeHash,
+              label: beforeResult.label ?? capture.label,
+              navPath: beforeResult.navPath ?? capture.navPath,
+              geometry: beforeResult.geometry,
+            });
+          }
+        } catch (err) {
+          console.warn(
+            "DesignTrail: skipped 'before' capture (could not serve the parent commit).",
+            err instanceof Error ? err.message : err
+          );
+        } finally {
+          await beforeServer?.stop().catch(() => undefined);
+          await fse.remove(beforeTmpDir).catch(() => undefined);
+        }
+      }
+    }
+
+    // --- Upsert components + versions (the "before" version, when captured,
+    // is inserted ahead of the "after" version so the history reads in order).
+    for (const capture of componentCaptures) {
+      const pageId = pageNodeId(capture.navPath);
+      const versionId = versionNodeId(commit.hash, capture.componentId);
+      const before = beforeByComponent.get(capture.componentId);
 
       graph.transaction(() => {
         graph.upsertTree1Node({
-          id: componentId,
+          id: capture.componentId,
           kind: "component",
           parentId: pageId,
-          navPath,
-          componentKey,
-          label,
+          navPath: capture.navPath,
+          componentKey: capture.componentKey,
+          label: capture.label,
           commitHash: commit.hash,
-          screenshotPath: finalRel,
-          screenshotHash: fileHash,
-          summary: spec.summary,
-          type: spec.type,
+          screenshotPath: capture.finalRel,
+          screenshotHash: capture.fileHash,
+          summary: capture.summary,
+          type: capture.type,
           timestamp: commit.timestamp,
-          geometry: result.geometry,
+          geometry: capture.geometry,
         });
+        if (before) {
+          graph.upsertTree1Node({
+            id: before.versionId,
+            kind: "version",
+            parentId: capture.componentId,
+            navPath: before.navPath,
+            componentKey: capture.componentKey,
+            label: before.label,
+            commitHash: before.commitHash,
+            screenshotPath: before.screenshotRel,
+            screenshotHash: before.screenshotHash,
+            summary: "Baseline (before first change)",
+            type: capture.type,
+            timestamp: before.timestamp,
+            geometry: before.geometry,
+          });
+        }
         graph.upsertTree1Node({
           id: versionId,
           kind: "version",
-          parentId: componentId,
-          navPath,
-          componentKey,
-          label,
+          parentId: capture.componentId,
+          navPath: capture.navPath,
+          componentKey: capture.componentKey,
+          label: capture.label,
           commitHash: commit.hash,
-          screenshotPath: finalRel,
-          screenshotHash: fileHash,
-          summary: spec.summary,
-          type: spec.type,
+          screenshotPath: capture.finalRel,
+          screenshotHash: capture.fileHash,
+          summary: capture.summary,
+          type: capture.type,
           timestamp: commit.timestamp,
-          geometry: result.geometry,
+          geometry: capture.geometry,
         });
       });
 
       entries.push({
         nodeId: versionId,
-        branchId: componentId,
+        branchId: capture.componentId,
         parentBranchId: pageId,
         parentId: null,
-        type: spec.type,
-        summary: spec.summary,
+        type: capture.type,
+        summary: capture.summary,
         annotation: null,
-        screenshotPath: finalRel,
+        screenshotPath: capture.finalRel,
       });
 
       pendingClassifications.push({
-        componentKey,
-        label,
-        screenshotPath: finalRel,
-        screenshotAbs: finalAbs,
-        hash: fileHash,
+        componentKey: capture.componentKey,
+        label: capture.label,
+        screenshotPath: capture.finalRel,
+        screenshotAbs: capture.finalAbs,
+        hash: capture.fileHash,
       });
     }
 

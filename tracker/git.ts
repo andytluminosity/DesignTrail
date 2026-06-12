@@ -28,6 +28,31 @@ export async function getLatestCommit(repoPath?: string): Promise<{ hash: string
   return { hash: latest.hash, message: latest.message };
 }
 
+/**
+ * Resolves the parent of `commitHash` (its first parent, `<hash>^`). Returns the
+ * parent's full hash plus its commit timestamp in milliseconds, or `null` when
+ * there is no parent (the root commit) or the lookup fails.
+ */
+export async function getParentCommit(
+  commitHash: string,
+  repoPath?: string
+): Promise<{ hash: string; timestamp: number } | null> {
+  const git = getGit(repoPath);
+
+  try {
+    const hash = (await git.raw(["rev-parse", "--verify", `${commitHash}^`])).trim();
+    if (!hash) return null;
+    const epochSeconds = Number(
+      (await git.raw(["show", "-s", "--format=%ct", hash])).trim()
+    );
+    const timestamp = Number.isFinite(epochSeconds) ? epochSeconds * 1000 : Date.now();
+    return { hash, timestamp };
+  } catch {
+    // No parent (root commit) or the ref could not be resolved.
+    return null;
+  }
+}
+
 export async function getDiff(commitHash: string, repoPath?: string): Promise<string> {
   const git = getGit(repoPath);
 

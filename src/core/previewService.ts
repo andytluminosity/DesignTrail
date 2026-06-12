@@ -13,6 +13,9 @@ const DESIGNTRAIL_ROOT = path.resolve(
 const WORKTREES_ROOT = path.join(DESIGNTRAIL_ROOT, ".preview-worktrees");
 
 const PREVIEW_PORT = Number(process.env.DESIGNTRAIL_PREVIEW_PORT ?? 4180);
+// Port for the headless "before" server booted during capture. Kept distinct
+// from PREVIEW_PORT and the watched app's CAPTURE_URL so they never collide.
+const BEFORE_PORT = Number(process.env.DESIGNTRAIL_BEFORE_PORT ?? 4190);
 // Generous ceiling: a cold worktree may need install + build before it serves.
 const READY_TIMEOUT_MS = Number(
   process.env.DESIGNTRAIL_PREVIEW_READY_TIMEOUT_MS ?? 180_000
@@ -120,6 +123,48 @@ export async function stopActivePreview(): Promise<void> {
   await removeWorktree(preview.repoPath, preview.worktreeDir);
 }
 
+export type HeadlessServer = {
+  url: string;
+  port: number;
+  stop: () => Promise<void>;
+};
+
+/**
+ * Checks out `commitHash` in an isolated worktree and serves it headlessly (no
+ * browser opened) so a caller can screenshot that exact code, e.g. the "before"
+ * state of a component's first change. Independent of the singleton preview
+ * lifecycle: the caller owns the returned `stop()`, which kills the server and
+ * removes the worktree. Prefers `npm run dev` to avoid a slow production build.
+ */
+export async function serveCommitHeadless(params: {
+  repoPath: string;
+  repoName: string;
+  commitHash: string;
+  port?: number;
+}): Promise<HeadlessServer> {
+  const { repoPath, repoName, commitHash } = params;
+  const port = params.port ?? BEFORE_PORT;
+  const shortHash = commitHash.slice(0, 12);
+  const worktreeDir = path.join(WORKTREES_ROOT, repoName, `before-${shortHash}`);
+
+  await ensureWorktree(repoPath, worktreeDir, commitHash);
+  const child = await launchPreviewServer(worktreeDir, port, { preferDev: true });
+
+  const stop = async (): Promise<void> => {
+    await killProcessTree(child);
+    await removeWorktree(repoPath, worktreeDir);
+  };
+
+  try {
+    await waitForServer(port, READY_TIMEOUT_MS);
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+
+  return { url: `http://localhost:${port}`, port, stop };
+}
+
 async function ensureWorktree(
   repoPath: string,
   worktreeDir: string,
@@ -168,11 +213,14 @@ async function readPackageJson(dir: string): Promise<PackageJson | null> {
 
 /**
  * Installs deps (when missing) and starts the checked-out app's server on `port`.
- * Prefers a production `build` + `preview`; falls back to `dev`.
+ * By default prefers a production `build` + `preview` and falls back to `dev`.
+ * When `preferDev` is set the order is reversed (use `dev` when present), which
+ * avoids paying for a full production build for short-lived capture servers.
  */
 async function launchPreviewServer(
   worktreeDir: string,
-  port: number
+  port: number,
+  options: { preferDev?: boolean } = {}
 ): Promise<ChildProcess> {
   const pkg = await readPackageJson(worktreeDir);
   const scripts = pkg?.scripts ?? {};
@@ -182,7 +230,9 @@ async function launchPreviewServer(
   }
 
   let serveArgs: string[];
-  if (scripts.build && scripts.preview) {
+  if (options.preferDev && scripts.dev) {
+    serveArgs = ["run", "dev", "--", "--port", String(port), "--strictPort"];
+  } else if (scripts.build && scripts.preview) {
     await runToCompletion("npm", ["run", "build"], worktreeDir);
     serveArgs = ["run", "preview", "--", "--port", String(port), "--strictPort"];
   } else if (scripts.dev) {
