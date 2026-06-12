@@ -16,6 +16,26 @@ const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
 
 /**
+ * Normalizes a navigated URL into a canonical route path so the SAME logical
+ * page is always identified the same way. It reads the LIVE page URL (so client
+ * or server redirects are already resolved — e.g. "/" -> "/dashboard"), drops
+ * the origin/query/hash, and strips a trailing slash. A component's identity
+ * embeds its navPath, so canonicalizing here keeps that identity stable across
+ * commits regardless of which equivalent route the analyzer happened to pick.
+ */
+export function canonicalNavPath(rawUrl: string): string {
+  try {
+    const pathname = new URL(rawUrl).pathname || "/";
+    if (pathname.length > 1 && pathname.endsWith("/")) {
+      return pathname.slice(0, -1);
+    }
+    return pathname;
+  } catch {
+    return "/";
+  }
+}
+
+/**
  * Extracts a compact map of real, visible elements on the currently loaded page
  * so the LLM can choose selectors/text/roles that actually exist (instead of
  * guessing class names from the diff).
@@ -137,12 +157,18 @@ export async function getSiteContext(url: string): Promise<PageContext[]> {
     const routes = await discoverRoutes(page, url);
 
     const contexts: PageContext[] = [];
+    // Dedupe by the RESOLVED route so redirect aliases (e.g. "/" -> "/dashboard")
+    // are presented to the analyzer as a single canonical page, not two.
+    const seenPaths = new Set<string>();
     for (const route of routes) {
       try {
         await page.goto(new URL(route, url).toString(), { waitUntil: "load" });
         await page.waitForTimeout(1000);
+        const resolvedPath = canonicalNavPath(page.url());
+        if (seenPaths.has(resolvedPath)) continue;
+        seenPaths.add(resolvedPath);
         const elements = await extractElements(page, MAX_CONTEXT_ELEMENTS);
-        contexts.push({ path: route, elements });
+        contexts.push({ path: resolvedPath, elements });
       } catch {
         // Skip routes that fail to load; keep whatever we gathered.
       }
@@ -295,6 +321,12 @@ async function captureOnePage(
   await page.goto(new URL(navPath, url).toString(), { waitUntil: "load" });
   await page.waitForTimeout(2000);
 
+  // Use the route the browser actually landed on (redirects resolved) as the
+  // canonical navPath. This is what scopes component identity, so it must be
+  // stable regardless of which equivalent alias (e.g. "/" vs "/dashboard") the
+  // analyzer requested.
+  const resolvedNavPath = canonicalNavPath(page.url());
+
   if (target.mode !== "full") {
     try {
       const located = await captureLocator(page, target);
@@ -303,7 +335,7 @@ async function captureOnePage(
         // The captured container's stable, route-scoped DOM identity defines this
         // component — instance-unique, so two sibling cards never collapse
         // together, and the SAME container is recognized across commits.
-        const identity = await computeContainerIdentity(container, navPath);
+        const identity = await computeContainerIdentity(container, resolvedNavPath);
         const selfBranchId = keyToBranchId(identity);
         await container.screenshot({ path: outputPath });
         // Measure the SAME element we screenshot, so geometry == the captured
@@ -318,7 +350,7 @@ async function captureOnePage(
           componentKey: identity.key,
           label: identity.label,
           selector: identity.selector,
-          navPath,
+          navPath: resolvedNavPath,
         };
       }
     } catch {
@@ -340,7 +372,7 @@ async function captureOnePage(
     geometry,
     branchId: MAIN_BRANCH,
     label: MAIN_BRANCH,
-    navPath,
+    navPath: resolvedNavPath,
   };
 }
 
