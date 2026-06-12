@@ -9,16 +9,11 @@ import type {
   ScreenshotTarget,
   UiElement,
 } from "./types.js";
-import { MAIN_BRANCH } from "./branch.js";
+import { MAIN_BRANCH, clampClimbLevels } from "./branch.js";
 import { computeContainerIdentity, keyToBranchId } from "./domKey.js";
 
 const MAX_CONTEXT_ELEMENTS = 150;
 const MAX_ROUTES = 10;
-// How many DOM ancestors above the located element the capture climb will
-// consider while searching for a "meaningful" container. Past this cap we stop
-// and fall back to the located element's immediate parent (today's behavior), so
-// a deeply-nested anonymous change never drags the capture up to the page root.
-const MAX_CLIMB_LEVELS = 4;
 
 /**
  * Normalizes a navigated URL into a canonical route path so the SAME logical
@@ -209,95 +204,54 @@ function resolveLocator(
 }
 
 /**
- * Climbs the DOM ancestor chain above the located element and returns the first
- * "meaningful" container handle, or null when there is no usable parent (the
- * parent is the page root body/html, or there is none). A page-sized rect would
- * corrupt spatial nesting, so the root is treated as "no usable parent".
+ * Climbs exactly `levels` DOM parents above the located element and returns that
+ * ancestor's handle. The climb stops early (returning the deepest ancestor it
+ * reached) if the chain hits the page root (body/html), since a page-sized rect
+ * would corrupt spatial nesting. Returns null when no climb happened (levels is
+ * 0, or the immediate parent is already the page root), so the caller captures
+ * the located element itself.
  *
- * "Meaningful" mirrors `selfMeaningful` in `domKey.ts`: an element that has an
- * id, at least one class, a data-* hook, a role, OR a name (an aria-label or a
- * single heading descendant). Climbing to such a container keeps the component's
- * derived label from collapsing to a bare tag (e.g. "div") for an anonymous
- * wrapper. The search starts at the located element's immediate parent (so we
- * always climb at least one level off the precise changed leaf) and walks up to
- * `MAX_CLIMB_LEVELS` ancestors. If none is meaningful within the cap (or the
- * chain reaches body/html first), the immediate parent is returned as a fallback,
- * preserving the prior single-level-climb behavior.
+ * `levels` is the analyzer's (LLM's) per-change choice of how far to climb so the
+ * captured container frames a coherent component; the caller clamps it to
+ * `[0, MAX_CLIMB_LEVELS]` via `clampClimbLevels` before calling.
  */
-async function meaningfulContainerHandle(
+async function climbContainerHandle(
   page: Page,
-  el: ElementHandle
+  el: ElementHandle,
+  levels: number
 ): Promise<ElementHandle | null> {
   // NOTE: this callback runs in the browser via Playwright. Keep it free of
   // named inner functions: tsx/esbuild's `keepNames` wraps named functions with
-  // a `__name` helper that does not exist in Playwright's evaluate world. The
-  // meaningfulness check is therefore inlined, matching `domKey.ts`.
+  // a `__name` helper that does not exist in Playwright's evaluate world.
   const handle = await page.evaluateHandle(
-    ({ node, maxLevels }) => {
-      const firstParent = (node as Element).parentElement;
-      let cur: Element | null = firstParent;
-      let levels = 0;
-      let fallback: Element | null = null;
-      while (cur && levels < maxLevels) {
-        const tag = cur.tagName.toLowerCase();
+    ({ node, levels }) => {
+      let cur: Element = node as Element;
+      let climbed = 0;
+      while (climbed < levels) {
+        const parent = cur.parentElement;
+        if (!parent) break;
+        const tag = parent.tagName.toLowerCase();
         if (tag === "body" || tag === "html") break;
-        if (!fallback) fallback = cur;
-
-        const id = cur.id ? String(cur.id).trim() : "";
-        const classes =
-          typeof cur.className === "string" && cur.className.trim()
-            ? cur.className.trim().split(/\s+/).filter(Boolean)
-            : Array.from(cur.classList || []);
-        const dHook =
-          cur.getAttribute("data-testid") ||
-          cur.getAttribute("data-test-id") ||
-          cur.getAttribute("data-component") ||
-          "";
-        const role = cur.getAttribute("role") || "";
-
-        let name = "";
-        const aria = cur.getAttribute("aria-label");
-        if (aria && aria.trim()) {
-          name = aria.trim();
-        } else {
-          const headings = cur.querySelectorAll(
-            "h1,h2,h3,h4,h5,h6,[role='heading']"
-          );
-          if (
-            headings.length === 1 &&
-            headings[0].textContent &&
-            headings[0].textContent.trim()
-          ) {
-            name = headings[0].textContent.trim();
-          }
-        }
-
-        const meaningful = Boolean(
-          id || classes.length || dHook || role || name
-        );
-        if (meaningful) return cur;
-
-        cur = cur.parentElement;
-        levels += 1;
+        cur = parent;
+        climbed += 1;
       }
-      return fallback;
+      return climbed > 0 ? cur : null;
     },
-    { node: el, maxLevels: MAX_CLIMB_LEVELS }
+    { node: el, levels }
   );
   return handle.asElement() as ElementHandle | null;
 }
 
 /**
  * Resolves the element to screenshot. The LLM locates the changed element via
- * `mode`/`value`, then we climb the DOM ancestor chain to the nearest meaningful
- * container — a container with an id, class, data-* hook, role, or name (see
- * `meaningfulContainerHandle`) — capped at `MAX_CLIMB_LEVELS`. That container
- * defines the branch and drives both the screenshot and the measured geometry,
- * so an anonymous wrapper (which would label as a bare tag like "div") is
- * skipped in favor of a container whose derived name makes sense. Priority order:
- *  1. the nearest meaningful ancestor within the climb cap;
- *  2. the located element's immediate parent (cap exhausted / none meaningful);
- *  3. the located changed element (no usable parent).
+ * `mode`/`value` and also decides how many DOM parents to climb above it
+ * (`target.climbLevels`) so the captured container frames a coherent component.
+ * That climb count is clamped to `[0, MAX_CLIMB_LEVELS]` (undefined falls back to
+ * a single-level climb), then we rise that many ancestors. The resulting
+ * container defines the branch and drives both the screenshot and the measured
+ * geometry. Priority order:
+ *  1. the ancestor reached after climbing the requested number of levels;
+ *  2. the located changed element (climb of 0, or no usable parent to climb to).
  * Returns null when the target can't be located at all.
  */
 async function captureLocator(
@@ -313,11 +267,14 @@ async function captureLocator(
   const elementHandle = await located.elementHandle();
   if (!elementHandle) return null;
 
-  try {
-    const container = await meaningfulContainerHandle(page, elementHandle);
-    if (container) return { container, located: elementHandle };
-  } catch {
-    // Any climb failure falls back to the located element below.
+  const levels = clampClimbLevels(target.climbLevels);
+  if (levels > 0) {
+    try {
+      const container = await climbContainerHandle(page, elementHandle, levels);
+      if (container) return { container, located: elementHandle };
+    } catch {
+      // Any climb failure falls back to the located element below.
+    }
   }
 
   return { container: elementHandle, located: elementHandle };
@@ -327,9 +284,9 @@ async function captureLocator(
  * Outlines a single changed container with a red dotted border, in-browser, so a
  * subsequent full-page screenshot captures the highlight exactly as it renders
  * (no coordinate math or device-scale mismatch). Resolves the same container the
- * targeted component capture would (the nearest meaningful ancestor of the
- * located element, or the element itself), applies an `outline` (which does not
- * shift layout), and reports whether a container was found. Failures are
+ * targeted component capture would (the ancestor reached after the analyzer's
+ * requested climb, or the located element itself), applies an `outline` (which
+ * does not shift layout), and reports whether a container was found. Failures are
  * swallowed by the caller.
  */
 async function applyHighlight(page: Page, target: ScreenshotTarget): Promise<boolean> {
@@ -396,7 +353,7 @@ export type ScreenshotJob = {
 
 /**
  * Captures a single job on an already-open page: navigates to its route, then
- * either screenshots the changed element's nearest meaningful container (a
+ * either screenshots the analyzer-chosen ancestor of the changed element (a
  * targeted component capture, see `captureLocator`) or the full page (a `full`
  * capture). Only that one container and the full page are ever captured. Falls
  * back to a full page capture on any locate failure. Throws only if navigation
@@ -497,8 +454,8 @@ async function captureOnePage(
 /**
  * Captures many screenshots reusing a SINGLE browser/page (one launch for N
  * captures). A failure on one job does not abort the rest. Returns one `result`
- * per successfully captured job (the changed element's nearest meaningful
- * container, or the full page).
+ * per successfully captured job (the analyzer-chosen ancestor of the changed
+ * element, or the full page).
  */
 export async function takeScreenshots(
   jobs: ScreenshotJob[],

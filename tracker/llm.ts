@@ -7,6 +7,7 @@ import type {
   PageContext,
   ScreenshotTarget,
 } from "./types.js";
+import { MAX_CLIMB_LEVELS, clampClimbLevels } from "./branch.js";
 
 const MODEL = "gpt-4o-mini";
 
@@ -30,14 +31,16 @@ Given a commit message, its diff, and a snapshot of the LIVE rendered DOM for ea
 identify EVERY distinct UI element the commit changed, and for each one decide what to
 screenshot and on which page.
 
-YOU DO NOT DECIDE GROUPING OR NESTING. The tracker derives each component's container
-DETERMINISTICALLY from the live DOM: it takes the single element you locate, then climbs up
-the ancestor chain to the NEAREST MEANINGFUL container (one with an id, class, data-* hook,
-role, or name), so an anonymous wrapper is skipped in favor of a container whose name makes
-sense. That container DEFINES the component. Each container is identified by a stable DOM key,
-so two elements that share a CSS class but are separate DOM nodes (e.g. two cards) are kept as
-SEPARATE containers, and the SAME container is matched across commits. Therefore NEVER try to
-name, group, or nest containers yourself — just locate each precise change.
+YOU DO NOT DECIDE GROUPING OR NESTING, but you DO choose how far to climb the DOM. For each
+change you locate the single precise changed element AND decide how many parent containers to
+climb above it ("climbLevels", an integer from 0 to ${MAX_CLIMB_LEVELS}) so the captured
+container frames a coherent, self-contained component instead of a bare wrapper or the whole
+page. The tracker captures the ancestor reached after climbing that many levels: 0 = the
+located element itself, 1 = its immediate parent, and so on. That container DEFINES the
+component. Each container is identified by a stable DOM key, so two elements that share a CSS
+class but are separate DOM nodes (e.g. two cards) are kept as SEPARATE containers, and the
+SAME container is matched across commits. NEVER try to name, group, or nest containers
+yourself — just locate each precise change and pick its climb depth.
 
 Respond with ONLY a JSON object in exactly this shape:
 {
@@ -50,7 +53,9 @@ Respond with ONLY a JSON object in exactly this shape:
       "screenshotTarget": {
         "mode": "full" | "selector" | "text" | "role" (use "full" ONLY for a global/page-wide
                 change; a specific change MUST locate its element with selector/text/role),
-        "value": string (omit ONLY when mode is "full")
+        "value": string (omit ONLY when mode is "full"),
+        "climbLevels": number (0-${MAX_CLIMB_LEVELS}; how many DOM parents to climb above the
+                located element to reach the component container to capture. Omit when mode is "full".)
       }
     }
   ]
@@ -66,10 +71,11 @@ CRITICAL targeting rules:
   that actually changed (the text node, icon, button, etc.) and make sure it exists in the UI
   CONTEXT. Prefer "text" (exact visible text from the context) or "role" because they are the
   most robust; use "selector" only when a class/id from the context clearly isolates it.
-- The tracker screenshots the nearest MEANINGFUL container above the located element as the
-  component (climbing past anonymous wrappers), so locate a precise element inside the area you
-  care about (e.g. to frame a card, locate the text or control inside it) and the tracker
-  resolves the enclosing container automatically.
+- The tracker screenshots the ancestor reached after climbing "climbLevels" parents above the
+  located element. Locate a precise element inside the area you care about (e.g. to frame a
+  card, locate the text or control inside it), then set "climbLevels" to the number of parents
+  between that element and the container you want captured. Prefer the SMALLEST climb that
+  yields a coherent component; never climb so far that you capture the whole page.
 - NEVER use mode "full" for a specific area. "full" screenshots the ENTIRE page and is
   reserved EXCLUSIVELY for a genuinely global, page-wide, or non-visual change. A small
   text/style tweak to one area (a footer version string, a single label, one stat value) is
@@ -185,7 +191,11 @@ function validateComponent(
     if (mode !== "full") {
       const value = typeof target.value === "string" ? target.value.trim() : "";
       if (value) {
-        screenshotTarget = { mode, value };
+        screenshotTarget = {
+          mode,
+          value,
+          climbLevels: clampClimbLevels(target.climbLevels),
+        };
       }
     }
   }

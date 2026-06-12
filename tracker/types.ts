@@ -53,11 +53,16 @@ export type NodeGeometry = {
 
 export type ScreenshotTarget = {
   // How to locate the changed element (or full page). For a non-full target we
-  // screenshot/measure the nearest meaningful container above the located element
-  // (climbing past anonymous wrappers), which defines this component's branch and
-  // drives the recorded geometry.
+  // screenshot/measure a DOM ancestor of the located element, which defines this
+  // component's branch and drives the recorded geometry.
   mode: "full" | "selector" | "text" | "role";
   value?: string;
+  // How many DOM parent containers to climb above the located element before
+  // capturing, as chosen by the analyzer (LLM) so the captured container frames
+  // a coherent component. 0 = the located element itself; 1 = its immediate
+  // parent. Clamped to [0, MAX_CLIMB_LEVELS] at capture time; undefined falls
+  // back to the default single-level climb.
+  climbLevels?: number;
 };
 
 export type CommitType = "UI_CHANGE" | "FEATURE" | "REFACTOR" | "UNKNOWN";
